@@ -1,0 +1,14 @@
+[package]
+name = "rdl"
+version = "0.1.0"
+edition = "2024"
+description = "Recursive Deep Learning — a graph-native DL framework"
+
+[features]
+default = []
+cuda = ["rdl-sys/cuda"]
+
+[dependencies]
+rdl-sys = { path = "../rdl-sys" }
+
+[dev-dependencies]

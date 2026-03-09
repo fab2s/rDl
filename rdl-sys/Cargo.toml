@@ -1,0 +1,12 @@
+[package]
+name = "rdl-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Raw FFI bindings to libtorch via a thin C++ shim"
+
+[features]
+default = []
+cuda = []
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,3 @@
+[workspace]
+members = ["rdl-sys", "rdl"]
+resolver = "2"

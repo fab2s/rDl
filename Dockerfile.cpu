@@ -1,0 +1,32 @@
+# rdl CPU-only image — for CI and development without GPU.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    curl \
+    unzip \
+    ca-certificates \
+    git \
+    gcc \
+    g++ \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Rust ---
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# --- libtorch (CPU-only, ~200MB) ---
+ARG LIBTORCH_VERSION=2.10.0
+RUN wget -q https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip \
+    && unzip -q libtorch-shared-with-deps-${LIBTORCH_VERSION}+cpu.zip -d /usr/local \
+    && rm libtorch-shared-with-deps-${LIBTORCH_VERSION}+cpu.zip
+
+ENV LIBTORCH_PATH="/usr/local/libtorch"
+ENV LD_LIBRARY_PATH="${LIBTORCH_PATH}/lib"
+ENV LIBRARY_PATH="${LIBTORCH_PATH}/lib"
+
+WORKDIR /workspace
