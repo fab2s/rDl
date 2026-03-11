@@ -80,25 +80,43 @@ impl Graph {
         Trend::new(history.get(tag).cloned().unwrap_or_default())
     }
 
-    /// Get trends for multiple tags.
+    /// Get trends for multiple tags. Tag group names are automatically
+    /// expanded to their member tags.
     pub fn trends(&self, tags: &[&str]) -> TrendGroup {
+        let expanded = self.expand_groups(tags);
         let history = self.epoch_history.borrow();
-        let trends = tags
+        let trends = expanded
             .iter()
-            .map(|&tag| Trend::new(history.get(tag).cloned().unwrap_or_default()))
+            .map(|tag| Trend::new(history.get(tag).cloned().unwrap_or_default()))
             .collect();
         TrendGroup(trends)
     }
 
     /// Clear epoch history. If tags is empty, clears all.
+    /// Tag group names are automatically expanded.
     pub fn reset_trend(&self, tags: &[&str]) {
         let mut history = self.epoch_history.borrow_mut();
         if tags.is_empty() {
             history.clear();
         } else {
-            for &tag in tags {
+            let expanded = self.expand_groups(tags);
+            for tag in &expanded {
                 history.remove(tag);
             }
         }
+    }
+
+    /// Expand tag group names into their member tags.
+    /// Non-group tags pass through unchanged.
+    fn expand_groups(&self, tags: &[&str]) -> Vec<String> {
+        let mut expanded = Vec::new();
+        for &tag in tags {
+            if let Some(members) = self.tag_groups.get(tag) {
+                expanded.extend(members.iter().cloned());
+            } else {
+                expanded.push(tag.to_string());
+            }
+        }
+        expanded
     }
 }

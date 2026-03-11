@@ -4,7 +4,7 @@ use crate::autograd::Variable;
 use crate::tensor::{Result, Tensor, TensorOptions};
 
 use super::parameter::Parameter;
-use super::{Module, TrainToggler};
+use super::Module;
 
 /// Batch normalization over the first (batch) dimension.
 ///
@@ -57,12 +57,6 @@ impl BatchNorm {
     }
 }
 
-impl TrainToggler for BatchNorm {
-    fn set_training(&self, training: bool) {
-        self.training.set(training);
-    }
-}
-
 impl Module for BatchNorm {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         if !self.training.get() {
@@ -91,5 +85,24 @@ impl Module for BatchNorm {
 
     fn parameters(&self) -> Vec<Parameter> {
         vec![self.weight.clone(), self.bias.clone()]
+    }
+
+    fn set_training(&self, training: bool) {
+        self.training.set(training);
+    }
+
+    fn move_to_device(&self, device: crate::tensor::Device) {
+        let mut rm = self.running_mean.borrow_mut();
+        if rm.device() != device {
+            if let Ok(t) = rm.to_device(device) {
+                *rm = t;
+            }
+        }
+        let mut rv = self.running_var.borrow_mut();
+        if rv.device() != device {
+            if let Ok(t) = rv.to_device(device) {
+                *rv = t;
+            }
+        }
     }
 }

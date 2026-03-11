@@ -36,7 +36,8 @@ pub use conv_transpose2d::ConvTranspose2d;
 pub use batchnorm::BatchNorm;
 pub use init::{xavier_uniform, xavier_normal};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::autograd::Variable;
 use crate::tensor::Result;
@@ -45,6 +46,18 @@ use crate::tensor::Result;
 pub trait Module {
     fn forward(&self, input: &Variable) -> Result<Variable>;
     fn parameters(&self) -> Vec<Parameter>;
+
+    /// Return direct child modules for recursive tree walks.
+    /// Override in composite modules (loops, switches, gates).
+    fn sub_modules(&self) -> Vec<Rc<dyn Module>> { vec![] }
+
+    /// Move non-parameter tensors (running stats, buffers) to a device.
+    /// Override in modules like BatchNorm that hold non-parameter state.
+    fn move_to_device(&self, _device: crate::tensor::Device) {}
+
+    /// Toggle training/eval mode. Override in modules with mode-dependent
+    /// behavior (BatchNorm, Dropout).
+    fn set_training(&self, _training: bool) {}
 }
 
 /// Module that can receive additional named inputs via graph Using().
@@ -56,11 +69,6 @@ pub trait NamedInputModule: Module {
     ) -> Result<Variable>;
 }
 
-/// Module with training/eval mode toggle (BatchNorm, Dropout).
-pub trait TrainToggler {
-    fn set_training(&self, training: bool);
-}
-
 /// Module with resettable per-forward state.
 pub trait Resettable {
     fn reset(&self);
@@ -69,6 +77,30 @@ pub trait Resettable {
 /// Module with detachable state (breaks gradient chains on retained state).
 pub trait Detachable {
     fn detach_state(&self);
+}
+
+/// Recursively walk a module tree, calling f on each module exactly once.
+pub fn walk_modules(module: &dyn Module, f: &mut dyn FnMut(&dyn Module)) {
+    let mut visited = HashSet::new();
+    walk_modules_visited(module, &mut visited, f);
+}
+
+/// Walk a module tree with an externally-managed visited set.
+/// Useful when walking multiple root modules (e.g., all graph nodes)
+/// while sharing dedup state.
+pub fn walk_modules_visited(
+    module: &dyn Module,
+    visited: &mut HashSet<usize>,
+    f: &mut dyn FnMut(&dyn Module),
+) {
+    let ptr = module as *const dyn Module as *const () as usize;
+    if !visited.insert(ptr) {
+        return;
+    }
+    f(module);
+    for child in module.sub_modules() {
+        walk_modules_visited(child.as_ref(), visited, f);
+    }
 }
 
 /// Recursively collect parameters from a module and its sub-modules.

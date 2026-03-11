@@ -120,4 +120,24 @@ impl Module for GateComposite {
         }
         params
     }
+
+    fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
+        let mut subs = vec![self.router.clone()];
+        subs.extend(self.experts.iter().cloned());
+        subs
+    }
+
+    fn move_to_device(&self, device: crate::tensor::Device) {
+        self.router.move_to_device(device);
+        for e in &self.experts {
+            e.move_to_device(device);
+        }
+    }
+
+    fn set_training(&self, training: bool) {
+        self.router.set_training(training);
+        for e in &self.experts {
+            e.set_training(training);
+        }
+    }
 }

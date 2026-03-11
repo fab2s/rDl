@@ -113,4 +113,24 @@ impl Module for SwitchComposite {
         }
         params
     }
+
+    fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
+        let mut subs = vec![self.router.clone()];
+        subs.extend(self.branches.iter().cloned());
+        subs
+    }
+
+    fn move_to_device(&self, device: crate::tensor::Device) {
+        self.router.move_to_device(device);
+        for b in &self.branches {
+            b.move_to_device(device);
+        }
+    }
+
+    fn set_training(&self, training: bool) {
+        self.router.set_training(training);
+        for b in &self.branches {
+            b.set_training(training);
+        }
+    }
 }

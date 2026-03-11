@@ -45,6 +45,8 @@ pub struct Graph {
     outputs: Vec<ExposedPort>,
     order: Vec<usize>,
     state: Vec<StateEntry>,
+    // Tag groups: group name → suffixed tag names
+    tag_groups: HashMap<String, Vec<String>>,
     // Observation: tag mapping (immutable after build)
     tag_names: HashMap<String, (usize, usize)>,           // tag name → (node_idx, port_idx)
     tag_capture: HashMap<usize, Vec<(String, usize)>>,     // node_idx → [(tag_name, port_idx)]
@@ -63,6 +65,7 @@ impl Graph {
         outputs: Vec<ExposedPort>,
         tags: HashMap<String, NodeRef>,
         forward_refs: Vec<ForwardRefSpec>,
+        tag_groups: HashMap<String, Vec<String>>,
     ) -> Result<Self> {
         // Set up forward-reference state buffers and wire state read nodes
         let mut state = Vec::with_capacity(forward_refs.len());
@@ -152,6 +155,7 @@ impl Graph {
             outputs,
             order,
             state,
+            tag_groups,
             tag_names: tag_names_map,
             tag_capture,
             tagged_outputs: RefCell::new(HashMap::new()),
@@ -317,6 +321,52 @@ impl Graph {
     pub fn has_state(&self) -> bool {
         !self.state.is_empty()
     }
+
+    /// Get member tags of a tag group, or None if not registered.
+    pub fn tag_group(&self, name: &str) -> Option<&[String]> {
+        self.tag_groups.get(name).map(|v| v.as_slice())
+    }
+
+    /// Forward with multiple inputs (for graphs with Input ports).
+    /// Inputs are in declaration order: From entry first, then each Input.
+    pub fn forward_multi(&self, inputs: &[Variable]) -> Result<Variable> {
+        self.forward_impl(inputs)
+    }
+
+    /// Move all parameters, state buffers, and module buffers to a device.
+    pub fn set_device(&self, device: crate::tensor::Device) {
+        // Move parameters
+        for p in self.parameters() {
+            if p.variable.data().device() != device {
+                if let Ok(t) = p.variable.data().to_device(device) {
+                    p.variable.set_data(t);
+                }
+            }
+        }
+        // Move state buffers
+        for entry in &self.state {
+            let mut val = entry.value.borrow_mut();
+            if let Some(ref v) = *val {
+                if v.data().device() != device {
+                    if let Ok(t) = v.data().to_device(device) {
+                        *val = Some(Variable::new(t, false));
+                    }
+                }
+            }
+        }
+        // Walk modules for move_to_device (BatchNorm running stats, etc.)
+        let mut visited = HashSet::new();
+        for &ni in &self.order {
+            if let Some(ref module) = self.nodes[ni].module {
+                crate::nn::walk_modules_visited(
+                    module.as_ref(),
+                    &mut visited,
+                    &mut |m: &dyn crate::nn::Module| m.move_to_device(device),
+                );
+            }
+        }
+    }
+
 }
 
 impl Module for Graph {
@@ -340,6 +390,23 @@ impl Module for Graph {
         }
 
         params
+    }
+
+    fn set_training(&self, training: bool) {
+        let mut visited = HashSet::new();
+        for &ni in &self.order {
+            if let Some(ref module) = self.nodes[ni].module {
+                crate::nn::walk_modules_visited(
+                    module.as_ref(),
+                    &mut visited,
+                    &mut |m: &dyn crate::nn::Module| m.set_training(training),
+                );
+            }
+        }
+    }
+
+    fn move_to_device(&self, device: crate::tensor::Device) {
+        self.set_device(device);
     }
 }
 
@@ -1577,5 +1644,202 @@ mod tests {
         let tg = graph.trends(&["a", "b"]);
         assert_eq!(tg.len(), 2);
         assert!(tg.all_improving(0));
+    }
+
+    // --- TagGroup tests ---
+
+    #[test]
+    fn test_tag_group() {
+        // Split into 3 branches with tag_group, then merge
+        let graph = FlowBuilder::from(Identity)
+            .split(vec![
+                Box::new(Doubler),
+                Box::new(Tripler),
+                Box::new(Identity),
+            ])
+            .tag_group("branch")
+            .merge(MergeOp::Add)
+            .build()
+            .unwrap();
+
+        // Check group registration
+        let members = graph.tag_group("branch").unwrap();
+        assert_eq!(members, &["branch_0", "branch_1", "branch_2"]);
+
+        // Non-existent group returns None
+        assert!(graph.tag_group("nonexistent").is_none());
+
+        // Tags work for observation
+        let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
+        let _ = graph.forward(&x).unwrap();
+
+        let b0 = graph.tagged("branch_0").unwrap();
+        let b0_data = b0.data().to_f32_vec().unwrap();
+        assert!((b0_data[0] - 2.0).abs() < 1e-5, "doubler: got {}", b0_data[0]);
+
+        let b1 = graph.tagged("branch_1").unwrap();
+        let b1_data = b1.data().to_f32_vec().unwrap();
+        assert!((b1_data[0] - 3.0).abs() < 1e-5, "tripler: got {}", b1_data[0]);
+    }
+
+    #[test]
+    fn test_tag_group_observation() {
+        // Tag group with collect/flush and trends expansion
+        let graph = FlowBuilder::from(Identity)
+            .split(vec![Box::new(ScalarSum), Box::new(ScalarSum)])
+            .tag_group("head")
+            .merge(MergeOp::Add)
+            .build()
+            .unwrap();
+
+        // Run a few epochs
+        for epoch in &[1.0f32, 2.0, 3.0] {
+            let x = Variable::new(from_f32(&[*epoch], &[1, 1]), false);
+            let _ = graph.forward(&x).unwrap();
+            graph.collect(&["head_0", "head_1"]);
+            graph.flush(&["head_0", "head_1"]);
+        }
+
+        // Trends with group expansion
+        let tg = graph.trends(&["head"]);
+        assert_eq!(tg.len(), 2); // head_0 and head_1
+    }
+
+    #[test]
+    fn test_tag_group_errors() {
+        // tag_group on single stream should error
+        let result = FlowBuilder::from(Identity)
+            .tag_group("bad")
+            .build();
+        assert!(result.is_err());
+
+        // Duplicate group name
+        let result = FlowBuilder::from(Identity)
+            .split(vec![Box::new(Doubler), Box::new(Tripler)])
+            .tag_group("x")
+            .merge(MergeOp::Add)
+            .split(vec![Box::new(Doubler), Box::new(Tripler)])
+            .tag_group("x")
+            .merge(MergeOp::Add)
+            .build();
+        assert!(result.is_err());
+    }
+
+    // --- Input tests ---
+
+    /// Module that adds all refs to input (for multi-input testing).
+    struct SumRefs;
+    impl Module for SumRefs {
+        fn forward(&self, input: &Variable) -> Result<Variable> {
+            Ok(input.clone())
+        }
+        fn parameters(&self) -> Vec<Parameter> { vec![] }
+    }
+    impl NamedInputModule for SumRefs {
+        fn forward_named(
+            &self,
+            input: &Variable,
+            refs: &HashMap<String, Variable>,
+        ) -> Result<Variable> {
+            let mut result = input.clone();
+            for (_, v) in refs {
+                result = result.add(v)?;
+            }
+            Ok(result)
+        }
+    }
+
+    #[test]
+    fn test_input_auxiliary() {
+        // Graph with auxiliary inputs: From(identity) + Input("ctx")
+        // Downstream: through_ref(SumRefs).using("ctx")
+        let graph = FlowBuilder::from(Identity)
+            .input(&["ctx"])
+            .through_ref(SumRefs)
+            .using(&["ctx"])
+            .build()
+            .unwrap();
+
+        let main = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
+        let ctx = Variable::new(from_f32(&[10.0, 20.0], &[1, 2]), false);
+
+        let y = graph.forward_multi(&[main, ctx]).unwrap();
+        let data = y.data().to_f32_vec().unwrap();
+        // SumRefs adds ctx to main: [1+10, 2+20] = [11, 22]
+        assert!((data[0] - 11.0).abs() < 1e-5, "got {}", data[0]);
+        assert!((data[1] - 22.0).abs() < 1e-5, "got {}", data[1]);
+    }
+
+    #[test]
+    fn test_input_multiple() {
+        // Graph with two auxiliary inputs
+        let graph = FlowBuilder::from(Identity)
+            .input(&["a", "b"])
+            .through_ref(SumRefs)
+            .using(&["a", "b"])
+            .build()
+            .unwrap();
+
+        let main = Variable::new(from_f32(&[1.0], &[1, 1]), false);
+        let a = Variable::new(from_f32(&[10.0], &[1, 1]), false);
+        let b = Variable::new(from_f32(&[100.0], &[1, 1]), false);
+
+        let y = graph.forward_multi(&[main, a, b]).unwrap();
+        let data = y.data().to_f32_vec().unwrap();
+        // 1 + 10 + 100 = 111
+        assert!((data[0] - 111.0).abs() < 1e-5, "got {}", data[0]);
+    }
+
+    #[test]
+    fn test_input_error_count_mismatch() {
+        let graph = FlowBuilder::from(Identity)
+            .input(&["ctx"])
+            .build()
+            .unwrap();
+
+        // forward() with single input should fail (expects 2: main + ctx)
+        let x = Variable::new(from_f32(&[1.0], &[1, 1]), false);
+        assert!(graph.forward(&x).is_err());
+    }
+
+    // --- Graph set_training test ---
+
+    #[test]
+    fn test_graph_set_training() {
+        use crate::nn::Dropout;
+
+        let graph = FlowBuilder::from(Linear::new(3, 3).unwrap())
+            .through(Dropout::new(0.5))
+            .build()
+            .unwrap();
+
+        // Training mode: dropout is active
+        let x = Variable::new(from_f32(&[1.0; 12], &[4, 3]), false);
+        let y1 = graph.forward(&x).unwrap();
+        assert_eq!(y1.shape(), vec![4, 3]);
+
+        // Set eval via graph
+        graph.set_training(false);
+        let y2 = graph.forward(&x).unwrap();
+        let y3 = graph.forward(&x).unwrap();
+        assert_eq!(y2.shape(), vec![4, 3]);
+
+        // In eval: dropout is identity, so repeated forward gives same output
+        let d2 = y2.data().to_f32_vec().unwrap();
+        let d3 = y3.data().to_f32_vec().unwrap();
+        let same = d2.iter().zip(d3.iter()).all(|(a, b)| (a - b).abs() < 1e-6);
+        assert!(same, "eval mode should be deterministic (no dropout)");
+    }
+
+    // --- walk_modules test ---
+
+    #[test]
+    fn test_walk_modules() {
+        use crate::nn::walk_modules;
+
+        let l1 = Linear::new(2, 2).unwrap();
+        let mut count = 0;
+        walk_modules(&l1, &mut |_| count += 1);
+        assert_eq!(count, 1); // leaf module, no children
     }
 }

@@ -22,6 +22,8 @@ pub struct FlowBuilder {
     pub(super) pending: HashMap<String, Vec<PendingUsing>>,
     /// Resolved forward references ready for Graph::build.
     pub(super) forward_refs: Vec<ForwardRefSpec>,
+    /// Tag group name → suffixed tag names (from TagGroup).
+    pub(super) tag_groups: HashMap<String, Vec<String>>,
 }
 
 impl FlowBuilder {
@@ -38,6 +40,7 @@ impl FlowBuilder {
             err: None,
             pending: HashMap::new(),
             forward_refs: Vec::new(),
+            tag_groups: HashMap::new(),
         };
 
         let node_ref = fb.add_module(module);
@@ -176,6 +179,102 @@ impl FlowBuilder {
             }
         }
 
+        self
+    }
+
+    /// Tag each stream in a multi-stream flow with auto-suffixed names.
+    /// Given group name "head" and 3 streams, creates "head_0", "head_1", "head_2".
+    /// The group is registered for expansion in observation queries.
+    pub fn tag_group(mut self, name: &str) -> Self {
+        if self.err.is_some() {
+            return self;
+        }
+        if self.current.len() < 2 {
+            self.err = Some(format!(
+                "tag_group({:?}) requires multiple streams (got {}); use tag for single-stream",
+                name,
+                self.current.len()
+            ));
+            return self;
+        }
+        if self.tag_groups.contains_key(name) {
+            self.err = Some(format!("duplicate tag group: {:?}", name));
+            return self;
+        }
+        if self.taps.contains_key(name) {
+            self.err = Some(format!(
+                "tag group {:?} conflicts with existing tag",
+                name
+            ));
+            return self;
+        }
+
+        let mut suffixed = Vec::with_capacity(self.current.len());
+        for (i, cur) in self.current.iter().enumerate() {
+            let tag = format!("{}_{}", name, i);
+            if self.taps.contains_key(&tag) {
+                self.err = Some(format!(
+                    "tag_group({:?}): suffixed name {:?} conflicts with existing tag",
+                    name, tag
+                ));
+                return self;
+            }
+            self.taps.insert(tag.clone(), cur.clone());
+            suffixed.push(tag.clone());
+
+            // Resolve pending forward refs to this suffixed tag
+            if let Some(pending_list) = self.pending.remove(&tag) {
+                for p in pending_list {
+                    self.forward_refs.push(ForwardRefSpec {
+                        name: tag.clone(),
+                        reader_id: p.reader_id,
+                        writer_id: cur.node_id.clone(),
+                        writer_port: cur.port.clone(),
+                    });
+                }
+            }
+        }
+
+        self.tag_groups.insert(name.to_string(), suffixed);
+        self
+    }
+
+    /// Add named auxiliary inputs to the graph.
+    /// Creates passthrough nodes for each name, tagged and exposed as graph inputs.
+    /// Forward receives inputs in declaration order: From entry first, then each Input.
+    pub fn input(mut self, names: &[&str]) -> Self {
+        if self.err.is_some() {
+            return self;
+        }
+        for &name in names {
+            if self.taps.contains_key(name) {
+                self.err = Some(format!(
+                    "input tag {:?} conflicts with existing tag",
+                    name
+                ));
+                return self;
+            }
+
+            let node_ref = self.add_input_node(name);
+            self.taps.insert(name.to_string(), node_ref.clone());
+            self.inputs.push(ExposedPort {
+                name: name.to_string(),
+                node_id: node_ref.node_id.clone(),
+                port: DEFAULT_INPUT.to_string(),
+            });
+
+            // Resolve pending forward refs to this tag
+            if let Some(pending_list) = self.pending.remove(name) {
+                for p in pending_list {
+                    self.forward_refs.push(ForwardRefSpec {
+                        name: name.to_string(),
+                        reader_id: p.reader_id,
+                        writer_id: node_ref.node_id.clone(),
+                        writer_port: node_ref.port.clone(),
+                    });
+                }
+            }
+        }
         self
     }
 
@@ -336,6 +435,7 @@ impl FlowBuilder {
             vec![output],
             self.taps,
             self.forward_refs,
+            self.tag_groups,
         )
     }
 
@@ -519,6 +619,25 @@ impl FlowBuilder {
             },
         );
 
+        NodeRef {
+            node_id: id,
+            port: DEFAULT_OUTPUT.into(),
+        }
+    }
+
+    fn add_input_node(&mut self, name: &str) -> NodeRef {
+        let id = self.next_id(&format!("input_{}", name));
+        self.nodes.insert(
+            id.clone(),
+            Node {
+                id: id.clone(),
+                input_ports: vec![DEFAULT_INPUT.into()],
+                output_ports: vec![DEFAULT_OUTPUT.into()],
+                run: Box::new(|inputs: &[Variable]| Ok(inputs.to_vec())),
+                module: None,
+                ref_forward: None,
+            },
+        );
         NodeRef {
             node_id: id,
             port: DEFAULT_OUTPUT.into(),

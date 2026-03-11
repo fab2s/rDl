@@ -6,7 +6,7 @@ pub mod graph;
 pub use tensor::{cuda_available, cuda_device_count, Device, DType, Tensor, TensorOptions};
 pub use autograd::{Variable, no_grad, is_grad_enabled, adaptive_avg_pool2d, grid_sample};
 pub use nn::{
-    Module, NamedInputModule, TrainToggler, Resettable, Detachable,
+    Module, NamedInputModule, Resettable, Detachable,
     Parameter, Linear, Optimizer, Stateful, SGD, Adam, AdamW,
     save_parameters, load_parameters, save_parameters_file, load_parameters_file,
     GradScaler, cast_parameters,
@@ -17,5 +17,6 @@ pub use nn::{
     clip_grad_norm, clip_grad_value,
     Scheduler, StepDecay, CosineScheduler, WarmupScheduler, PlateauScheduler,
     xavier_uniform, xavier_normal,
+    walk_modules, walk_modules_visited,
 };
 pub use graph::{FlowBuilder, MergeOp, Graph, MapBuilder, Trend, TrendGroup};

@@ -217,4 +217,26 @@ impl Module for LoopComposite {
         }
         params
     }
+
+    fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
+        let mut subs = vec![self.body.clone()];
+        if let Some(ref cond) = self.cond {
+            subs.push(cond.clone());
+        }
+        subs
+    }
+
+    fn move_to_device(&self, device: crate::tensor::Device) {
+        self.body.move_to_device(device);
+        if let Some(ref cond) = self.cond {
+            cond.move_to_device(device);
+        }
+    }
+
+    fn set_training(&self, training: bool) {
+        self.body.set_training(training);
+        if let Some(ref cond) = self.cond {
+            cond.set_training(training);
+        }
+    }
 }

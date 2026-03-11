@@ -4,7 +4,7 @@ use crate::autograd::Variable;
 use crate::tensor::{Result, Tensor, TensorOptions};
 
 use super::parameter::Parameter;
-use super::{Module, TrainToggler};
+use super::Module;
 
 /// Inverted dropout module.
 ///
@@ -24,12 +24,6 @@ impl Dropout {
         }
     }
 
-}
-
-impl TrainToggler for Dropout {
-    fn set_training(&self, training: bool) {
-        self.training.set(training);
-    }
 }
 
 impl Module for Dropout {
@@ -55,5 +49,9 @@ impl Module for Dropout {
 
     fn parameters(&self) -> Vec<Parameter> {
         vec![]
+    }
+
+    fn set_training(&self, training: bool) {
+        self.training.set(training);
     }
 }
