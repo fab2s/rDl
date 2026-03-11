@@ -4,8 +4,10 @@ pub mod loop_node;
 pub mod switch;
 pub mod gate;
 pub mod map;
+pub mod observe;
+pub mod trend;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -17,6 +19,7 @@ use crate::tensor::{Result, Tensor, TensorError};
 pub use flow::FlowBuilder;
 pub use loop_node::LoopBuilder;
 pub use map::MapBuilder;
+pub use trend::{Trend, TrendGroup};
 
 /// Merge operation for combining split branches.
 pub enum MergeOp {
@@ -42,6 +45,14 @@ pub struct Graph {
     outputs: Vec<ExposedPort>,
     order: Vec<usize>,
     state: Vec<StateEntry>,
+    // Observation: tag mapping (immutable after build)
+    tag_names: HashMap<String, (usize, usize)>,           // tag name → (node_idx, port_idx)
+    tag_capture: HashMap<usize, Vec<(String, usize)>>,     // node_idx → [(tag_name, port_idx)]
+    // Observation: mutable state (RefCell/Cell for &self methods)
+    tagged_outputs: RefCell<HashMap<String, Variable>>,
+    batch_buffer: RefCell<HashMap<String, Vec<f64>>>,
+    epoch_history: RefCell<HashMap<String, Vec<f64>>>,
+    flush_count: Cell<usize>,
 }
 
 impl Graph {
@@ -50,7 +61,7 @@ impl Graph {
         edges: Vec<Edge>,
         inputs: Vec<ExposedPort>,
         outputs: Vec<ExposedPort>,
-        _tags: HashMap<String, NodeRef>,
+        tags: HashMap<String, NodeRef>,
         forward_refs: Vec<ForwardRefSpec>,
     ) -> Result<Self> {
         // Set up forward-reference state buffers and wire state read nodes
@@ -113,6 +124,24 @@ impl Graph {
         let levels = topological_levels(&nodes, &node_index, &edges)?;
         let order: Vec<usize> = levels.iter().flat_map(|l| l.iter().copied()).collect();
 
+        // Build tag capture indices for observation
+        let mut tag_names_map: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut tag_capture: HashMap<usize, Vec<(String, usize)>> = HashMap::new();
+        for (name, node_ref) in &tags {
+            if let Some(&ni) = node_index.get(&node_ref.node_id) {
+                let port_idx = nodes[ni]
+                    .output_ports
+                    .iter()
+                    .position(|p| p == &node_ref.port)
+                    .unwrap_or(0);
+                tag_names_map.insert(name.clone(), (ni, port_idx));
+                tag_capture
+                    .entry(ni)
+                    .or_default()
+                    .push((name.clone(), port_idx));
+            }
+        }
+
         Ok(Graph {
             nodes,
             node_index,
@@ -123,6 +152,12 @@ impl Graph {
             outputs,
             order,
             state,
+            tag_names: tag_names_map,
+            tag_capture,
+            tagged_outputs: RefCell::new(HashMap::new()),
+            batch_buffer: RefCell::new(HashMap::new()),
+            epoch_history: RefCell::new(HashMap::new()),
+            flush_count: Cell::new(0),
         })
     }
 
@@ -136,10 +171,15 @@ impl Graph {
         }
 
         let n = self.nodes.len();
-        // Option<Variable>: None means state_read returned no value yet
         let mut input_slots: Vec<HashMap<String, Option<Variable>>> =
             (0..n).map(|_| HashMap::new()).collect();
         let mut output_values: Vec<Option<Vec<Variable>>> = vec![None; n];
+        let has_tags = !self.tag_capture.is_empty();
+        let mut tagged_outputs = if has_tags {
+            Some(HashMap::new())
+        } else {
+            None
+        };
 
         // Route graph inputs to node input ports
         for (i, ep) in self.inputs.iter().enumerate() {
@@ -216,7 +256,25 @@ impl Graph {
                         }
                     }
                 }
+
+                // Capture tagged outputs for observation
+                if let Some(ref mut tagged) = tagged_outputs {
+                    if let Some(captures) = self.tag_capture.get(&ni) {
+                        if let Some(ref outs) = output_values[ni] {
+                            for (tag_name, port_idx) in captures {
+                                if *port_idx < outs.len() {
+                                    tagged.insert(tag_name.clone(), outs[*port_idx].clone());
+                                }
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        // Store tagged outputs
+        if let Some(tagged) = tagged_outputs {
+            *self.tagged_outputs.borrow_mut() = tagged;
         }
 
         // Collect graph output
@@ -1358,5 +1416,166 @@ mod tests {
         for p in graph.parameters() {
             assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
         }
+    }
+
+    // --- Observation tests ---
+
+    /// Scalar output module: sum all elements to a single value.
+    struct ScalarSum;
+    impl Module for ScalarSum {
+        fn forward(&self, input: &Variable) -> Result<Variable> {
+            input.sum()
+        }
+        fn parameters(&self) -> Vec<Parameter> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn test_tagged_capture() {
+        // Tag intermediate output and retrieve it after forward
+        let graph = FlowBuilder::from(Identity)
+            .tag("features")
+            .through(Doubler)
+            .build()
+            .unwrap();
+
+        let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
+        let _ = graph.forward(&x).unwrap();
+
+        // Tagged value should be the identity output (before doubling)
+        let features = graph.tagged("features").unwrap();
+        let data = features.data().to_f32_vec().unwrap();
+        assert!((data[0] - 1.0).abs() < 1e-5);
+        assert!((data[1] - 2.0).abs() < 1e-5);
+
+        assert!(graph.tagged("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_tagged_updates_each_forward() {
+        let graph = FlowBuilder::from(Doubler)
+            .tag("doubled")
+            .build()
+            .unwrap();
+
+        let x1 = Variable::new(from_f32(&[1.0], &[1, 1]), false);
+        let _ = graph.forward(&x1).unwrap();
+        let v1 = graph.tagged("doubled").unwrap().item().unwrap();
+        assert!((v1 - 2.0).abs() < 1e-5);
+
+        let x2 = Variable::new(from_f32(&[5.0], &[1, 1]), false);
+        let _ = graph.forward(&x2).unwrap();
+        let v2 = graph.tagged("doubled").unwrap().item().unwrap();
+        assert!((v2 - 10.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_tag_names() {
+        let graph = FlowBuilder::from(Identity)
+            .tag("a")
+            .through(Identity)
+            .tag("b")
+            .build()
+            .unwrap();
+
+        let mut names = graph.tag_names();
+        names.sort();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_collect_flush_trend() {
+        // Simulate a training loop with collect → flush → trend
+        let graph = FlowBuilder::from(ScalarSum)
+            .tag("loss")
+            .build()
+            .unwrap();
+
+        // Epoch 1: 3 batches with different inputs
+        for val in &[1.0f32, 2.0, 3.0] {
+            let x = Variable::new(from_f32(&[*val], &[1, 1]), false);
+            let _ = graph.forward(&x).unwrap();
+            graph.collect(&["loss"]);
+        }
+        // batch buffer should have [1, 2, 3]
+        let collected = graph.collected("loss");
+        assert_eq!(collected.len(), 3);
+
+        graph.flush(&["loss"]);
+        assert_eq!(graph.flush_count(), 1);
+
+        // Epoch 2: 3 batches
+        for val in &[0.5f32, 0.3, 0.2] {
+            let x = Variable::new(from_f32(&[*val], &[1, 1]), false);
+            let _ = graph.forward(&x).unwrap();
+            graph.collect(&["loss"]);
+        }
+        graph.flush(&["loss"]);
+        assert_eq!(graph.flush_count(), 2);
+
+        // Trend should show decrease: epoch1 mean=2.0, epoch2 mean≈0.333
+        let trend = graph.trend("loss");
+        assert_eq!(trend.len(), 2);
+        assert!((trend.values()[0] - 2.0).abs() < 1e-5);
+        assert!((trend.values()[1] - (1.0 / 3.0)).abs() < 1e-5);
+        assert!(trend.improving(0));
+    }
+
+    #[test]
+    fn test_record_external_values() {
+        let graph = FlowBuilder::from(Identity).build().unwrap();
+
+        graph.record("external_loss", &[0.5, 0.4, 0.3]);
+        graph.flush(&["external_loss"]);
+
+        graph.record("external_loss", &[0.1, 0.05]);
+        graph.flush(&["external_loss"]);
+
+        let trend = graph.trend("external_loss");
+        assert_eq!(trend.len(), 2);
+        assert!((trend.values()[0] - 0.4).abs() < 1e-5); // mean(0.5, 0.4, 0.3)
+        assert!((trend.values()[1] - 0.075).abs() < 1e-5); // mean(0.1, 0.05)
+        assert!(trend.improving(0));
+    }
+
+    #[test]
+    fn test_flush_all() {
+        let graph = FlowBuilder::from(Identity).build().unwrap();
+
+        graph.record("a", &[1.0, 2.0]);
+        graph.record("b", &[3.0, 4.0]);
+        graph.flush(&[]); // flush all
+
+        assert_eq!(graph.trend("a").len(), 1);
+        assert_eq!(graph.trend("b").len(), 1);
+    }
+
+    #[test]
+    fn test_reset_trend() {
+        let graph = FlowBuilder::from(Identity).build().unwrap();
+
+        graph.record("loss", &[1.0]);
+        graph.flush(&[]);
+        assert_eq!(graph.trend("loss").len(), 1);
+
+        graph.reset_trend(&["loss"]);
+        assert_eq!(graph.trend("loss").len(), 0);
+    }
+
+    #[test]
+    fn test_trends_group() {
+        let graph = FlowBuilder::from(Identity).build().unwrap();
+
+        // Two decreasing series
+        for epoch in &[10.0, 8.0, 6.0, 4.0] {
+            graph.record("a", &[*epoch]);
+            graph.record("b", &[*epoch * 0.5]);
+            graph.flush(&[]);
+        }
+
+        let tg = graph.trends(&["a", "b"]);
+        assert_eq!(tg.len(), 2);
+        assert!(tg.all_improving(0));
     }
 }
