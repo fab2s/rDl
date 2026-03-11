@@ -443,6 +443,13 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
+    pub fn clamp(&self, min: f64, max: f64) -> Result<Tensor> {
+        let mut handle: RdlTensor = ptr::null_mut();
+        let err = unsafe { ffi::rdl_clamp(self.handle, min, max, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
     // --- Comparisons ---
 
     pub fn gt_scalar(&self, scalar: f64) -> Result<Tensor> {
@@ -663,6 +670,105 @@ impl Tensor {
         };
         check_err(err)?;
         Ok(Self::from_raw(handle))
+    }
+
+    // --- Convolution ---
+
+    /// 2D convolution. bias may be a null-handle tensor for no bias.
+    pub fn conv2d(
+        &self, weight: &Tensor, bias: Option<&Tensor>,
+        stride: [i64; 2], padding: [i64; 2], dilation: [i64; 2], groups: i64,
+    ) -> Result<Tensor> {
+        let mut handle: RdlTensor = ptr::null_mut();
+        let mut stride = stride;
+        let mut padding = padding;
+        let mut dilation = dilation;
+        let bias_handle = bias.map_or(ptr::null_mut(), |b| b.handle);
+        let err = unsafe {
+            ffi::rdl_conv2d(
+                self.handle, weight.handle, bias_handle,
+                stride.as_mut_ptr(), padding.as_mut_ptr(), dilation.as_mut_ptr(),
+                groups, &mut handle,
+            )
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// 2D convolution backward. Returns (grad_input, grad_weight, Option<grad_bias>).
+    pub fn conv2d_backward(
+        grad_output: &Tensor, input: &Tensor, weight: &Tensor,
+        stride: [i64; 2], padding: [i64; 2], dilation: [i64; 2],
+        groups: i64, compute_bias: bool,
+    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let mut gi: RdlTensor = ptr::null_mut();
+        let mut gw: RdlTensor = ptr::null_mut();
+        let mut gb: RdlTensor = ptr::null_mut();
+        let mut stride = stride;
+        let mut padding = padding;
+        let mut dilation = dilation;
+        let err = unsafe {
+            ffi::rdl_conv2d_backward(
+                grad_output.handle, input.handle, weight.handle,
+                stride.as_mut_ptr(), padding.as_mut_ptr(), dilation.as_mut_ptr(),
+                groups, compute_bias as i32,
+                &mut gi, &mut gw, &mut gb,
+            )
+        };
+        check_err(err)?;
+        let grad_bias = if compute_bias { Some(Tensor::from_raw(gb)) } else { None };
+        Ok((Tensor::from_raw(gi), Tensor::from_raw(gw), grad_bias))
+    }
+
+    /// Transposed 2D convolution.
+    pub fn conv_transpose2d(
+        &self, weight: &Tensor, bias: Option<&Tensor>,
+        stride: [i64; 2], padding: [i64; 2], output_padding: [i64; 2],
+        dilation: [i64; 2], groups: i64,
+    ) -> Result<Tensor> {
+        let mut handle: RdlTensor = ptr::null_mut();
+        let mut stride = stride;
+        let mut padding = padding;
+        let mut output_padding = output_padding;
+        let mut dilation = dilation;
+        let bias_handle = bias.map_or(ptr::null_mut(), |b| b.handle);
+        let err = unsafe {
+            ffi::rdl_conv_transpose2d(
+                self.handle, weight.handle, bias_handle,
+                stride.as_mut_ptr(), padding.as_mut_ptr(),
+                output_padding.as_mut_ptr(), dilation.as_mut_ptr(),
+                groups, &mut handle,
+            )
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Transposed 2D convolution backward.
+    pub fn conv_transpose2d_backward(
+        grad_output: &Tensor, input: &Tensor, weight: &Tensor,
+        stride: [i64; 2], padding: [i64; 2], output_padding: [i64; 2],
+        dilation: [i64; 2], groups: i64, compute_bias: bool,
+    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let mut gi: RdlTensor = ptr::null_mut();
+        let mut gw: RdlTensor = ptr::null_mut();
+        let mut gb: RdlTensor = ptr::null_mut();
+        let mut stride = stride;
+        let mut padding = padding;
+        let mut output_padding = output_padding;
+        let mut dilation = dilation;
+        let err = unsafe {
+            ffi::rdl_conv_transpose2d_backward(
+                grad_output.handle, input.handle, weight.handle,
+                stride.as_mut_ptr(), padding.as_mut_ptr(),
+                output_padding.as_mut_ptr(), dilation.as_mut_ptr(),
+                groups, compute_bias as i32,
+                &mut gi, &mut gw, &mut gb,
+            )
+        };
+        check_err(err)?;
+        let grad_bias = if compute_bias { Some(Tensor::from_raw(gb)) } else { None };
+        Ok((Tensor::from_raw(gi), Tensor::from_raw(gw), grad_bias))
     }
 
     // --- Device ---

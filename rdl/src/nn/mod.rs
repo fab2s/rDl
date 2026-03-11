@@ -11,12 +11,15 @@ pub mod layernorm;
 pub mod embedding;
 pub mod grucell;
 pub mod lstmcell;
+pub mod conv2d;
+pub mod conv_transpose2d;
+pub mod batchnorm;
 
 pub use parameter::Parameter;
 pub use linear::Linear;
 pub use activation::{ReLU, Sigmoid, Tanh, GELU, SiLU};
 pub use loss::{mse_loss, cross_entropy_loss, bce_with_logits_loss, l1_loss, smooth_l1_loss, kl_div_loss};
-pub use optim::{Optimizer, SGD, Adam};
+pub use optim::{Optimizer, SGD, Adam, AdamW};
 pub use clip::{clip_grad_norm, clip_grad_value};
 pub use scheduler::{Scheduler, StepDecay, CosineScheduler, WarmupScheduler, PlateauScheduler};
 pub use dropout::Dropout;
@@ -24,6 +27,10 @@ pub use layernorm::LayerNorm;
 pub use embedding::Embedding;
 pub use grucell::GRUCell;
 pub use lstmcell::LSTMCell;
+pub use conv2d::Conv2d;
+pub use conv_transpose2d::ConvTranspose2d;
+pub use batchnorm::BatchNorm;
+pub use init::{xavier_uniform, xavier_normal};
 
 use std::collections::HashMap;
 
@@ -701,5 +708,151 @@ mod tests {
 
         // 4 input Linear (w+b=2 each) + 4 hidden Linear (w only=1 each) = 12
         assert_eq!(lstm.parameters().len(), 12);
+    }
+
+    #[test]
+    fn test_conv2d() {
+        let conv = Conv2d::new(1, 2, 3).unwrap();
+        // Input: [batch=1, channels=1, h=5, w=5]
+        let x = Variable::new(
+            Tensor::randn(&[1, 1, 5, 5], Default::default()).unwrap(),
+            true,
+        );
+        let out = conv.forward(&x).unwrap();
+        // With kernel=3, no padding: output = 5-3+1 = 3
+        assert_eq!(out.shape(), vec![1, 2, 3, 3]);
+
+        // Backward
+        let loss = out.sum().unwrap();
+        loss.backward().unwrap();
+        assert!(x.grad().is_some());
+
+        // weight + bias = 2 params
+        assert_eq!(conv.parameters().len(), 2);
+    }
+
+    #[test]
+    fn test_conv2d_no_bias() {
+        let conv = Conv2d::no_bias(3, 8, 3).unwrap();
+        let x = Variable::new(
+            Tensor::randn(&[2, 3, 8, 8], Default::default()).unwrap(),
+            true,
+        );
+        let out = conv.forward(&x).unwrap();
+        assert_eq!(out.shape(), vec![2, 8, 6, 6]);
+        assert_eq!(conv.parameters().len(), 1); // weight only
+    }
+
+    #[test]
+    fn test_conv2d_with_padding() {
+        let conv = Conv2d::build(1, 1, 3, true, [1, 1], [1, 1], [1, 1], 1, Device::CPU).unwrap();
+        let x = Variable::new(
+            Tensor::randn(&[1, 1, 5, 5], Default::default()).unwrap(),
+            true,
+        );
+        let out = conv.forward(&x).unwrap();
+        // Same padding: output = input size
+        assert_eq!(out.shape(), vec![1, 1, 5, 5]);
+    }
+
+    #[test]
+    fn test_conv_transpose2d() {
+        let conv = ConvTranspose2d::new(2, 1, 3).unwrap();
+        // Input: [batch=1, channels=2, h=3, w=3]
+        let x = Variable::new(
+            Tensor::randn(&[1, 2, 3, 3], Default::default()).unwrap(),
+            true,
+        );
+        let out = conv.forward(&x).unwrap();
+        // With kernel=3, no padding: output = 3+3-1 = 5
+        assert_eq!(out.shape(), vec![1, 1, 5, 5]);
+
+        let loss = out.sum().unwrap();
+        loss.backward().unwrap();
+        assert!(x.grad().is_some());
+        assert_eq!(conv.parameters().len(), 2);
+    }
+
+    #[test]
+    fn test_batchnorm_training() {
+        let bn = BatchNorm::new(4).unwrap();
+        // Input: [batch=8, features=4]
+        let x = Variable::new(
+            Tensor::randn(&[8, 4], Default::default()).unwrap(),
+            true,
+        );
+        let out = bn.forward(&x).unwrap();
+        assert_eq!(out.shape(), vec![8, 4]);
+
+        // Output should be roughly normalized: mean ≈ 0 (with gamma=1, beta=0)
+        let out_data = out.data().to_f32_vec().unwrap();
+        let mean: f32 = out_data.iter().sum::<f32>() / out_data.len() as f32;
+        assert!(mean.abs() < 0.5, "mean should be close to 0, got {}", mean);
+
+        // Backward
+        let loss = out.sum().unwrap();
+        loss.backward().unwrap();
+        assert!(x.grad().is_some());
+        assert_eq!(bn.parameters().len(), 2);
+    }
+
+    #[test]
+    fn test_batchnorm_eval() {
+        let bn = BatchNorm::new(3).unwrap();
+
+        // Run a few training steps to populate running stats
+        for _ in 0..5 {
+            let x = Variable::new(
+                Tensor::randn(&[4, 3], Default::default()).unwrap(),
+                false,
+            );
+            bn.forward(&x).unwrap();
+        }
+
+        // Switch to eval mode
+        bn.set_training(false);
+        let x = Variable::new(
+            Tensor::randn(&[2, 3], Default::default()).unwrap(),
+            false,
+        );
+        let out = bn.forward(&x).unwrap();
+        assert_eq!(out.shape(), vec![2, 3]);
+    }
+
+    #[test]
+    fn test_adamw() {
+        let w = Parameter {
+            variable: Variable::new(from_f32(&[1.0, 2.0, 3.0], &[3]), true),
+            name: "w".into(),
+        };
+        let params = vec![w.clone()];
+        let mut opt = AdamW::new(&params, 0.01, 0.01);
+
+        // Simulate a gradient
+        let loss = w.variable.mul_scalar(2.0).unwrap().sum().unwrap();
+        loss.backward().unwrap();
+
+        let before = w.variable.data().to_f32_vec().unwrap();
+        opt.step().unwrap();
+        let after = w.variable.data().to_f32_vec().unwrap();
+
+        // Parameters should have changed
+        assert!(before != after, "AdamW should update parameters");
+        opt.zero_grad();
+    }
+
+    #[test]
+    fn test_xavier_init() {
+        let t = init::xavier_uniform(&[10, 20], 10, 20, Device::CPU).unwrap();
+        assert_eq!(t.shape(), vec![10, 20]);
+        let data = t.to_f32_vec().unwrap();
+        let bound = (6.0 / 30.0_f64).sqrt() as f32;
+        for &v in &data {
+            assert!(v >= -bound - 0.01 && v <= bound + 0.01,
+                "xavier_uniform value {} out of bounds [{}, {}]", v, -bound, bound);
+        }
+
+        let t = init::xavier_normal(&[10, 20], 10, 20, Device::CPU).unwrap();
+        assert_eq!(t.shape(), vec![10, 20]);
     }
 }

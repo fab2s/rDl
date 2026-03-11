@@ -357,6 +357,110 @@ impl Variable {
         Ok(Variable::from_op(result, grad_fn))
     }
 
+    /// Mean along a dimension, optionally keeping the dimension.
+    pub fn mean_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
+        let result = self.inner.borrow().data.mean_dim(dim, keepdim)?;
+
+        if !needs_grad(&[self]) {
+            return Ok(Variable::leaf(result, false));
+        }
+
+        let input_shape = self.inner.borrow().data.shape();
+        let dim_size = input_shape[dim as usize] as f64;
+
+        let grad_fn = GradFn {
+            name: "MeanDimBackward",
+            inputs: vec![self.clone()],
+            apply: Box::new(move |grad: &Tensor| {
+                let grad_for_expand = if keepdim {
+                    grad.clone()
+                } else {
+                    let mut shape = input_shape.clone();
+                    shape[dim as usize] = 1;
+                    grad.reshape(&shape)?
+                };
+                Ok(vec![grad_for_expand.expand(&input_shape)?.mul_scalar(1.0 / dim_size)?])
+            }),
+        };
+
+        Ok(Variable::from_op(result, grad_fn))
+    }
+
+    /// Softmax along a dimension with native libtorch forward.
+    pub fn softmax(&self, dim: i32) -> Result<Variable> {
+        let result = self.inner.borrow().data.softmax(dim)?;
+
+        if !needs_grad(&[self]) {
+            return Ok(Variable::leaf(result, false));
+        }
+
+        let saved_output = result.clone();
+
+        // d(softmax)/dx_i = softmax_i * (delta_ij - softmax_j)
+        // grad_input = softmax * (grad - sum(grad * softmax, dim, keepdim))
+        let grad_fn = GradFn {
+            name: "SoftmaxBackward",
+            inputs: vec![self.clone()],
+            apply: Box::new(move |grad: &Tensor| {
+                let gs = grad.mul(&saved_output)?;
+                let sum_gs = gs.sum_dim(dim, true)?;
+                let correction = saved_output.mul(&sum_gs)?;
+                Ok(vec![gs.sub(&correction)?])
+            }),
+        };
+
+        Ok(Variable::from_op(result, grad_fn))
+    }
+
+    /// Clamp values to [min, max].
+    pub fn clamp(&self, min: f64, max: f64) -> Result<Variable> {
+        let result = self.inner.borrow().data.clamp(min, max)?;
+
+        if !needs_grad(&[self]) {
+            return Ok(Variable::leaf(result, false));
+        }
+
+        let saved_input = self.inner.borrow().data.clone();
+
+        // Gradient passes through where input was not clamped
+        let grad_fn = GradFn {
+            name: "ClampBackward",
+            inputs: vec![self.clone()],
+            apply: Box::new(move |grad: &Tensor| {
+                // Where clamp didn't change the value, pass gradient through
+                let clamped = saved_input.clamp(min, max)?;
+                let diff = saved_input.sub(&clamped)?.abs()?;
+                let mask = Tensor::ones_like(&diff)?.sub(&diff.gt_scalar(1e-30)?)?;
+                Ok(vec![grad.mul(&mask)?])
+            }),
+        };
+
+        Ok(Variable::from_op(result, grad_fn))
+    }
+
+    /// Element-wise power with scalar exponent.
+    pub fn pow_scalar(&self, exponent: f64) -> Result<Variable> {
+        let result = self.inner.borrow().data.pow_scalar(exponent)?;
+
+        if !needs_grad(&[self]) {
+            return Ok(Variable::leaf(result, false));
+        }
+
+        let saved_input = self.inner.borrow().data.clone();
+
+        // d(x^n)/dx = n * x^(n-1)
+        let grad_fn = GradFn {
+            name: "PowScalarBackward",
+            inputs: vec![self.clone()],
+            apply: Box::new(move |grad: &Tensor| {
+                let x_pow = saved_input.pow_scalar(exponent - 1.0)?;
+                Ok(vec![grad.mul(&x_pow)?.mul_scalar(exponent)?])
+            }),
+        };
+
+        Ok(Variable::from_op(result, grad_fn))
+    }
+
     // --- Element-wise math ---
 
     /// Absolute value with differentiable backward (sign function).
@@ -702,4 +806,101 @@ pub fn layer_norm(
     };
 
     Ok(Variable::from_op(output, grad_fn))
+}
+
+/// 2D convolution with differentiable backward for input, weight, and optional bias.
+pub fn conv2d(
+    input: &Variable, weight: &Variable, bias: Option<&Variable>,
+    stride: [i64; 2], padding: [i64; 2], dilation: [i64; 2], groups: i64,
+) -> Result<Variable> {
+    let input_data = input.inner.borrow().data.clone();
+    let weight_data = weight.inner.borrow().data.clone();
+    let bias_data = bias.map(|b| b.inner.borrow().data.clone());
+
+    let result = input_data.conv2d(
+        &weight_data, bias_data.as_ref(),
+        stride, padding, dilation, groups,
+    )?;
+
+    let grad_vars: Vec<&Variable> = if let Some(b) = bias {
+        vec![input, weight, b]
+    } else {
+        vec![input, weight]
+    };
+
+    if !needs_grad(&grad_vars) {
+        return Ok(Variable::leaf(result, false));
+    }
+
+    let saved_input = input_data;
+    let saved_weight = weight_data;
+    let has_bias = bias.is_some();
+    let inputs: Vec<Variable> = grad_vars.iter().map(|v| (*v).clone()).collect();
+
+    let grad_fn = GradFn {
+        name: "Conv2dBackward",
+        inputs,
+        apply: Box::new(move |grad: &Tensor| {
+            let (gi, gw, gb) = Tensor::conv2d_backward(
+                grad, &saved_input, &saved_weight,
+                stride, padding, dilation, groups, has_bias,
+            )?;
+            if has_bias {
+                Ok(vec![gi, gw, gb.unwrap()])
+            } else {
+                Ok(vec![gi, gw])
+            }
+        }),
+    };
+
+    Ok(Variable::from_op(result, grad_fn))
+}
+
+/// Transposed 2D convolution with differentiable backward.
+pub fn conv_transpose2d(
+    input: &Variable, weight: &Variable, bias: Option<&Variable>,
+    stride: [i64; 2], padding: [i64; 2], output_padding: [i64; 2],
+    dilation: [i64; 2], groups: i64,
+) -> Result<Variable> {
+    let input_data = input.inner.borrow().data.clone();
+    let weight_data = weight.inner.borrow().data.clone();
+    let bias_data = bias.map(|b| b.inner.borrow().data.clone());
+
+    let result = input_data.conv_transpose2d(
+        &weight_data, bias_data.as_ref(),
+        stride, padding, output_padding, dilation, groups,
+    )?;
+
+    let grad_vars: Vec<&Variable> = if let Some(b) = bias {
+        vec![input, weight, b]
+    } else {
+        vec![input, weight]
+    };
+
+    if !needs_grad(&grad_vars) {
+        return Ok(Variable::leaf(result, false));
+    }
+
+    let saved_input = input_data;
+    let saved_weight = weight_data;
+    let has_bias = bias.is_some();
+    let inputs: Vec<Variable> = grad_vars.iter().map(|v| (*v).clone()).collect();
+
+    let grad_fn = GradFn {
+        name: "ConvTranspose2dBackward",
+        inputs,
+        apply: Box::new(move |grad: &Tensor| {
+            let (gi, gw, gb) = Tensor::conv_transpose2d_backward(
+                grad, &saved_input, &saved_weight,
+                stride, padding, output_padding, dilation, groups, has_bias,
+            )?;
+            if has_bias {
+                Ok(vec![gi, gw, gb.unwrap()])
+            } else {
+                Ok(vec![gi, gw])
+            }
+        }),
+    };
+
+    Ok(Variable::from_op(result, grad_fn))
 }

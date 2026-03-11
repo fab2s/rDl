@@ -110,6 +110,22 @@ impl Adam {
 
 impl Optimizer for Adam {
     fn step(&mut self) -> Result<()> {
+        self.adam_update(0.0)
+    }
+
+    fn zero_grad(&self) {
+        for param in &self.params {
+            param.zero_grad();
+        }
+    }
+
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
+    }
+}
+
+impl Adam {
+    fn adam_update(&mut self, weight_decay: f64) -> Result<()> {
         self.t += 1;
         let bc1 = 1.0 - self.beta1.powi(self.t as i32);
         let bc2 = 1.0 - self.beta2.powi(self.t as i32);
@@ -143,20 +159,53 @@ impl Optimizer for Adam {
                 // param -= lr * m_hat / (sqrt(v_hat) + eps)
                 let denom = v_hat.sqrt()?.add_scalar(self.eps)?;
                 let update = m_hat.div(&denom)?.mul_scalar(self.lr)?;
-                let new_data = param.data().sub(&update)?;
+                let mut new_data = param.data().sub(&update)?;
+
+                // Decoupled weight decay: param -= lr * wd * param
+                if weight_decay > 0.0 {
+                    let decay = param.data().mul_scalar(self.lr * weight_decay)?;
+                    new_data = new_data.sub(&decay)?;
+                }
+
                 param.set_data(new_data);
             }
         }
         Ok(())
     }
+}
 
-    fn zero_grad(&self) {
-        for param in &self.params {
-            param.zero_grad();
+/// AdamW optimizer (Adam with decoupled weight decay).
+///
+/// Unlike L2 regularization, weight decay is applied directly to parameters,
+/// not to gradients.
+pub struct AdamW {
+    adam: Adam,
+    weight_decay: f64,
+}
+
+impl AdamW {
+    pub fn new(params: &[Parameter], lr: f64, weight_decay: f64) -> Self {
+        AdamW {
+            adam: Adam::new(params, lr),
+            weight_decay,
         }
     }
 
+    pub fn lr(&self) -> f64 {
+        self.adam.lr
+    }
+}
+
+impl Optimizer for AdamW {
+    fn step(&mut self) -> Result<()> {
+        self.adam.adam_update(self.weight_decay)
+    }
+
+    fn zero_grad(&self) {
+        self.adam.zero_grad()
+    }
+
     fn set_lr(&mut self, lr: f64) {
-        self.lr = lr;
+        self.adam.lr = lr;
     }
 }
