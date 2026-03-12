@@ -1,11 +1,11 @@
-# rdl development commands
+# flodl development commands
 #
 # All commands run inside the Docker container via docker compose.
 
 COMPOSE = docker compose
 RUN     = $(COMPOSE) run --rm dev
 
-.PHONY: build test test-release check clippy shell clean image
+.PHONY: build test test-release check clippy doc shell clean image
 
 # Build the Docker image
 image:
@@ -30,6 +30,10 @@ check: image
 # Lint
 clippy: image
 	$(RUN) cargo clippy -- -W clippy::all
+
+# Generate API docs → target/doc/flodl/index.html
+doc: image
+	$(RUN) cargo doc --no-deps --document-private-items
 
 # Interactive shell
 shell: image

@@ -1,0 +1,259 @@
+digraph G {
+  rankdir=TB;
+  fontname="Helvetica";
+  node [fontname="Helvetica" fontsize=11 style=filled];
+  edge [fontname="Helvetica" fontsize=9];
+  compound=true;
+
+  subgraph cluster_level_0 {
+    label="level 0";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "linear_1" [label="linear\n#input\n[24 params]" shape=invhouse fillcolor="#aed6f1"];
+    "state_read_memory_25" [label="state_read_memory" shape=diamond fillcolor="#f9e79f"];
+  }
+
+  subgraph cluster_level_1 {
+    label="level 1";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "gelu_2" [label="gelu" shape=ellipse fillcolor="#fdebd0"];
+  }
+
+  subgraph cluster_level_2 {
+    label="level 2";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "layernorm_3" [label="layernorm\n[16 params]" shape=box fillcolor="#d5f5e3"];
+  }
+
+  subgraph cluster_level_3 {
+    label="level 3";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "rmsnorm_4" [label="rmsnorm" shape=box fillcolor="#d5f5e3"];
+  }
+
+  subgraph cluster_level_4 {
+    label="level 4";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "graph_6" [label="graph\n[88 params]" shape=box fillcolor="#eaecee"];
+    "graph_5" [label="graph\n[88 params]" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_5 {
+    label="level 5";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "merge_7" [label="merge" shape=circle fillcolor="#d5dbdb"];
+  }
+
+  subgraph cluster_level_6 {
+    label="level 6";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "linear_8" [label="linear\n[72 params]" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_7 {
+    label="level 7";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "add_9" [label="add" shape=circle fillcolor="#d5dbdb"];
+  }
+
+  subgraph cluster_level_8 {
+    label="level 8";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "dropout_10" [label="dropout" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_9 {
+    label="level 9";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "softclamp_11" [label="softclamp" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_10 {
+    label="level 10";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "softplus_12" [label="softplus" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_11 {
+    label="level 11";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "map_13" [label="map\n[10 params]" shape=parallelogram fillcolor="#a9cce3"];
+  }
+
+  subgraph cluster_level_12 {
+    label="level 12";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "reshape_14" [label="reshape" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_13 {
+    label="level 13";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "map_15" [label="map\n#halves\n[20 params]" shape=parallelogram fillcolor="#a9cce3"];
+  }
+
+  subgraph cluster_level_14 {
+    label="level 14";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "map_16" [label="map\n[20 params]" shape=parallelogram fillcolor="#a9cce3"];
+  }
+
+  subgraph cluster_level_15 {
+    label="level 15";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "reshape_17" [label="reshape" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_16 {
+    label="level 16";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "shape_ops_18" [label="shape_ops" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_17 {
+    label="level 17";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "neg_sigmoid_gate_19" [label="neg_sigmoid_gate" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_18 {
+    label="level 18";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "transpose_rt_20" [label="transpose_rt" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_19 {
+    label="level 19";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "loop_21" [label="loop\n#refined\n[88 params]" shape=box3d fillcolor="#d7bde2"];
+  }
+
+  subgraph cluster_level_20 {
+    label="level 20";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "gate_22" [label="gate\n[162 params]" shape=diamond fillcolor="#f5cba7"];
+  }
+
+  subgraph cluster_level_21 {
+    label="level 21";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "switch_23" [label="switch\n[160 params]" shape=diamond fillcolor="#f5cba7"];
+  }
+
+  subgraph cluster_level_22 {
+    label="level 22";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "state_add_24" [label="state_add\n#memory" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_23 {
+    label="level 23";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "loop_26" [label="loop\n[72 params]" shape=box3d fillcolor="#d7bde2"];
+  }
+
+  subgraph cluster_level_24 {
+    label="level 24";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "loop_27" [label="loop\n[81 params]" shape=box3d fillcolor="#d7bde2"];
+  }
+
+  subgraph cluster_level_25 {
+    label="level 25";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "log_softmax_reduce_28" [label="log_softmax_reduce" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_26 {
+    label="level 26";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "linear_29" [label="linear\n[16 params]" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_27 {
+    label="level 27";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "linear_30" [label="linear\n[72 params]" shape=box fillcolor="#eaecee"];
+    "linear_31" [label="linear\n[72 params]" shape=box fillcolor="#eaecee"];
+  }
+
+  subgraph cluster_level_28 {
+    label="level 28";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "merge_32" [label="merge" shape=circle fillcolor="#d5dbdb"];
+  }
+
+  subgraph cluster_level_29 {
+    label="level 29";
+    style=dashed; color="#999999"; fontcolor="#999999";
+    rank=same;
+    "linear_33" [label="linear\n#output\n[18 params]" shape=house fillcolor="#a9dfbf"];
+  }
+
+  "linear_1" -> "gelu_2" [style=solid color="#2c3e50"];
+  "gelu_2" -> "layernorm_3" [style=solid color="#2c3e50"];
+  "layernorm_3" -> "rmsnorm_4" [style=solid color="#2c3e50"];
+  "rmsnorm_4" -> "graph_5" [style=solid color="#2c3e50"];
+  "rmsnorm_4" -> "graph_6" [style=solid color="#2c3e50"];
+  "graph_5" -> "merge_7" [style=solid color="#2c3e50"];
+  "graph_6" -> "merge_7" [style=solid color="#2c3e50"];
+  "merge_7" -> "linear_8" [style=solid color="#2c3e50"];
+  "merge_7" -> "add_9" [style=solid color="#2c3e50"];
+  "linear_8" -> "add_9" [style=solid color="#2c3e50"];
+  "add_9" -> "dropout_10" [style=solid color="#2c3e50"];
+  "dropout_10" -> "softclamp_11" [style=solid color="#2c3e50"];
+  "softclamp_11" -> "softplus_12" [style=solid color="#2c3e50"];
+  "softplus_12" -> "map_13" [style=solid color="#2c3e50"];
+  "map_13" -> "reshape_14" [style=solid color="#2c3e50"];
+  "reshape_14" -> "map_15" [style=solid color="#2c3e50"];
+  "map_15" -> "map_16" [style=solid color="#2c3e50"];
+  "map_16" -> "reshape_17" [style=solid color="#2c3e50"];
+  "reshape_17" -> "shape_ops_18" [style=solid color="#2c3e50"];
+  "shape_ops_18" -> "neg_sigmoid_gate_19" [style=solid color="#2c3e50"];
+  "neg_sigmoid_gate_19" -> "transpose_rt_20" [style=solid color="#2c3e50"];
+  "transpose_rt_20" -> "loop_21" [style=solid color="#2c3e50"];
+  "loop_21" -> "gate_22" [style=solid color="#2c3e50"];
+  "linear_1" -> "gate_22" [style=dashed color="#2980b9" label="input" fontcolor="#2980b9"];
+  "gate_22" -> "switch_23" [style=solid color="#2c3e50"];
+  "loop_21" -> "switch_23" [style=dashed color="#2980b9" label="refined" fontcolor="#2980b9"];
+  "switch_23" -> "state_add_24" [style=solid color="#2c3e50"];
+  "state_read_memory_25" -> "state_add_24" [style=dashed color="#2980b9" label="memory" fontcolor="#2980b9"];
+  "state_add_24" -> "loop_26" [style=solid color="#2c3e50"];
+  "loop_26" -> "loop_27" [style=solid color="#2c3e50"];
+  "loop_27" -> "log_softmax_reduce_28" [style=solid color="#2c3e50"];
+  "log_softmax_reduce_28" -> "linear_29" [style=solid color="#2c3e50"];
+  "linear_29" -> "linear_30" [style=solid color="#2c3e50"];
+  "linear_29" -> "linear_31" [style=solid color="#2c3e50"];
+  "linear_30" -> "merge_32" [style=solid color="#2c3e50"];
+  "linear_31" -> "merge_32" [style=solid color="#2c3e50"];
+  "merge_32" -> "linear_33" [style=solid color="#2c3e50"];
+  "state_add_24" -> "state_read_state_add_24" [style=dotted color="#e67e22" label="state" fontcolor="#e67e22" constraint=false];
+}

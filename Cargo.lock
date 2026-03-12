@@ -19,14 +19,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "rdl"
+name = "flodl"
 version = "0.1.0"
 dependencies = [
- "rdl-sys",
+ "flodl-sys",
 ]
 
 [[package]]
-name = "rdl-sys"
+name = "flodl-sys"
 version = "0.1.0"
 dependencies = [
  "cc",

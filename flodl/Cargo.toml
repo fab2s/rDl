@@ -1,0 +1,25 @@
+[package]
+name = "flodl"
+version = "0.1.0"
+edition = "2024"
+description = "floDl — a flow-graph deep learning framework built on libtorch"
+license = "MIT"
+repository = "https://github.com/fab2s/floDl"
+homepage = "https://github.com/fab2s/floDl"
+readme = "../README.md"
+keywords = ["deep-learning", "machine-learning", "neural-network", "libtorch", "graph"]
+categories = ["science", "mathematics"]
+
+[features]
+default = []
+cuda = ["flodl-sys/cuda"]
+
+[dependencies]
+flodl-sys = { path = "../flodl-sys" }
+
+[package.metadata.docs.rs]
+# docs.rs has no libtorch — build with this cfg so the -sys build.rs can skip compilation.
+rustc-args = ["--cfg", "docsrs"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dev-dependencies]

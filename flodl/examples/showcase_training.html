@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Training Curves</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Helvetica,Arial,sans-serif;background:#f5f6fa;padding:24px}
+.container{background:#fff;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.08);padding:24px;max-width:960px;margin:0 auto}
+h2{color:#2c3e50;margin-bottom:16px;font-size:18px}
+canvas{width:100%;cursor:crosshair}
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:14px}
+.legend-item{display:flex;align-items:center;gap:6px;font-size:12px;color:#555}
+.legend-color{width:12px;height:12px;border-radius:2px}
+.tooltip{position:absolute;background:rgba(44,62,80,.9);color:#fff;padding:6px 10px;border-radius:4px;font-size:11px;pointer-events:none;display:none;white-space:nowrap}
+</style>
+</head>
+<body>
+<div class="container">
+<h2>Training Curves</h2>
+<canvas id="chart" height="400"></canvas>
+<div class="legend" id="legend"></div>
+</div>
+<div class="tooltip" id="tooltip"></div>
+<script>
+const DATA=[{"name":"loss","values":[22568.32025146,808.07314301,148.33106613]}];
+const COLORS=['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#34495e','#c0392b','#2980b9','#27ae60','#d35400'];
+const canvas=document.getElementById('chart');
+const ctx=canvas.getContext('2d');
+const tooltip=document.getElementById('tooltip');
+const legend=document.getElementById('legend');
+const dpr=window.devicePixelRatio||1;
+function resize(){
+  const rect=canvas.getBoundingClientRect();
+  canvas.width=rect.width*dpr;
+  canvas.height=rect.height*dpr;
+  ctx.scale(dpr,dpr);
+  draw();
+}
+const M={top:20,right:20,bottom:36,left:60};
+function draw(){
+  const W=canvas.width/dpr,H=canvas.height/dpr;
+  const pw=W-M.left-M.right,ph=H-M.top-M.bottom;
+  ctx.clearRect(0,0,W,H);
+  if(!DATA||DATA.length===0)return;
+  let maxEp=0,minV=Infinity,maxV=-Infinity;
+  DATA.forEach(s=>{
+    maxEp=Math.max(maxEp,s.values.length);
+    s.values.forEach(v=>{minV=Math.min(minV,v);maxV=Math.max(maxV,v)});
+  });
+  if(minV===maxV){minV-=1;maxV+=1}
+  const pad=(maxV-minV)*0.05;
+  minV-=pad;maxV+=pad;
+  const xScale=i=>M.left+(i/(maxEp-1||1))*pw;
+  const yScale=v=>M.top+ph-(v-minV)/(maxV-minV)*ph;
+  ctx.strokeStyle='#eee';ctx.lineWidth=1;
+  const yTicks=5;
+  for(let i=0;i<=yTicks;i++){
+    const v=minV+(maxV-minV)*i/yTicks;
+    const y=yScale(v);
+    ctx.beginPath();ctx.moveTo(M.left,y);ctx.lineTo(W-M.right,y);ctx.stroke();
+    ctx.fillStyle='#999';ctx.font='10px Helvetica';ctx.textAlign='right';
+    ctx.fillText(formatVal(v),M.left-6,y+3);
+  }
+  const xStep=Math.max(1,Math.floor(maxEp/10));
+  ctx.textAlign='center';
+  for(let i=0;i<maxEp;i+=xStep){
+    const x=xScale(i);
+    ctx.beginPath();ctx.moveTo(x,M.top);ctx.lineTo(x,H-M.bottom);ctx.stroke();
+    ctx.fillStyle='#999';ctx.font='10px Helvetica';
+    ctx.fillText(''+(i+1),x,H-M.bottom+14);
+  }
+  ctx.fillStyle='#888';ctx.font='11px Helvetica';ctx.textAlign='center';
+  ctx.fillText('Epoch',M.left+pw/2,H-4);
+  DATA.forEach((s,si)=>{
+    const color=COLORS[si%COLORS.length];
+    ctx.strokeStyle=color;ctx.lineWidth=2;
+    ctx.beginPath();
+    s.values.forEach((v,i)=>{
+      const x=xScale(i),y=yScale(v);
+      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    s.values.forEach((v,i)=>{
+      ctx.fillStyle=color;ctx.beginPath();
+      ctx.arc(xScale(i),yScale(v),3,0,Math.PI*2);ctx.fill();
+    });
+  });
+  canvas._layout={xScale,yScale,maxEp,minV,maxV,pw,ph};
+}
+function formatVal(v){
+  if(Math.abs(v)<0.001&&v!==0)return v.toExponential(1);
+  if(Math.abs(v)>=1000)return v.toFixed(0);
+  if(Math.abs(v)>=1)return v.toFixed(3);
+  return v.toFixed(4);
+}
+DATA.forEach((s,i)=>{
+  const item=document.createElement('div');item.className='legend-item';
+  const swatch=document.createElement('div');swatch.className='legend-color';
+  swatch.style.background=COLORS[i%COLORS.length];
+  const label=document.createTextNode(s.name);
+  item.appendChild(swatch);item.appendChild(label);
+  legend.appendChild(item);
+});
+canvas.addEventListener('mousemove',e=>{
+  const L=canvas._layout;if(!L)return;
+  const rect=canvas.getBoundingClientRect();
+  const mx=e.clientX-rect.left,my=e.clientY-rect.top;
+  let bestDist=Infinity,bestEp=-1;
+  for(let i=0;i<L.maxEp;i++){
+    const d=Math.abs(L.xScale(i)-mx);
+    if(d<bestDist){bestDist=d;bestEp=i}
+  }
+  if(bestDist>20){tooltip.style.display='none';return}
+  let html='<b>Epoch '+(bestEp+1)+'</b>';
+  DATA.forEach((s,si)=>{
+    if(bestEp<s.values.length){
+      const c=COLORS[si%COLORS.length];
+      html+='<br><span style="color:'+c+'">■</span> '+s.name+': '+formatVal(s.values[bestEp]);
+    }
+  });
+  tooltip.innerHTML=html;tooltip.style.display='block';
+  tooltip.style.left=(e.pageX+12)+'px';tooltip.style.top=(e.pageY-10)+'px';
+});
+canvas.addEventListener('mouseleave',()=>{tooltip.style.display='none'});
+window.addEventListener('resize',resize);
+resize();
+</script>
+</body>
+</html>

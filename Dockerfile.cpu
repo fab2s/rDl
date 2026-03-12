@@ -1,4 +1,4 @@
-# rdl CPU-only image — for CI and development without GPU.
+# flodl CPU-only image — for CI and development without GPU.
 
 FROM ubuntu:24.04
 
@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     pkg-config \
+    graphviz \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Rust ---
