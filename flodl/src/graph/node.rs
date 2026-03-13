@@ -25,6 +25,10 @@ pub(crate) struct Node {
     pub ref_forward: Option<RefForwardFn>,
     /// Trace buffer for loop nodes whose body implements Module::trace().
     pub trace_buf: Option<Rc<RefCell<Vec<Variable>>>>,
+    /// Shared port list for loop nodes — the loop's run closure reads this
+    /// at execution time to extract refs. Updated by wire_using when
+    /// .using() is chained after a loop.
+    pub loop_ports: Option<Rc<RefCell<Vec<String>>>>,
 }
 
 #[derive(Clone, Debug)]

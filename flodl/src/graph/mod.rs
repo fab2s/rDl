@@ -757,6 +757,91 @@ mod tests {
         assert!((data[2] - 7.0).abs() < 1e-5);
     }
 
+    // --- Fork tests ---
+
+    #[test]
+    fn test_fork_basic() {
+        // Fork runs a side module but main stream continues unchanged.
+        // identity(x) → fork(linear) tagged "side" → through(ReLU)
+        // Main stream: ReLU(identity(x)) = ReLU(x)
+        // Side output: linear(x) accessible via tagged("side")
+        let l = Linear::new(2, 3).unwrap();
+
+        let graph = FlowBuilder::from(Identity)
+            .fork(l)
+            .tag("side")
+            .through(ReLU::new())
+            .build()
+            .unwrap();
+
+        let x = Variable::new(from_f32(&[1.0, -2.0], &[1, 2]), false);
+        let y = graph.forward(&x).unwrap();
+
+        // Main stream went through ReLU(identity(x)) → shape [1, 2]
+        assert_eq!(y.shape(), vec![1, 2]);
+        let data = y.data().to_f32_vec().unwrap();
+        assert!((data[0] - 1.0).abs() < 1e-5);
+        assert!((data[1] - 0.0).abs() < 1e-5); // ReLU(-2) = 0
+
+        // Side output is linear(x) → shape [1, 3]
+        let side = graph.tagged("side").unwrap();
+        assert_eq!(side.shape(), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_fork_multiple() {
+        // Two forks from the same stream: letter_head and case_head pattern
+        let head_a = Linear::new(4, 3).unwrap();
+        let head_b = Linear::new(4, 2).unwrap();
+
+        let graph = FlowBuilder::from(Linear::new(2, 4).unwrap())
+            .tag("latent")
+            .fork(head_a)
+            .tag("head_a")
+            .fork(head_b)
+            .tag("head_b")
+            .build()
+            .unwrap();
+
+        let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
+        let y = graph.forward(&x).unwrap();
+
+        // Main stream is still the linear(2→4) output
+        assert_eq!(y.shape(), vec![1, 4]);
+
+        // Both forks produced their outputs
+        let a = graph.tagged("head_a").unwrap();
+        assert_eq!(a.shape(), vec![1, 3]);
+        let b = graph.tagged("head_b").unwrap();
+        assert_eq!(b.shape(), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_fork_backward() {
+        // Gradients flow through both forks and the main stream
+        let graph = FlowBuilder::from(Linear::new(2, 4).unwrap())
+            .fork(Linear::new(4, 3).unwrap())
+            .tag("side")
+            .through(Linear::new(4, 1).unwrap())
+            .build()
+            .unwrap();
+
+        let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), true);
+        let y = graph.forward(&x).unwrap();
+
+        // Loss from main stream + side output
+        let side = graph.tagged("side").unwrap();
+        let loss = y.sum().unwrap().add(&side.sum().unwrap()).unwrap();
+        loss.backward().unwrap();
+
+        assert!(x.grad().is_some(), "input should have gradient");
+        for p in graph.parameters() {
+            assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        }
+    }
+
+    // --- Split/Merge tests ---
+
     #[test]
     fn test_split_merge_add() {
         let graph = FlowBuilder::from(Linear::new(3, 3).unwrap())
@@ -1221,6 +1306,51 @@ mod tests {
         let x = Variable::new(from_f32(&[1.0, 2.0, 3.0], &[1, 3]), false);
         let y = graph.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_loop_using_backward_ref() {
+        // Tag a tensor, then use it inside a loop body via .using()
+        // Graph: identity → tag("ctx") → loop_body(AddRefModule).for_n(3).using("ctx")
+        // Each iteration: state = state + ctx
+        // So after 3 iterations: state = x + 3*x = 4*x
+        let graph = FlowBuilder::from(Identity)
+            .tag("ctx")
+            .loop_body(AddRefModule)
+            .for_n(3)
+            .using(&["ctx"])
+            .build()
+            .unwrap();
+
+        let x = Variable::new(from_f32(&[2.0, 3.0], &[1, 2]), false);
+        let y = graph.forward(&x).unwrap();
+        let data = y.data().to_f32_vec().unwrap();
+
+        // x = [2, 3], after 3 iterations of (state + ctx): [8, 12]
+        assert!((data[0] - 8.0).abs() < 1e-5, "got {}", data[0]);
+        assert!((data[1] - 12.0).abs() < 1e-5, "got {}", data[1]);
+    }
+
+    #[test]
+    fn test_loop_using_backward_gradients() {
+        // Ensure gradients flow through loop+using
+        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+            .tag("ctx")
+            .loop_body(AddRefModule)
+            .for_n(2)
+            .using(&["ctx"])
+            .build()
+            .unwrap();
+
+        let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), true);
+        let y = graph.forward(&x).unwrap();
+        let loss = y.sum().unwrap();
+        loss.backward().unwrap();
+
+        assert!(x.grad().is_some(), "input should have gradient");
+        for p in graph.parameters() {
+            assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        }
     }
 
     // --- Forward reference tests ---

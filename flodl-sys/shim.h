@@ -147,6 +147,7 @@ char* flodl_index_add(FlodlTensor t, int dim, FlodlTensor index,
 // --- Concatenation ---
 
 char* flodl_cat2(FlodlTensor a, FlodlTensor b, int dim, FlodlTensor* result);
+char* flodl_stack(FlodlTensor* tensors, int count, int dim, FlodlTensor* result);
 
 // --- Conditional ---
 

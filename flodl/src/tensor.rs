@@ -623,6 +623,22 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
+    /// Stack tensors along a new dimension.
+    ///
+    /// All tensors must have the same shape. A new dimension is inserted at `dim`.
+    pub fn stack(tensors: &[&Tensor], dim: i32) -> Result<Tensor> {
+        if tensors.is_empty() {
+            return Err(TensorError::new("stack: empty tensor list"));
+        }
+        let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let mut result: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_stack(handles.as_mut_ptr(), handles.len() as i32, dim, &mut result)
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(result))
+    }
+
     /// Softmax along a dimension.
     pub fn softmax(&self, dim: i32) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -1219,5 +1235,24 @@ mod tests {
         let t = Tensor::ones(&[2, 3, 4], TensorOptions::default()).unwrap();
         let f = t.flatten(1, 2).unwrap();
         assert_eq!(f.shape(), vec![2, 12]);
+    }
+
+    #[test]
+    fn test_stack() {
+        let a = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
+        let b = Tensor::from_f32(&[3.0, 4.0], &[2], Device::CPU).unwrap();
+        let c = Tensor::from_f32(&[5.0, 6.0], &[2], Device::CPU).unwrap();
+
+        // Stack along dim 0: [3, 2]
+        let s = Tensor::stack(&[&a, &b, &c], 0).unwrap();
+        assert_eq!(s.shape(), vec![3, 2]);
+        let data = s.to_f32_vec().unwrap();
+        assert_eq!(data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // Stack along dim 1: [2, 3]
+        let s1 = Tensor::stack(&[&a, &b, &c], 1).unwrap();
+        assert_eq!(s1.shape(), vec![2, 3]);
+        let data1 = s1.to_f32_vec().unwrap();
+        assert_eq!(data1, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
     }
 }

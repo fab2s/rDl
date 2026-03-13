@@ -52,6 +52,8 @@ pub struct FlowBuilder {
     pub(super) current: Vec<NodeRef>,
     pub(super) taps: HashMap<String, NodeRef>,
     pub(super) on_target: Option<NodeRef>,
+    /// Side-branch output from fork(), consumed by the next tag() call.
+    fork_target: Option<NodeRef>,
     pub(super) counter: usize,
     pub(super) err: Option<String>,
     /// Pending forward references: Using("x") called before Tag("x").
@@ -73,6 +75,7 @@ impl FlowBuilder {
             current: Vec::new(),
             taps: HashMap::new(),
             on_target: None,
+            fork_target: None,
             counter: 0,
             err: None,
             pending: HashMap::new(),
@@ -116,6 +119,44 @@ impl FlowBuilder {
 
         self.on_target = Some(node_ref.clone());
         self.current = vec![node_ref];
+        self
+    }
+
+    /// Fork: run a module on the current stream as a side branch.
+    /// The module's output can be tagged, but the **main stream continues unchanged**.
+    ///
+    /// Use this when multiple modules consume the same tensor independently
+    /// (e.g. classification heads that read the same latent).
+    ///
+    /// ```ignore
+    /// .through(encoder).tag("latent")
+    /// .fork(letter_head).tag("letter_logits")
+    /// .fork(case_head).tag("case_logits")
+    /// .through(decoder)   // decoder still sees encoder output
+    /// ```
+    pub fn fork(mut self, module: impl Module + 'static) -> Self {
+        if self.err.is_some() {
+            return self;
+        }
+        if self.current.len() != 1 {
+            self.err = Some("fork requires single stream".into());
+            return self;
+        }
+
+        let prev = self.current[0].clone();
+        let node_ref = self.add_module(module);
+
+        self.edges.push(Edge {
+            from_node: prev.node_id.clone(),
+            from_port: prev.port.clone(),
+            to_node: node_ref.node_id.clone(),
+            to_port: DEFAULT_INPUT.into(),
+        });
+
+        // on_target for .using(), fork_target for .tag()
+        // current stays on the main stream
+        self.on_target = Some(node_ref.clone());
+        self.fork_target = Some(node_ref);
         self
     }
 
@@ -177,7 +218,8 @@ impl FlowBuilder {
             return self;
         }
 
-        let cur = self.current[0].clone();
+        // Fork target takes priority (side-branch output), otherwise main stream.
+        let cur = self.fork_target.take().unwrap_or_else(|| self.current[0].clone());
         self.taps.insert(name.to_string(), cur.clone());
 
         // Resolve any pending forward references to this tag
@@ -500,6 +542,7 @@ impl FlowBuilder {
                 module: Some(rc),
                 ref_forward,
                 trace_buf: None,
+                loop_ports: None,
             },
         );
 
@@ -570,11 +613,16 @@ impl FlowBuilder {
             }
         }
 
-        // Rebuild run function with updated ports
+        // Update run function with new ports
         let node = self.nodes.get_mut(&target.node_id).unwrap();
-        if let (Some(module), Some(ref_forward)) =
+        if let Some(ref loop_ports) = node.loop_ports {
+            // Loop nodes: update the shared port list — the loop's run closure
+            // already reads this at execution time via extract_refs.
+            *loop_ports.borrow_mut() = node.input_ports.clone();
+        } else if let (Some(module), Some(ref_forward)) =
             (node.module.clone(), node.ref_forward.clone())
         {
+            // Non-loop nodes: rebuild run with wrap_ref_module
             let ports = node.input_ports.clone();
             node.run = wrap_ref_module(module, ref_forward, ports);
         }
@@ -602,6 +650,7 @@ impl FlowBuilder {
                 module: None,
                 ref_forward: None,
                 trace_buf: None,
+                loop_ports: None,
             },
         );
 
@@ -629,6 +678,7 @@ impl FlowBuilder {
                 module: None,
                 ref_forward: None,
                 trace_buf: None,
+                loop_ports: None,
             },
         );
 
@@ -650,6 +700,7 @@ impl FlowBuilder {
                 module: None,
                 ref_forward: None,
                 trace_buf: None,
+                loop_ports: None,
             },
         );
         NodeRef {
@@ -689,6 +740,7 @@ impl FlowBuilder {
                 module: None,
                 ref_forward: None,
                 trace_buf: None,
+                loop_ports: None,
             },
         );
 

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::autograd::Variable;
@@ -36,12 +37,13 @@ impl LoopBuilder {
 
         let body: Rc<dyn Module> = Rc::from(self.body);
         let trace_buf: Rc<RefCell<Vec<Variable>>> = Rc::new(RefCell::new(Vec::new()));
-        let run = make_for_loop_func(body.clone(), n, trace_buf.clone());
+        let ports: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![DEFAULT_INPUT.into()]));
+        let run = make_for_loop_func(body.clone(), n, trace_buf.clone(), ports.clone());
         let composite: Rc<dyn Module> = Rc::new(LoopComposite {
             body,
             cond: None,
         });
-        wire_loop(fb, composite, run, trace_buf)
+        wire_loop(fb, composite, run, trace_buf, ports)
     }
 
     /// Repeat while condition says "continue" (positive output = halt).
@@ -63,12 +65,13 @@ impl LoopBuilder {
         let body: Rc<dyn Module> = Rc::from(self.body);
         let cond: Rc<dyn Module> = Rc::new(cond);
         let trace_buf: Rc<RefCell<Vec<Variable>>> = Rc::new(RefCell::new(Vec::new()));
-        let run = make_while_loop_func(body.clone(), cond.clone(), max_iter, trace_buf.clone());
+        let ports: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![DEFAULT_INPUT.into()]));
+        let run = make_while_loop_func(body.clone(), cond.clone(), max_iter, trace_buf.clone(), ports.clone());
         let composite: Rc<dyn Module> = Rc::new(LoopComposite {
             body,
             cond: Some(cond),
         });
-        wire_loop(fb, composite, run, trace_buf)
+        wire_loop(fb, composite, run, trace_buf, ports)
     }
 
     /// Repeat until condition signals halt (positive output = halt).
@@ -90,12 +93,13 @@ impl LoopBuilder {
         let body: Rc<dyn Module> = Rc::from(self.body);
         let cond: Rc<dyn Module> = Rc::new(cond);
         let trace_buf: Rc<RefCell<Vec<Variable>>> = Rc::new(RefCell::new(Vec::new()));
-        let run = make_until_loop_func(body.clone(), cond.clone(), max_iter, trace_buf.clone());
+        let ports: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![DEFAULT_INPUT.into()]));
+        let run = make_until_loop_func(body.clone(), cond.clone(), max_iter, trace_buf.clone(), ports.clone());
         let composite: Rc<dyn Module> = Rc::new(LoopComposite {
             body,
             cond: Some(cond),
         });
-        wire_loop(fb, composite, run, trace_buf)
+        wire_loop(fb, composite, run, trace_buf, ports)
     }
 }
 
@@ -105,9 +109,25 @@ fn wire_loop(
     composite: Rc<dyn Module>,
     run: NodeFn,
     trace_buf: Rc<RefCell<Vec<Variable>>>,
+    ports: Rc<RefCell<Vec<String>>>,
 ) -> FlowBuilder {
     let cur = fb.current[0].clone();
     let id = fb.next_id("loop");
+
+    // If the body supports NamedInputModule, expose ref_forward on the loop node
+    // so that .using() can be chained after the loop.
+    let ref_forward = if composite.sub_modules().first()
+        .and_then(|body| body.as_named_input())
+        .is_some()
+    {
+        let body_rc = composite.sub_modules().into_iter().next().unwrap();
+        let rf: RefForwardFn = Rc::new(move |input, refs| {
+            body_rc.as_named_input().unwrap().forward_named(input, refs)
+        });
+        Some(rf)
+    } else {
+        None
+    };
 
     fb.nodes.insert(
         id.clone(),
@@ -117,8 +137,9 @@ fn wire_loop(
             output_ports: vec![DEFAULT_OUTPUT.into()],
             run,
             module: Some(composite),
-            ref_forward: None,
+            ref_forward,
             trace_buf: Some(trace_buf),
+            loop_ports: Some(ports),
         },
     );
 
@@ -138,16 +159,32 @@ fn wire_loop(
     fb
 }
 
+/// Execute body step: use forward_named if refs are available, plain forward otherwise.
+fn body_step(
+    body: &Rc<dyn Module>,
+    state: &Variable,
+    refs: &HashMap<String, Variable>,
+) -> Result<Variable> {
+    if !refs.is_empty()
+        && let Some(named) = body.as_named_input()
+    {
+        return named.forward_named(state, refs);
+    }
+    body.forward(state)
+}
+
 fn make_for_loop_func(
     body: Rc<dyn Module>,
     count: usize,
     trace_buf: Rc<RefCell<Vec<Variable>>>,
+    ports: Rc<RefCell<Vec<String>>>,
 ) -> NodeFn {
     Box::new(move |inputs: &[Variable]| {
         let mut state = inputs[0].clone();
+        let refs = extract_refs(&ports.borrow(), inputs);
         trace_buf.borrow_mut().clear();
         for i in 0..count {
-            state = body.forward(&state).map_err(|e| {
+            state = body_step(&body, &state, &refs).map_err(|e| {
                 crate::tensor::TensorError::new(&format!("loop iteration {}: {}", i, e))
             })?;
             if let Some(t) = body.trace() {
@@ -163,9 +200,11 @@ fn make_while_loop_func(
     cond: Rc<dyn Module>,
     max_iter: usize,
     trace_buf: Rc<RefCell<Vec<Variable>>>,
+    ports: Rc<RefCell<Vec<String>>>,
 ) -> NodeFn {
     Box::new(move |inputs: &[Variable]| {
         let mut state = inputs[0].clone();
+        let refs = extract_refs(&ports.borrow(), inputs);
         trace_buf.borrow_mut().clear();
         for i in 0..max_iter {
             let halt = cond.forward(&state)?;
@@ -178,7 +217,7 @@ fn make_while_loop_func(
             if !halt_val.is_empty() && halt_val[0] > 0.0 {
                 break;
             }
-            state = body.forward(&state).map_err(|e| {
+            state = body_step(&body, &state, &refs).map_err(|e| {
                 crate::tensor::TensorError::new(&format!("loop iteration {}: {}", i, e))
             })?;
             if let Some(t) = body.trace() {
@@ -194,12 +233,14 @@ fn make_until_loop_func(
     cond: Rc<dyn Module>,
     max_iter: usize,
     trace_buf: Rc<RefCell<Vec<Variable>>>,
+    ports: Rc<RefCell<Vec<String>>>,
 ) -> NodeFn {
     Box::new(move |inputs: &[Variable]| {
         let mut state = inputs[0].clone();
+        let refs = extract_refs(&ports.borrow(), inputs);
         trace_buf.borrow_mut().clear();
         for i in 0..max_iter {
-            state = body.forward(&state).map_err(|e| {
+            state = body_step(&body, &state, &refs).map_err(|e| {
                 crate::tensor::TensorError::new(&format!("loop iteration {}: {}", i, e))
             })?;
             if let Some(t) = body.trace() {

@@ -92,6 +92,11 @@ impl Graph {
         buffer.entry(tag.to_string()).or_default().extend_from_slice(values);
     }
 
+    /// Record a single scalar value. Convenience wrapper around [`record`](Self::record).
+    pub fn record_scalar(&self, tag: &str, value: f64) {
+        self.record(tag, &[value]);
+    }
+
     /// Read raw batch buffer for a tag (all values since last flush).
     pub fn collected(&self, tag: &str) -> Vec<f64> {
         self.batch_buffer.borrow().get(tag).cloned().unwrap_or_default()
@@ -206,6 +211,21 @@ impl Graph {
             }
         }
         None
+    }
+
+    /// Estimated time remaining based on average flush duration.
+    ///
+    /// Returns seconds remaining. Returns 0.0 if no flushes have occurred yet.
+    pub fn eta(&self, total_epochs: usize) -> f64 {
+        let count = self.flush_count.get();
+        if count == 0 {
+            return 0.0;
+        }
+        let times = self.flush_times.borrow();
+        let elapsed = times[count - 1]; // already relative to training_start
+        let per_flush = elapsed / count as f64;
+        let remaining = total_epochs.saturating_sub(count);
+        per_flush * remaining as f64
     }
 
     /// Expand tag group names into their member tags.

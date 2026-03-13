@@ -798,6 +798,21 @@ extern "C" char* flodl_cat2(FlodlTensor a, FlodlTensor b, int dim,
     }
 }
 
+extern "C" char* flodl_stack(FlodlTensor* tensors, int count, int dim,
+                            FlodlTensor* result) {
+    try {
+        std::vector<at::Tensor> vec;
+        vec.reserve(count);
+        for (int i = 0; i < count; i++) {
+            vec.push_back(unwrap(tensors[i]));
+        }
+        *result = wrap(torch::stack(vec, dim));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
 // --- Conditional ---
 
 extern "C" char* flodl_where(FlodlTensor condition, FlodlTensor x,
