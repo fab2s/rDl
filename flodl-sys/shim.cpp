@@ -13,6 +13,10 @@
 #include <cstring>
 #include <string>
 
+#ifdef FLODL_BUILD_CUDA
+#include <c10/cuda/CUDAFunctions.h>
+#endif
+
 // Helper: convert a C++ exception to a malloc'd C string.
 static char* make_error(const std::string& msg) {
     char* err = (char*)malloc(msg.size() + 1);
@@ -420,32 +424,6 @@ extern "C" char* flodl_native_layer_norm(FlodlTensor input, FlodlTensor weight,
         *output = wrap(std::get<0>(result));
         *mean = wrap(std::get<1>(result));
         *rstd = wrap(std::get<2>(result));
-        return nullptr;
-    } catch (const std::exception& e) {
-        return make_error(e.what());
-    }
-}
-
-extern "C" char* flodl_native_layer_norm_backward(FlodlTensor grad_output,
-                                                  FlodlTensor input,
-                                                  FlodlTensor mean, FlodlTensor rstd,
-                                                  FlodlTensor weight, FlodlTensor bias,
-                                                  int64_t normalized_size,
-                                                  FlodlTensor* grad_input,
-                                                  FlodlTensor* grad_weight,
-                                                  FlodlTensor* grad_bias) {
-    try {
-        c10::optional<torch::Tensor> w_opt = weight ? c10::optional<torch::Tensor>(unwrap(weight)) : c10::nullopt;
-        c10::optional<torch::Tensor> b_opt = bias ? c10::optional<torch::Tensor>(unwrap(bias)) : c10::nullopt;
-        std::array<bool, 3> mask = {true, true, true};
-        auto result = at::native_layer_norm_backward(
-            unwrap(grad_output), unwrap(input),
-            {normalized_size},
-            unwrap(mean), unwrap(rstd),
-            w_opt, b_opt, mask);
-        *grad_input = wrap(std::get<0>(result));
-        *grad_weight = wrap(std::get<1>(result));
-        *grad_bias = wrap(std::get<2>(result));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -871,50 +849,6 @@ extern "C" char* flodl_conv2d(FlodlTensor input, FlodlTensor weight,
     }
 }
 
-extern "C" char* flodl_conv2d_backward(FlodlTensor grad_output, FlodlTensor input,
-                                      FlodlTensor weight,
-                                      int64_t* stride, int64_t* padding,
-                                      int64_t* dilation,
-                                      int64_t groups, int compute_bias,
-                                      FlodlTensor* grad_input,
-                                      FlodlTensor* grad_weight,
-                                      FlodlTensor* grad_bias) {
-    try {
-        auto go_ = unwrap(grad_output);
-        auto in = unwrap(input);
-        auto w = unwrap(weight);
-
-        c10::OptionalIntArrayRef bias_sizes = c10::nullopt;
-        std::vector<int64_t> bias_sizes_vec;
-        if (compute_bias) {
-            bias_sizes_vec = {w.size(0)};
-            bias_sizes = bias_sizes_vec;
-        }
-
-        std::vector<int64_t> output_padding = {0, 0};
-        auto result = at::convolution_backward(
-            go_, in, w,
-            bias_sizes,
-            torch::IntArrayRef(stride, 2),
-            torch::IntArrayRef(padding, 2),
-            torch::IntArrayRef(dilation, 2),
-            false, // transposed
-            output_padding,
-            groups,
-            {true, true, compute_bias != 0}
-        );
-
-        *grad_input = wrap(std::get<0>(result));
-        *grad_weight = wrap(std::get<1>(result));
-        if (compute_bias) {
-            *grad_bias = wrap(std::get<2>(result));
-        }
-        return nullptr;
-    } catch (const std::exception& e) {
-        return make_error(e.what());
-    }
-}
-
 // --- Transposed convolution ---
 
 extern "C" char* flodl_conv_transpose2d(FlodlTensor input, FlodlTensor weight,
@@ -941,51 +875,6 @@ extern "C" char* flodl_conv_transpose2d(FlodlTensor input, FlodlTensor weight,
     }
 }
 
-extern "C" char* flodl_conv_transpose2d_backward(FlodlTensor grad_output,
-                                                 FlodlTensor input,
-                                                 FlodlTensor weight,
-                                                 int64_t* stride, int64_t* padding,
-                                                 int64_t* output_padding,
-                                                 int64_t* dilation,
-                                                 int64_t groups, int compute_bias,
-                                                 FlodlTensor* grad_input,
-                                                 FlodlTensor* grad_weight,
-                                                 FlodlTensor* grad_bias) {
-    try {
-        auto go_ = unwrap(grad_output);
-        auto in = unwrap(input);
-        auto w = unwrap(weight);
-
-        c10::OptionalIntArrayRef bias_sizes = c10::nullopt;
-        std::vector<int64_t> bias_sizes_vec;
-        if (compute_bias) {
-            bias_sizes_vec = {w.size(1) * groups};
-            bias_sizes = bias_sizes_vec;
-        }
-
-        auto result = at::convolution_backward(
-            go_, in, w,
-            bias_sizes,
-            torch::IntArrayRef(stride, 2),
-            torch::IntArrayRef(padding, 2),
-            torch::IntArrayRef(dilation, 2),
-            true, // transposed
-            torch::IntArrayRef(output_padding, 2),
-            groups,
-            {true, true, compute_bias != 0}
-        );
-
-        *grad_input = wrap(std::get<0>(result));
-        *grad_weight = wrap(std::get<1>(result));
-        if (compute_bias) {
-            *grad_bias = wrap(std::get<2>(result));
-        }
-        return nullptr;
-    } catch (const std::exception& e) {
-        return make_error(e.what());
-    }
-}
-
 // --- Pooling ---
 
 extern "C" char* flodl_adaptive_avg_pool2d(FlodlTensor input, int64_t* output_size,
@@ -993,18 +882,6 @@ extern "C" char* flodl_adaptive_avg_pool2d(FlodlTensor input, int64_t* output_si
     try {
         *result = wrap(at::adaptive_avg_pool2d(
             unwrap(input), torch::IntArrayRef(output_size, 2)));
-        return nullptr;
-    } catch (const std::exception& e) {
-        return make_error(e.what());
-    }
-}
-
-extern "C" char* flodl_adaptive_avg_pool2d_backward(FlodlTensor grad_output,
-                                                    FlodlTensor input,
-                                                    FlodlTensor* grad_input) {
-    try {
-        *grad_input = wrap(at::_adaptive_avg_pool2d_backward(
-            unwrap(grad_output), unwrap(input)));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1019,25 +896,6 @@ extern "C" char* flodl_grid_sample(FlodlTensor input, FlodlTensor grid,
     try {
         *result = wrap(at::grid_sampler(
             unwrap(input), unwrap(grid), mode, padding_mode, align_corners != 0));
-        return nullptr;
-    } catch (const std::exception& e) {
-        return make_error(e.what());
-    }
-}
-
-extern "C" char* flodl_grid_sample_backward(FlodlTensor grad_output,
-                                           FlodlTensor input, FlodlTensor grid,
-                                           int mode, int padding_mode,
-                                           int align_corners,
-                                           FlodlTensor* grad_input,
-                                           FlodlTensor* grad_grid) {
-    try {
-        auto result = at::grid_sampler_2d_backward(
-            unwrap(grad_output), unwrap(input), unwrap(grid),
-            mode, padding_mode, align_corners != 0,
-            {true, true});
-        *grad_input = wrap(std::get<0>(result));
-        *grad_grid = wrap(std::get<1>(result));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1083,6 +941,19 @@ extern "C" int flodl_cuda_is_available(void) {
 
 extern "C" int flodl_cuda_device_count(void) {
     return (int)torch::cuda::device_count();
+}
+
+// Force a real symbol reference to c10_cuda.so so that --as-needed
+// doesn't drop CUDA libraries from the link. Without this, no Rust
+// code directly references symbols in libtorch_cuda.so / c10_cuda.so,
+// so the linker silently drops them and torch::cuda::is_available()
+// returns false even with a GPU present.
+extern "C" int flodl_force_cuda_link(void) {
+#ifdef FLODL_BUILD_CUDA
+    return (int)c10::cuda::device_count();
+#else
+    return 0;
+#endif
 }
 
 // --- Comparison (tensor-tensor, return float masks: 0.0 or 1.0) ---
@@ -1373,6 +1244,140 @@ extern "C" char* flodl_pad(FlodlTensor t, int64_t* padding, int pad_len, double 
     try {
         *result = wrap(at::constant_pad_nd(unwrap(t),
                        torch::IntArrayRef(padding, pad_len), value));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+// --- Autograd ---
+
+extern "C" char* flodl_set_requires_grad(FlodlTensor t, int requires_grad,
+                                          FlodlTensor* result) {
+    try {
+        *result = wrap(unwrap(t).set_requires_grad(requires_grad != 0));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" int flodl_requires_grad(FlodlTensor t) {
+    return unwrap(t).requires_grad() ? 1 : 0;
+}
+
+extern "C" char* flodl_backward(FlodlTensor t) {
+    try {
+        unwrap(t).backward();
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_grad(FlodlTensor t, FlodlTensor* result) {
+    try {
+        auto g = unwrap(t).grad();
+        if (g.defined()) {
+            *result = wrap(g);
+        } else {
+            *result = nullptr;
+        }
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_set_grad(FlodlTensor t, FlodlTensor grad) {
+    try {
+        unwrap(t).mutable_grad() = unwrap(grad);
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_zero_grad(FlodlTensor t) {
+    try {
+        auto& tensor = unwrap(t);
+        if (tensor.grad().defined()) {
+            tensor.mutable_grad().zero_();
+        }
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_detach(FlodlTensor t, FlodlTensor* result) {
+    try {
+        *result = wrap(unwrap(t).detach());
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" int flodl_is_leaf(FlodlTensor t) {
+    return unwrap(t).is_leaf() ? 1 : 0;
+}
+
+// --- Autograd context ---
+
+extern "C" void* flodl_no_grad_guard_new() {
+    return new torch::NoGradGuard();
+}
+
+extern "C" void flodl_no_grad_guard_delete(void* guard) {
+    delete static_cast<torch::NoGradGuard*>(guard);
+}
+
+extern "C" int flodl_is_grad_enabled() {
+    return torch::GradMode::is_enabled() ? 1 : 0;
+}
+
+// --- In-place operations ---
+
+extern "C" char* flodl_add_(FlodlTensor t, FlodlTensor other) {
+    try {
+        unwrap(t).add_(unwrap(other));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_sub_(FlodlTensor t, FlodlTensor other) {
+    try {
+        unwrap(t).sub_(unwrap(other));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_mul_scalar_(FlodlTensor t, double scalar) {
+    try {
+        unwrap(t).mul_(scalar);
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_add_scalar_(FlodlTensor t, double scalar) {
+    try {
+        unwrap(t).add_(scalar);
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_zero_(FlodlTensor t) {
+    try {
+        unwrap(t).zero_();
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());

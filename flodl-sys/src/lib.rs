@@ -125,15 +125,6 @@ unsafe extern "C" {
         output: *mut FlodlTensor, mean: *mut FlodlTensor, rstd: *mut FlodlTensor,
     ) -> *mut i8;
 
-    pub fn flodl_native_layer_norm_backward(
-        grad_output: FlodlTensor, input: FlodlTensor,
-        mean: FlodlTensor, rstd: FlodlTensor,
-        weight: FlodlTensor, bias: FlodlTensor,
-        normalized_size: i64,
-        grad_input: *mut FlodlTensor, grad_weight: *mut FlodlTensor,
-        grad_bias: *mut FlodlTensor,
-    ) -> *mut i8;
-
     // --- Element-wise math ---
 
     pub fn flodl_exp(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
@@ -285,14 +276,6 @@ unsafe extern "C" {
         groups: i64, result: *mut FlodlTensor,
     ) -> *mut i8;
 
-    pub fn flodl_conv2d_backward(
-        grad_output: FlodlTensor, input: FlodlTensor, weight: FlodlTensor,
-        stride: *mut i64, padding: *mut i64, dilation: *mut i64,
-        groups: i64, compute_bias: i32,
-        grad_input: *mut FlodlTensor, grad_weight: *mut FlodlTensor,
-        grad_bias: *mut FlodlTensor,
-    ) -> *mut i8;
-
     // --- Transposed convolution ---
 
     pub fn flodl_conv_transpose2d(
@@ -302,25 +285,11 @@ unsafe extern "C" {
         groups: i64, result: *mut FlodlTensor,
     ) -> *mut i8;
 
-    pub fn flodl_conv_transpose2d_backward(
-        grad_output: FlodlTensor, input: FlodlTensor, weight: FlodlTensor,
-        stride: *mut i64, padding: *mut i64,
-        output_padding: *mut i64, dilation: *mut i64,
-        groups: i64, compute_bias: i32,
-        grad_input: *mut FlodlTensor, grad_weight: *mut FlodlTensor,
-        grad_bias: *mut FlodlTensor,
-    ) -> *mut i8;
-
     // --- Pooling ---
 
     pub fn flodl_adaptive_avg_pool2d(
         input: FlodlTensor, output_size: *mut i64,
         result: *mut FlodlTensor,
-    ) -> *mut i8;
-
-    pub fn flodl_adaptive_avg_pool2d_backward(
-        grad_output: FlodlTensor, input: FlodlTensor,
-        grad_input: *mut FlodlTensor,
     ) -> *mut i8;
 
     // --- Grid sampling ---
@@ -331,12 +300,6 @@ unsafe extern "C" {
         result: *mut FlodlTensor,
     ) -> *mut i8;
 
-    pub fn flodl_grid_sample_backward(
-        grad_output: FlodlTensor, input: FlodlTensor, grid: FlodlTensor,
-        mode: i32, padding_mode: i32, align_corners: i32,
-        grad_input: *mut FlodlTensor, grad_grid: *mut FlodlTensor,
-    ) -> *mut i8;
-
     // --- Device ---
 
     pub fn flodl_to_device(
@@ -345,6 +308,7 @@ unsafe extern "C" {
 
     pub fn flodl_cuda_is_available() -> i32;
     pub fn flodl_cuda_device_count() -> i32;
+    pub fn flodl_force_cuda_link() -> i32;
 
     // --- Dtype casting ---
 
@@ -458,6 +422,40 @@ unsafe extern "C" {
         t: FlodlTensor, padding: *mut i64, pad_len: i32, value: f64,
         result: *mut FlodlTensor,
     ) -> *mut i8;
+
+    // --- Autograd ---
+
+    pub fn flodl_set_requires_grad(
+        t: FlodlTensor, requires_grad: i32, result: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    pub fn flodl_requires_grad(t: FlodlTensor) -> i32;
+
+    pub fn flodl_backward(t: FlodlTensor) -> *mut i8;
+
+    pub fn flodl_grad(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
+
+    pub fn flodl_set_grad(t: FlodlTensor, grad: FlodlTensor) -> *mut i8;
+
+    pub fn flodl_zero_grad(t: FlodlTensor) -> *mut i8;
+
+    pub fn flodl_detach(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
+
+    pub fn flodl_is_leaf(t: FlodlTensor) -> i32;
+
+    // --- Autograd context ---
+
+    pub fn flodl_no_grad_guard_new() -> *mut c_void;
+    pub fn flodl_no_grad_guard_delete(guard: *mut c_void);
+    pub fn flodl_is_grad_enabled() -> i32;
+
+    // --- In-place operations ---
+
+    pub fn flodl_add_(t: FlodlTensor, other: FlodlTensor) -> *mut i8;
+    pub fn flodl_sub_(t: FlodlTensor, other: FlodlTensor) -> *mut i8;
+    pub fn flodl_mul_scalar_(t: FlodlTensor, scalar: f64) -> *mut i8;
+    pub fn flodl_add_scalar_(t: FlodlTensor, scalar: f64) -> *mut i8;
+    pub fn flodl_zero_(t: FlodlTensor) -> *mut i8;
 
     // --- Utility ---
 

@@ -748,26 +748,6 @@ impl Tensor {
         Ok((Tensor::from_raw(out), Tensor::from_raw(mean), Tensor::from_raw(rstd)))
     }
 
-    /// Native layer normalization backward. Returns (grad_input, grad_weight, grad_bias).
-    pub fn native_layer_norm_backward(
-        grad_output: &Tensor, input: &Tensor, mean: &Tensor, rstd: &Tensor,
-        weight: &Tensor, bias: &Tensor, normalized_size: i64,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let mut gi: FlodlTensor = ptr::null_mut();
-        let mut gw: FlodlTensor = ptr::null_mut();
-        let mut gb: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_native_layer_norm_backward(
-                grad_output.handle, input.handle,
-                mean.handle, rstd.handle,
-                weight.handle, bias.handle, normalized_size,
-                &mut gi, &mut gw, &mut gb,
-            )
-        };
-        check_err(err)?;
-        Ok((Tensor::from_raw(gi), Tensor::from_raw(gw), Tensor::from_raw(gb)))
-    }
-
     /// Permute dimensions.
     pub fn permute(&self, dims: &[i64]) -> Result<Tensor> {
         let mut dims = dims.to_vec();
@@ -891,32 +871,6 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// 2D convolution backward. Returns (grad_input, grad_weight, Option<grad_bias>).
-    #[allow(clippy::too_many_arguments)]
-    pub fn conv2d_backward(
-        grad_output: &Tensor, input: &Tensor, weight: &Tensor,
-        stride: [i64; 2], padding: [i64; 2], dilation: [i64; 2],
-        groups: i64, compute_bias: bool,
-    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-        let mut gi: FlodlTensor = ptr::null_mut();
-        let mut gw: FlodlTensor = ptr::null_mut();
-        let mut gb: FlodlTensor = ptr::null_mut();
-        let mut stride = stride;
-        let mut padding = padding;
-        let mut dilation = dilation;
-        let err = unsafe {
-            ffi::flodl_conv2d_backward(
-                grad_output.handle, input.handle, weight.handle,
-                stride.as_mut_ptr(), padding.as_mut_ptr(), dilation.as_mut_ptr(),
-                groups, compute_bias as i32,
-                &mut gi, &mut gw, &mut gb,
-            )
-        };
-        check_err(err)?;
-        let grad_bias = if compute_bias { Some(Tensor::from_raw(gb)) } else { None };
-        Ok((Tensor::from_raw(gi), Tensor::from_raw(gw), grad_bias))
-    }
-
     /// Transposed 2D convolution.
     #[allow(clippy::too_many_arguments)]
     pub fn conv_transpose2d(
@@ -940,34 +894,6 @@ impl Tensor {
         };
         check_err(err)?;
         Ok(Tensor::from_raw(handle))
-    }
-
-    /// Transposed 2D convolution backward.
-    #[allow(clippy::too_many_arguments)]
-    pub fn conv_transpose2d_backward(
-        grad_output: &Tensor, input: &Tensor, weight: &Tensor,
-        stride: [i64; 2], padding: [i64; 2], output_padding: [i64; 2],
-        dilation: [i64; 2], groups: i64, compute_bias: bool,
-    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-        let mut gi: FlodlTensor = ptr::null_mut();
-        let mut gw: FlodlTensor = ptr::null_mut();
-        let mut gb: FlodlTensor = ptr::null_mut();
-        let mut stride = stride;
-        let mut padding = padding;
-        let mut output_padding = output_padding;
-        let mut dilation = dilation;
-        let err = unsafe {
-            ffi::flodl_conv_transpose2d_backward(
-                grad_output.handle, input.handle, weight.handle,
-                stride.as_mut_ptr(), padding.as_mut_ptr(),
-                output_padding.as_mut_ptr(), dilation.as_mut_ptr(),
-                groups, compute_bias as i32,
-                &mut gi, &mut gw, &mut gb,
-            )
-        };
-        check_err(err)?;
-        let grad_bias = if compute_bias { Some(Tensor::from_raw(gb)) } else { None };
-        Ok((Tensor::from_raw(gi), Tensor::from_raw(gw), grad_bias))
     }
 
     // --- Missing wrappers for existing shims ---
@@ -1111,16 +1037,6 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Adaptive average pooling backward.
-    pub fn adaptive_avg_pool2d_backward(grad_output: &Tensor, input: &Tensor) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_adaptive_avg_pool2d_backward(grad_output.handle, input.handle, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
-    }
-
     /// Grid sampling (bilinear/nearest interpolation).
     pub fn grid_sample(
         &self, grid: &Tensor, mode: i32, padding_mode: i32, align_corners: bool,
@@ -1134,24 +1050,6 @@ impl Tensor {
         };
         check_err(err)?;
         Ok(Tensor::from_raw(handle))
-    }
-
-    /// Grid sampling backward.
-    pub fn grid_sample_backward(
-        grad_output: &Tensor, input: &Tensor, grid: &Tensor,
-        mode: i32, padding_mode: i32, align_corners: bool,
-    ) -> Result<(Tensor, Tensor)> {
-        let mut gi: FlodlTensor = ptr::null_mut();
-        let mut gg: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_grid_sample_backward(
-                grad_output.handle, input.handle, grid.handle,
-                mode, padding_mode, align_corners as i32,
-                &mut gi, &mut gg,
-            )
-        };
-        check_err(err)?;
-        Ok((Tensor::from_raw(gi), Tensor::from_raw(gg)))
     }
 
     /// Cast to a different dtype.
@@ -1458,6 +1356,108 @@ impl Tensor {
         check_err(err)?;
         Ok(Tensor::from_raw(handle))
     }
+
+    // --- Autograd ---
+
+    /// Set requires_grad on this tensor. Returns a new tensor that shares
+    /// storage but has the grad flag set. This enables libtorch's native
+    /// autograd tracking for all subsequent operations.
+    pub fn set_requires_grad(&self, requires_grad: bool) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_set_requires_grad(self.handle, requires_grad as i32, &mut handle)
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Check whether this tensor requires gradient computation.
+    pub fn requires_grad(&self) -> bool {
+        unsafe { ffi::flodl_requires_grad(self.handle) != 0 }
+    }
+
+    /// Run backward pass from this scalar tensor. Populates .grad() on
+    /// all leaf tensors in the computation graph.
+    pub fn backward(&self) -> Result<()> {
+        let err = unsafe { ffi::flodl_backward(self.handle) };
+        check_err(err)
+    }
+
+    /// Get the accumulated gradient for this tensor, if any.
+    /// Returns None if no gradient has been computed.
+    pub fn grad(&self) -> Option<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_grad(self.handle, &mut handle) };
+        if !err.is_null() {
+            unsafe { ffi::flodl_free_string(err) };
+            return None;
+        }
+        if handle.is_null() {
+            None
+        } else {
+            Some(Tensor::from_raw(handle))
+        }
+    }
+
+    /// Replace the gradient tensor (for gradient clipping / unscaling).
+    pub fn set_grad(&self, grad: &Tensor) -> Result<()> {
+        let err = unsafe { ffi::flodl_set_grad(self.handle, grad.handle) };
+        check_err(err)
+    }
+
+    /// Zero out the accumulated gradient.
+    pub fn zero_grad(&self) -> Result<()> {
+        let err = unsafe { ffi::flodl_zero_grad(self.handle) };
+        check_err(err)
+    }
+
+    /// Whether this tensor is a leaf in the autograd graph.
+    /// A tensor is a leaf if it was created by the user (not by an op)
+    /// or if it doesn't require grad.
+    pub fn is_leaf(&self) -> bool {
+        unsafe { ffi::flodl_is_leaf(self.handle) != 0 }
+    }
+
+    /// Detach from the computation graph. Returns a new tensor that shares
+    /// storage but has no autograd history.
+    pub fn detach(&self) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_detach(self.handle, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    // --- In-place operations ---
+
+    /// In-place add: self += other
+    pub fn add_(&self, other: &Tensor) -> Result<()> {
+        let err = unsafe { ffi::flodl_add_(self.handle, other.handle) };
+        check_err(err)
+    }
+
+    /// In-place subtract: self -= other
+    pub fn sub_(&self, other: &Tensor) -> Result<()> {
+        let err = unsafe { ffi::flodl_sub_(self.handle, other.handle) };
+        check_err(err)
+    }
+
+    /// In-place scalar multiply: self *= scalar
+    pub fn mul_scalar_(&self, scalar: f64) -> Result<()> {
+        let err = unsafe { ffi::flodl_mul_scalar_(self.handle, scalar) };
+        check_err(err)
+    }
+
+    /// In-place scalar add: self += scalar
+    pub fn add_scalar_(&self, scalar: f64) -> Result<()> {
+        let err = unsafe { ffi::flodl_add_scalar_(self.handle, scalar) };
+        check_err(err)
+    }
+
+    /// In-place zero: self = 0
+    pub fn zero_(&self) -> Result<()> {
+        let err = unsafe { ffi::flodl_zero_(self.handle) };
+        check_err(err)
+    }
 }
 
 impl fmt::Debug for Tensor {
@@ -1473,7 +1473,16 @@ impl fmt::Debug for Tensor {
 }
 
 /// Returns true if CUDA is available.
+///
+/// On Linux, this also ensures CUDA libraries are loaded (they can be
+/// dropped by the linker's `--as-needed` flag since no Rust code
+/// directly references symbols in `libtorch_cuda.so`).
 pub fn cuda_available() -> bool {
+    // flodl_force_cuda_link references c10::cuda::device_count(),
+    // creating a real symbol dependency on c10_cuda.so. This prevents
+    // --as-needed from dropping CUDA libs. The call is cheap (no-op on
+    // non-CUDA builds since the symbol resolves to a stub returning 0).
+    unsafe { let _ = ffi::flodl_force_cuda_link(); }
     unsafe { ffi::flodl_cuda_is_available() != 0 }
 }
 

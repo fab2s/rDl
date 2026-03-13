@@ -81,13 +81,6 @@ char* flodl_silu(FlodlTensor t, FlodlTensor* result);
 char* flodl_native_layer_norm(FlodlTensor input, FlodlTensor weight, FlodlTensor bias,
                              int64_t normalized_size, double eps,
                              FlodlTensor* output, FlodlTensor* mean, FlodlTensor* rstd);
-char* flodl_native_layer_norm_backward(FlodlTensor grad_output, FlodlTensor input,
-                                      FlodlTensor mean, FlodlTensor rstd,
-                                      FlodlTensor weight, FlodlTensor bias,
-                                      int64_t normalized_size,
-                                      FlodlTensor* grad_input, FlodlTensor* grad_weight,
-                                      FlodlTensor* grad_bias);
-
 // --- Element-wise math ---
 
 char* flodl_exp(FlodlTensor t, FlodlTensor* result);
@@ -220,56 +213,57 @@ char* flodl_ones_like(FlodlTensor t, FlodlTensor* result);
 char* flodl_conv2d(FlodlTensor input, FlodlTensor weight, FlodlTensor bias,
                  int64_t* stride, int64_t* padding, int64_t* dilation,
                  int64_t groups, FlodlTensor* result);
-char* flodl_conv2d_backward(FlodlTensor grad_output, FlodlTensor input,
-                          FlodlTensor weight,
-                          int64_t* stride, int64_t* padding,
-                          int64_t* dilation, int64_t groups,
-                          int compute_bias,
-                          FlodlTensor* grad_input, FlodlTensor* grad_weight,
-                          FlodlTensor* grad_bias);
-
 // --- Transposed convolution ---
 
 char* flodl_conv_transpose2d(FlodlTensor input, FlodlTensor weight, FlodlTensor bias,
                            int64_t* stride, int64_t* padding,
                            int64_t* output_padding, int64_t* dilation,
                            int64_t groups, FlodlTensor* result);
-char* flodl_conv_transpose2d_backward(FlodlTensor grad_output, FlodlTensor input,
-                                    FlodlTensor weight,
-                                    int64_t* stride, int64_t* padding,
-                                    int64_t* output_padding, int64_t* dilation,
-                                    int64_t groups, int compute_bias,
-                                    FlodlTensor* grad_input,
-                                    FlodlTensor* grad_weight,
-                                    FlodlTensor* grad_bias);
-
 // --- Pooling ---
 
 char* flodl_adaptive_avg_pool2d(FlodlTensor input, int64_t* output_size,
                               FlodlTensor* result);
-char* flodl_adaptive_avg_pool2d_backward(FlodlTensor grad_output, FlodlTensor input,
-                                       FlodlTensor* grad_input);
-
 // --- Grid sampling ---
 
 char* flodl_grid_sample(FlodlTensor input, FlodlTensor grid,
                       int mode, int padding_mode, int align_corners,
                       FlodlTensor* result);
-char* flodl_grid_sample_backward(FlodlTensor grad_output,
-                               FlodlTensor input, FlodlTensor grid,
-                               int mode, int padding_mode, int align_corners,
-                               FlodlTensor* grad_input, FlodlTensor* grad_grid);
-
 // --- Device ---
 
 char* flodl_to_device(FlodlTensor t, int device, FlodlTensor* result);
 int flodl_cuda_is_available(void);
 int flodl_cuda_device_count(void);
+int flodl_force_cuda_link(void);
 
 // --- Dtype casting ---
 
 char* flodl_to_dtype(FlodlTensor t, int dtype, FlodlTensor* result);
 char* flodl_all_finite(FlodlTensor t, int* result);
+
+// --- Autograd ---
+
+char* flodl_set_requires_grad(FlodlTensor t, int requires_grad, FlodlTensor* result);
+int flodl_requires_grad(FlodlTensor t);
+char* flodl_backward(FlodlTensor t);
+char* flodl_grad(FlodlTensor t, FlodlTensor* result);
+char* flodl_set_grad(FlodlTensor t, FlodlTensor grad);
+char* flodl_zero_grad(FlodlTensor t);
+char* flodl_detach(FlodlTensor t, FlodlTensor* result);
+int flodl_is_leaf(FlodlTensor t);
+
+// --- Autograd context ---
+
+void* flodl_no_grad_guard_new(void);
+void flodl_no_grad_guard_delete(void* guard);
+int flodl_is_grad_enabled(void);
+
+// --- In-place operations ---
+
+char* flodl_add_(FlodlTensor t, FlodlTensor other);
+char* flodl_sub_(FlodlTensor t, FlodlTensor other);
+char* flodl_mul_scalar_(FlodlTensor t, double scalar);
+char* flodl_add_scalar_(FlodlTensor t, double scalar);
+char* flodl_zero_(FlodlTensor t);
 
 // --- Utility ---
 

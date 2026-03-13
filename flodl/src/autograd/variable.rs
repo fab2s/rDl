@@ -4,42 +4,19 @@ use std::rc::Rc;
 
 use crate::tensor::{DType, Device, Result, Tensor};
 
-/// Backward closure type: given upstream gradient, returns gradients for each input.
-pub(crate) type GradApplyFn = Box<dyn Fn(&Tensor) -> Result<Vec<Tensor>>>;
-
-/// The backward function for a graph node.
-///
-/// When the node is processed during backward, `apply` is called with the
-/// incoming gradient and must return one gradient per input.
-///
-/// Saved tensors live inside the `apply` closure. When the GradFn is dropped
-/// (set to None after backward processes the node), the closure is dropped,
-/// which drops the saved tensors — deterministic VRAM release with zero
-/// infrastructure. This replaces goDl's Retain/Release + Phase 1 + Phase 3.
-pub(crate) struct GradFn {
-    #[allow(dead_code)]
-    pub name: &'static str,
-    pub inputs: Vec<Variable>,
-    pub apply: GradApplyFn,
-}
-
 pub(crate) struct VariableInner {
     pub data: Tensor,
-    pub grad: Option<Tensor>,
-    pub requires_grad: bool,
-    pub grad_fn: Option<GradFn>,
-    pub is_leaf: bool,
 }
 
 /// A differentiable variable wrapping a Tensor.
 ///
-/// Variables track computation history for reverse-mode autodiff.
-/// Leaf variables (created by user) accumulate gradients during backward.
-/// Non-leaf variables (created by ops) hold a GradFn describing how to
-/// compute input gradients.
+/// Variables use libtorch's native autograd. When a tensor has
+/// `requires_grad=true`, all standard operations build a C++ computation
+/// graph automatically. Calling `backward()` runs libtorch's backward
+/// engine — no Rust-side graph walking.
 ///
-/// Internally uses `Rc<RefCell<>>` for shared ownership — the backward
-/// graph holds references to input variables via `GradFn.inputs`.
+/// Internally uses `Rc<RefCell<>>` for shared ownership — the same
+/// parameter can be referenced by both a Module and an Optimizer.
 ///
 /// ```ignore
 /// let w = Variable::new(Tensor::randn(&[3, 2], opts)?, true);
@@ -55,36 +32,26 @@ pub struct Variable {
 
 impl Variable {
     /// Create a leaf variable (parameter or input data).
-    /// If `requires_grad` is true, operations on this variable will be tracked
-    /// and gradients accumulated during backward.
+    /// If `requires_grad` is true, libtorch will track operations for autodiff.
     pub fn new(data: Tensor, requires_grad: bool) -> Self {
+        let data = if requires_grad {
+            // Set requires_grad on the C++ tensor so libtorch tracks ops
+            data.set_requires_grad(true).unwrap_or(data)
+        } else {
+            data
+        };
         Variable {
-            inner: Rc::new(RefCell::new(VariableInner {
-                data,
-                grad: None,
-                requires_grad,
-                grad_fn: None,
-                is_leaf: true,
-            })),
+            inner: Rc::new(RefCell::new(VariableInner { data })),
         }
     }
 
-    /// Create a non-leaf variable from an operation result.
-    pub(crate) fn from_op(data: Tensor, grad_fn: GradFn) -> Self {
+    /// Wrap a tensor that already has the correct requires_grad flag set.
+    /// Used by ops to wrap libtorch output tensors (which inherit autograd
+    /// metadata from their inputs automatically).
+    pub(crate) fn wrap(data: Tensor) -> Self {
         Variable {
-            inner: Rc::new(RefCell::new(VariableInner {
-                data,
-                grad: None,
-                requires_grad: true,
-                grad_fn: Some(grad_fn),
-                is_leaf: false,
-            })),
+            inner: Rc::new(RefCell::new(VariableInner { data })),
         }
-    }
-
-    /// Create a leaf with no gradient tracking (for op results when grad disabled).
-    pub(crate) fn leaf(data: Tensor, requires_grad: bool) -> Self {
-        Self::new(data, requires_grad)
     }
 
     /// Get the underlying tensor data (shallow clone).
@@ -92,24 +59,26 @@ impl Variable {
         self.inner.borrow().data.clone()
     }
 
-    /// Get the accumulated gradient, if any (shallow clone).
+    /// Get the accumulated gradient, if any.
+    /// Reads from the C++ tensor's .grad() field.
     pub fn grad(&self) -> Option<Tensor> {
-        self.inner.borrow().grad.clone()
+        self.inner.borrow().data.grad()
     }
 
-    /// Replace the gradient tensor (for gradient clipping).
+    /// Replace the gradient tensor (for gradient clipping / unscaling).
     pub fn set_grad(&self, grad: Tensor) {
-        self.inner.borrow_mut().grad = Some(grad);
+        let _ = self.inner.borrow().data.set_grad(&grad);
     }
 
     /// Whether this variable tracks gradients.
     pub fn requires_grad(&self) -> bool {
-        self.inner.borrow().requires_grad
+        self.inner.borrow().data.requires_grad()
     }
 
-    /// Whether this is a leaf variable (created by user, not by an op).
+    /// Whether this is a leaf variable (no grad_fn in libtorch).
+    /// A leaf tensor is one created by the user, not by an operation.
     pub fn is_leaf(&self) -> bool {
-        self.inner.borrow().is_leaf
+        self.inner.borrow().data.is_leaf()
     }
 
     /// Shape of the underlying data tensor.
@@ -134,14 +103,15 @@ impl Variable {
 
     /// Zero out the accumulated gradient.
     pub fn zero_grad(&self) {
-        self.inner.borrow_mut().grad = None;
+        let _ = self.inner.borrow().data.zero_grad();
     }
 
     /// Detach from the computation graph. Returns a new leaf variable
-    /// sharing the same data tensor (shallow clone) with no gradient tracking.
-    /// Useful for breaking gradient flow at graph boundaries.
+    /// sharing the same data tensor (detached) with no gradient tracking.
     pub fn detach(&self) -> Variable {
-        Variable::new(self.data(), false)
+        let detached = self.inner.borrow().data.detach()
+            .unwrap_or_else(|_| self.inner.borrow().data.clone());
+        Variable::wrap(detached)
     }
 
     /// Move to a different device. Returns a new leaf variable.
@@ -154,7 +124,14 @@ impl Variable {
     }
 
     /// Replace the underlying tensor data (used by optimizers).
+    /// Preserves the `requires_grad` flag from the current tensor.
     pub fn set_data(&self, data: Tensor) {
+        let rg = self.requires_grad();
+        let data = if rg {
+            data.set_requires_grad(true).unwrap_or(data)
+        } else {
+            data
+        };
         self.inner.borrow_mut().data = data;
     }
 
@@ -163,18 +140,10 @@ impl Variable {
         self.inner.borrow().data.numel()
     }
 
-    /// Accumulate a gradient into this variable's grad field.
-    pub(crate) fn accumulate_grad(&self, grad: &Tensor) -> Result<()> {
-        let mut inner = self.inner.borrow_mut();
-        match inner.grad.take() {
-            None => {
-                inner.grad = Some(grad.clone());
-            }
-            Some(existing) => {
-                inner.grad = Some(existing.add(grad)?);
-            }
-        }
-        Ok(())
+    /// Run backward pass from this scalar variable.
+    /// Populates .grad() on all leaf variables in the computation graph.
+    pub fn backward(&self) -> Result<()> {
+        self.inner.borrow().data.backward()
     }
 }
 
@@ -183,12 +152,11 @@ impl fmt::Debug for Variable {
         let inner = self.inner.borrow();
         write!(
             f,
-            "Variable({:?}, {:?}, {:?}, requires_grad={}, is_leaf={})",
+            "Variable({:?}, {:?}, {:?}, requires_grad={})",
             inner.data.shape(),
             inner.data.dtype(),
             inner.data.device(),
-            inner.requires_grad,
-            inner.is_leaf,
+            inner.data.requires_grad(),
         )
     }
 }

@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use crate::autograd::Variable;
+use crate::autograd::{Variable, no_grad};
 use crate::tensor::Result;
 
 use super::checkpoint::{
@@ -74,24 +74,34 @@ impl SGD {
 
 impl Optimizer for SGD {
     fn step(&mut self) -> Result<()> {
-        for (i, param) in self.params.iter().enumerate() {
-            if let Some(grad) = param.grad() {
-                let update = if self.momentum > 0.0 {
-                    let v = match self.velocity[i].take() {
-                        Some(v) => v.mul_scalar(self.momentum)?.add(&grad)?,
-                        None => grad.clone(),
-                    };
-                    self.velocity[i] = Some(v.clone());
-                    v.mul_scalar(self.lr)?
-                } else {
-                    grad.mul_scalar(self.lr)?
-                };
-
-                let new_data = param.data().sub(&update)?;
-                param.set_data(new_data);
+        no_grad(|| {
+            for (i, param) in self.params.iter().enumerate() {
+                if let Some(grad) = param.grad() {
+                    let data = param.data().detach()?;
+                    if self.momentum > 0.0 {
+                        let v = match self.velocity[i].take() {
+                            Some(v) => {
+                                v.mul_scalar_(self.momentum)?;
+                                v.add_(&grad)?;
+                                v
+                            }
+                            // mul_scalar creates a new tensor with independent storage,
+                            // unlike clone() which shares storage with grad
+                            None => grad.mul_scalar(1.0)?,
+                        };
+                        // data -= lr * v
+                        let scaled = v.mul_scalar(self.lr)?;
+                        data.sub_(&scaled)?;
+                        self.velocity[i] = Some(v);
+                    } else {
+                        // data -= lr * grad
+                        let scaled = grad.mul_scalar(self.lr)?;
+                        data.sub_(&scaled)?;
+                    }
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn zero_grad(&self) {
@@ -199,47 +209,52 @@ impl Adam {
         let bc1 = 1.0 - self.beta1.powi(self.t as i32);
         let bc2 = 1.0 - self.beta2.powi(self.t as i32);
 
-        for (i, param) in self.params.iter().enumerate() {
-            if let Some(grad) = param.grad() {
-                // First moment: m = β1*m + (1-β1)*grad
-                let m_new = match self.m[i].take() {
-                    Some(m) => m
-                        .mul_scalar(self.beta1)?
-                        .add(&grad.mul_scalar(1.0 - self.beta1)?)?,
-                    None => grad.mul_scalar(1.0 - self.beta1)?,
-                };
+        no_grad(|| {
+            for (i, param) in self.params.iter().enumerate() {
+                if let Some(grad) = param.grad() {
+                    // First moment: m = β1*m + (1-β1)*grad
+                    let m = match self.m[i].take() {
+                        Some(m) => {
+                            m.mul_scalar_(self.beta1)?;
+                            m.add_(&grad.mul_scalar(1.0 - self.beta1)?)?;
+                            m
+                        }
+                        None => grad.mul_scalar(1.0 - self.beta1)?,
+                    };
 
-                // Second moment: v = β2*v + (1-β2)*grad²
-                let grad_sq = grad.mul(&grad)?;
-                let v_new = match self.v[i].take() {
-                    Some(v) => v
-                        .mul_scalar(self.beta2)?
-                        .add(&grad_sq.mul_scalar(1.0 - self.beta2)?)?,
-                    None => grad_sq.mul_scalar(1.0 - self.beta2)?,
-                };
+                    // Second moment: v = β2*v + (1-β2)*grad²
+                    let grad_sq = grad.mul(&grad)?;
+                    let v = match self.v[i].take() {
+                        Some(v) => {
+                            v.mul_scalar_(self.beta2)?;
+                            v.add_(&grad_sq.mul_scalar(1.0 - self.beta2)?)?;
+                            v
+                        }
+                        None => grad_sq.mul_scalar(1.0 - self.beta2)?,
+                    };
 
-                self.m[i] = Some(m_new.clone());
-                self.v[i] = Some(v_new.clone());
+                    // Bias-corrected estimates
+                    let m_hat = m.mul_scalar(1.0 / bc1)?;
+                    let v_hat = v.mul_scalar(1.0 / bc2)?;
 
-                // Bias-corrected estimates
-                let m_hat = m_new.mul_scalar(1.0 / bc1)?;
-                let v_hat = v_new.mul_scalar(1.0 / bc2)?;
+                    self.m[i] = Some(m);
+                    self.v[i] = Some(v);
 
-                // param -= lr * m_hat / (sqrt(v_hat) + eps)
-                let denom = v_hat.sqrt()?.add_scalar(self.eps)?;
-                let update = m_hat.div(&denom)?.mul_scalar(self.lr)?;
-                let mut new_data = param.data().sub(&update)?;
+                    // param -= lr * m_hat / (sqrt(v_hat) + eps)
+                    let denom = v_hat.sqrt()?.add_scalar(self.eps)?;
+                    let update = m_hat.div(&denom)?.mul_scalar(self.lr)?;
+                    let data = param.data().detach()?;
 
-                // Decoupled weight decay: param -= lr * wd * param
-                if weight_decay > 0.0 {
-                    let decay = param.data().mul_scalar(self.lr * weight_decay)?;
-                    new_data = new_data.sub(&decay)?;
+                    // Decoupled weight decay: data *= (1 - lr * wd)
+                    if weight_decay > 0.0 {
+                        data.mul_scalar_(1.0 - self.lr * weight_decay)?;
+                    }
+
+                    data.sub_(&update)?;
                 }
-
-                param.set_data(new_data);
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
