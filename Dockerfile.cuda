@@ -3,7 +3,7 @@
 # Uses NVIDIA's CUDA base image with libtorch CUDA variant.
 # For runtime GPU access, use: docker run --gpus all ...
 
-FROM nvidia/cuda:12.4.1-devel-ubuntu24.04
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -25,9 +25,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 # --- libtorch (CUDA 12.4) ---
 ARG LIBTORCH_VERSION=2.10.0
-RUN wget -q "https://download.pytorch.org/libtorch/cu124/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu124.zip" \
-    && unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu124.zip" -d /usr/local \
-    && rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu124.zip"
+RUN wget -q "https://download.pytorch.org/libtorch/cu126/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu126.zip" \
+    && unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu126.zip" -d /usr/local \
+    && rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu126.zip"
 
 ENV LIBTORCH_PATH="/usr/local/libtorch"
 ENV LD_LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"
