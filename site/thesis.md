@@ -1,10 +1,8 @@
 ---
-layout: default
+layout: page
 title: "The Trajectory Thesis"
 permalink: /thesis
 ---
-
-<main class="content thesis-content" markdown="1">
 
 # The Trajectory Thesis
 
@@ -432,5 +430,3 @@ happening.
   destroying prior knowledge.
 - Jacobs et al. (1991) — *Adaptive Mixtures of Local Experts*. The original
   mixture of experts — competitive learning between specialized modules.
-
-</main>
