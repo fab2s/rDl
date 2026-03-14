@@ -458,6 +458,20 @@ unsafe extern "C" {
     pub fn flodl_no_grad_guard_delete(guard: *mut c_void);
     pub fn flodl_is_grad_enabled() -> i32;
 
+    // --- Meshgrid ---
+
+    pub fn flodl_meshgrid(
+        tensors: *mut FlodlTensor, count: i32,
+        results: *mut *mut FlodlTensor, result_count: *mut i32,
+    ) -> *mut i8;
+
+    // --- Pairwise distance ---
+
+    pub fn flodl_cdist(
+        x: FlodlTensor, y: FlodlTensor, p: f64,
+        result: *mut FlodlTensor,
+    ) -> *mut i8;
+
     // --- In-place operations ---
 
     pub fn flodl_add_(t: FlodlTensor, other: FlodlTensor) -> *mut i8;

@@ -1480,6 +1480,43 @@ extern "C" char* flodl_zero_(FlodlTensor t) {
     }
 }
 
+// --- Meshgrid ---
+
+extern "C" char* flodl_meshgrid(FlodlTensor* tensors, int count,
+                                FlodlTensor** results, int* result_count) {
+    try {
+        std::vector<torch::Tensor> vec;
+        vec.reserve(count);
+        for (int i = 0; i < count; i++) {
+            vec.push_back(unwrap(tensors[i]));
+        }
+        auto grids = torch::meshgrid(vec, "ij");
+        int n = (int)grids.size();
+        *result_count = n;
+        FlodlTensor* arr = (FlodlTensor*)malloc(n * sizeof(FlodlTensor));
+        for (int i = 0; i < n; i++) {
+            arr[i] = new torch::Tensor(grids[i]);
+        }
+        *results = arr;
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+// --- Pairwise distance ---
+
+extern "C" char* flodl_cdist(FlodlTensor x, FlodlTensor y, double p,
+                             FlodlTensor* result) {
+    try {
+        auto out = torch::cdist(unwrap(x), unwrap(y), p);
+        *result = new torch::Tensor(out);
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
 // --- Utility ---
 
 extern "C" void flodl_free_string(char* s) {

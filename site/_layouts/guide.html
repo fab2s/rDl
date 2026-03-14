@@ -1,0 +1,27 @@
+---
+layout: default
+---
+
+<div class="guide-layout">
+  {% include sidebar.html %}
+  <main class="guide-content content">
+    {{ content }}
+
+    {% if page.prev_url or page.next_url %}
+    <div class="page-nav">
+      {% if page.prev_url %}
+      <a href="{{ page.prev_url | relative_url }}">
+        <span class="label">&larr; Previous</span>
+        <span class="title">{{ page.prev_title }}</span>
+      </a>
+      {% endif %}
+      {% if page.next_url %}
+      <a href="{{ page.next_url | relative_url }}" class="next">
+        <span class="label">Next &rarr;</span>
+        <span class="title">{{ page.next_title }}</span>
+      </a>
+      {% endif %}
+    </div>
+    {% endif %}
+  </main>
+</div>

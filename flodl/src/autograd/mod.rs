@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn test_gather_gradient() {
         let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), true);
-        let idx = Tensor::from_i64(&[0, 0, 1, 0], &[2, 2]).unwrap();
+        let idx = Tensor::from_i64(&[0, 0, 1, 0], &[2, 2], Device::CPU).unwrap();
         let y = x.gather(1, &idx).unwrap().sum().unwrap();
         y.backward().unwrap();
 

@@ -36,6 +36,38 @@ pub trait Stateful {
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()>;
     /// Restore optimizer state from a reader.
     fn load_state<R: Read>(&mut self, r: &mut R) -> Result<()>;
+
+    /// Save state to a file. Uses gzip compression if path ends with `.gz`.
+    fn save_state_file(&self, path: &str) -> Result<()> {
+        let f = std::fs::File::create(path).map_err(|e| {
+            crate::tensor::TensorError::new(&format!("io: {}", e))
+        })?;
+        if path.ends_with(".gz") {
+            let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+            self.save_state(&mut w)?;
+            w.finish().map_err(|e| {
+                crate::tensor::TensorError::new(&format!("io: {}", e))
+            })?;
+            Ok(())
+        } else {
+            let mut w = std::io::BufWriter::new(f);
+            self.save_state(&mut w)
+        }
+    }
+
+    /// Load state from a file. Detects gzip from `.gz` extension.
+    fn load_state_file(&mut self, path: &str) -> Result<()> {
+        let f = std::fs::File::open(path).map_err(|e| {
+            crate::tensor::TensorError::new(&format!("io: {}", e))
+        })?;
+        if path.ends_with(".gz") {
+            let mut r = flate2::read::GzDecoder::new(f);
+            self.load_state(&mut r)
+        } else {
+            let mut r = std::io::BufReader::new(f);
+            self.load_state(&mut r)
+        }
+    }
 }
 
 /// SGD with optional momentum.
@@ -579,7 +611,7 @@ mod tests {
     fn test_adam_backward_compat() {
         // Adam::new still works with a single LR
         let p = make_param("w", &[3, 2]);
-        let mut opt = Adam::new(&[p.clone()], 0.01);
+        let mut opt = Adam::new(std::slice::from_ref(&p), 0.01);
 
         let x = Variable::new(
             Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], Device::CPU).unwrap(),
@@ -602,8 +634,8 @@ mod tests {
 
         // Group 0: high LR, Group 1: very low LR
         let mut opt = Adam::with_groups()
-            .group(&[p1.clone()], 0.1)
-            .group(&[p2.clone()], 1e-10)
+            .group(std::slice::from_ref(&p1), 0.1)
+            .group(std::slice::from_ref(&p2), 1e-10)
             .build();
 
         let x = Variable::new(
@@ -638,8 +670,8 @@ mod tests {
         let p2 = make_param("w2", &[3, 2]);
 
         let mut opt = Adam::with_groups()
-            .group(&[p1.clone()], 0.01)
-            .group(&[p2.clone()], 0.01)
+            .group(std::slice::from_ref(&p1), 0.01)
+            .group(std::slice::from_ref(&p2), 0.01)
             .build();
 
         opt.set_group_lr(1, 0.99);
@@ -654,8 +686,8 @@ mod tests {
         let p2 = make_param("w2", &[3, 2]);
 
         let mut opt = Adam::with_groups()
-            .group(&[p1.clone()], 0.01)
-            .group(&[p2.clone()], 0.05)
+            .group(std::slice::from_ref(&p1), 0.01)
+            .group(std::slice::from_ref(&p2), 0.05)
             .build();
 
         opt.set_lr(0.42);
@@ -671,7 +703,7 @@ mod tests {
         p1.freeze().unwrap();
 
         let mut opt = Adam::with_groups()
-            .group(&[p1.clone(), p2.clone()], 0.01)
+            .group(&[p1, p2.clone()], 0.01)
             .build();
 
         let x = Variable::new(
@@ -693,8 +725,8 @@ mod tests {
         let p2 = make_param("w2", &[3, 2]);
 
         let mut opt = Adam::with_groups()
-            .group(&[p1.clone()], 0.01)
-            .group(&[p2.clone()], 0.05)
+            .group(std::slice::from_ref(&p1), 0.01)
+            .group(std::slice::from_ref(&p2), 0.05)
             .build();
 
         // Do a step to populate moment buffers
@@ -714,8 +746,8 @@ mod tests {
 
         // Load into fresh optimizer with same structure
         let mut opt2 = Adam::with_groups()
-            .group(&[p1.clone()], 0.99)
-            .group(&[p2.clone()], 0.99)
+            .group(std::slice::from_ref(&p1), 0.99)
+            .group(std::slice::from_ref(&p2), 0.99)
             .build();
 
         let mut cursor = std::io::Cursor::new(&buf);

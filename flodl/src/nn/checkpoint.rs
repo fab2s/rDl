@@ -57,16 +57,30 @@ pub fn load_parameters<R: Read>(r: &mut R, params: &[Parameter]) -> Result<()> {
     Ok(())
 }
 
-/// Save parameters to a file path.
+/// Save parameters to a file path. Uses gzip compression if path ends with `.gz`.
 pub fn save_parameters_file(path: &str, params: &[Parameter]) -> Result<()> {
-    let mut f = std::fs::File::create(path).map_err(io_err)?;
-    save_parameters(&mut f, params)
+    let f = std::fs::File::create(path).map_err(io_err)?;
+    if path.ends_with(".gz") {
+        let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        save_parameters(&mut w, params)?;
+        w.finish().map_err(io_err)?;
+        Ok(())
+    } else {
+        let mut w = std::io::BufWriter::new(f);
+        save_parameters(&mut w, params)
+    }
 }
 
-/// Load parameters from a file path.
+/// Load parameters from a file path. Detects gzip from `.gz` extension.
 pub fn load_parameters_file(path: &str, params: &[Parameter]) -> Result<()> {
-    let mut f = std::fs::File::open(path).map_err(io_err)?;
-    load_parameters(&mut f, params)
+    let f = std::fs::File::open(path).map_err(io_err)?;
+    if path.ends_with(".gz") {
+        let mut r = flate2::read::GzDecoder::new(f);
+        load_parameters(&mut r, params)
+    } else {
+        let mut r = std::io::BufReader::new(f);
+        load_parameters(&mut r, params)
+    }
 }
 
 /// Report from a named parameter load: what was loaded, skipped, or missing.
@@ -185,16 +199,30 @@ pub fn load_named_parameters<R: Read>(r: &mut R, params: &[(String, Parameter)])
     Ok(LoadReport { loaded, skipped, missing })
 }
 
-/// Save named parameters to a file path.
+/// Save named parameters to a file path. Uses gzip compression if path ends with `.gz`.
 pub fn save_named_parameters_file(path: &str, params: &[(String, Parameter)]) -> Result<()> {
-    let mut f = std::fs::File::create(path).map_err(io_err)?;
-    save_named_parameters(&mut f, params)
+    let f = std::fs::File::create(path).map_err(io_err)?;
+    if path.ends_with(".gz") {
+        let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        save_named_parameters(&mut w, params)?;
+        w.finish().map_err(io_err)?;
+        Ok(())
+    } else {
+        let mut w = std::io::BufWriter::new(f);
+        save_named_parameters(&mut w, params)
+    }
 }
 
-/// Load named parameters from a file path.
+/// Load named parameters from a file path. Detects gzip from `.gz` extension.
 pub fn load_named_parameters_file(path: &str, params: &[(String, Parameter)]) -> Result<LoadReport> {
-    let mut f = std::fs::File::open(path).map_err(io_err)?;
-    load_named_parameters(&mut f, params)
+    let f = std::fs::File::open(path).map_err(io_err)?;
+    if path.ends_with(".gz") {
+        let mut r = flate2::read::GzDecoder::new(f);
+        load_named_parameters(&mut r, params)
+    } else {
+        let mut r = std::io::BufReader::new(f);
+        load_named_parameters(&mut r, params)
+    }
 }
 
 // --- Tensor state helpers for optimizer save/load ---
@@ -332,7 +360,7 @@ fn tensor_from_raw_bytes(raw: &[u8], shape: &[i64], dtype: DType) -> Result<Tens
             let data: Vec<i64> = raw.chunks_exact(8)
                 .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                 .collect();
-            Tensor::from_i64(&data, shape)
+            Tensor::from_i64(&data, shape, Device::CPU)
         }
         DType::Float16 | DType::BFloat16 | DType::Int32 => {
             // For f16/bf16/i32: load as f32, then cast to target dtype.
@@ -625,5 +653,38 @@ mod tests {
         assert!(result.is_err(), "shape mismatch should be an error");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("shape mismatch"), "error should mention shape: {}", err_msg);
+    }
+
+    #[test]
+    fn test_compressed_roundtrip() {
+        let params = make_named_params(&[(16, 32), (32, 8)]);
+
+        let dir = std::env::temp_dir();
+        let gz_path = dir.join("test_ckpt.fdl.gz");
+        let plain_path = dir.join("test_ckpt.fdl");
+        let gz = gz_path.to_str().unwrap();
+        let plain = plain_path.to_str().unwrap();
+
+        // Save both compressed and uncompressed
+        save_named_parameters_file(gz, &params).unwrap();
+        save_named_parameters_file(plain, &params).unwrap();
+
+        // Compressed should be smaller
+        let gz_size = std::fs::metadata(gz).unwrap().len();
+        let plain_size = std::fs::metadata(plain).unwrap().len();
+        assert!(gz_size < plain_size, "gz={} should be < plain={}", gz_size, plain_size);
+
+        // Load from compressed and verify
+        let load_params = make_named_params(&[(16, 32), (32, 8)]);
+        let report = load_named_parameters_file(gz, &load_params).unwrap();
+        assert_eq!(report.loaded.len(), 2);
+
+        for ((_, src), (_, dst)) in params.iter().zip(load_params.iter()) {
+            assert_eq!(src.variable.data().to_f32_vec().unwrap(),
+                       dst.variable.data().to_f32_vec().unwrap());
+        }
+
+        std::fs::remove_file(gz).ok();
+        std::fs::remove_file(plain).ok();
     }
 }

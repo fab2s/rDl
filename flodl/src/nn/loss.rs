@@ -21,7 +21,7 @@ pub fn mse_loss(pred: &Variable, target: &Variable) -> Result<Variable> {
 ///
 /// ```ignore
 /// // With class indices (no one-hot allocation needed):
-/// let labels = Variable::new(Tensor::from_i64(&[0, 2, 1], &[3])?, false);
+/// let labels = Variable::new(Tensor::from_i64(&[0, 2, 1], &[3], Device::CPU)?, false);
 /// let loss = cross_entropy_loss(&logits, &labels)?;
 ///
 /// // With one-hot targets (same as before):

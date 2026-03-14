@@ -14,7 +14,7 @@ use super::Module;
 /// ```ignore
 /// let emb = Embedding::new(1000, 64)?;
 /// // Input: [seq_len] of token indices → Output: [seq_len, 64]
-/// let indices = Variable::new(Tensor::from_i64(&[0, 5, 42], &[3])?, false);
+/// let indices = Variable::new(Tensor::from_i64(&[0, 5, 42], &[3], Device::CPU)?, false);
 /// let vectors = emb.forward(&indices)?;
 /// assert_eq!(vectors.shape(), vec![3, 64]);
 /// ```
@@ -62,7 +62,7 @@ impl Module for Embedding {
         } else {
             let flat_data = input.data().to_f32_vec()?;
             let indices: Vec<i64> = flat_data.iter().map(|&v| v as i64).collect();
-            Tensor::from_i64(&indices, &[numel])?
+            Tensor::from_i64(&indices, &[numel], input.device())?
         };
 
         // index_select along dim 0

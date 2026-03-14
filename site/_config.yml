@@ -1,0 +1,26 @@
+title: floDl
+description: A Rust-native deep learning framework built on libtorch
+url: "https://flodl.dev"
+baseurl: ""
+
+markdown: kramdown
+highlighter: rouge
+
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - README.md
+
+defaults:
+  - scope:
+      path: "guide"
+      type: "pages"
+    values:
+      layout: guide

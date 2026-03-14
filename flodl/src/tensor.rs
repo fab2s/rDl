@@ -275,7 +275,7 @@ impl Tensor {
     }
 
     /// Create a tensor from i64 data (for indices).
-    pub fn from_i64(data: &[i64], shape: &[i64]) -> Result<Self> {
+    pub fn from_i64(data: &[i64], shape: &[i64], device: Device) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe {
@@ -284,7 +284,7 @@ impl Tensor {
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 DType::Int64 as i32,
-                Device::CPU as i32,
+                device as i32,
                 &mut handle,
             )
         };
@@ -1354,6 +1354,55 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
+    /// Insert multiple dimensions of size 1.
+    /// Dims are sorted ascending and applied sequentially.
+    pub fn unsqueeze_many(&self, dims: &[i32]) -> Result<Tensor> {
+        let mut sorted = dims.to_vec();
+        sorted.sort();
+        let mut t = self.unsqueeze(sorted[0])?;
+        for &d in &sorted[1..] {
+            t = t.unsqueeze(d)?;
+        }
+        Ok(t)
+    }
+
+    /// Compute meshgrid from a slice of 1-D tensors (always "ij" indexing).
+    pub fn meshgrid(tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
+        let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let mut results_ptr: *mut FlodlTensor = ptr::null_mut();
+        let mut count: i32 = 0;
+        let err = unsafe {
+            ffi::flodl_meshgrid(
+                handles.as_mut_ptr(), handles.len() as i32,
+                &mut results_ptr, &mut count,
+            )
+        };
+        check_err(err)?;
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let handle = unsafe { *results_ptr.add(i) };
+            out.push(Tensor::from_raw(handle));
+        }
+        if !results_ptr.is_null() {
+            unsafe { ffi::flodl_free_string(results_ptr as *mut i8) };
+        }
+        Ok(out)
+    }
+
+    /// Pairwise L2 distance between rows of two batched matrices.
+    /// Input shapes: `[B, P, D]` and `[B, R, D]` -> output `[B, P, R]`.
+    pub fn cdist(&self, other: &Tensor) -> Result<Tensor> {
+        self.cdist_p(other, 2.0)
+    }
+
+    /// Pairwise distance with custom p-norm.
+    pub fn cdist_p(&self, other: &Tensor, p: f64) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_cdist(self.handle, other.handle, p, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
     // --- Device ---
 
     /// Move this tensor to a different device (CPU or CUDA).
@@ -1635,7 +1684,7 @@ mod tests {
         assert_eq!(f.dtype(), DType::Float64);
         assert_eq!(f.to_f64_vec().unwrap(), vec![1.0, 2.0, 3.0]);
 
-        let i = Tensor::from_i64(&[10, 20, 30], &[3]).unwrap();
+        let i = Tensor::from_i64(&[10, 20, 30], &[3], Device::CPU).unwrap();
         assert_eq!(i.dtype(), DType::Int64);
         assert_eq!(i.to_i64_vec().unwrap(), vec![10, 20, 30]);
     }
@@ -1745,7 +1794,7 @@ mod tests {
         assert_eq!(c.to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
 
         let t = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5], Device::CPU).unwrap();
-        let idx = Tensor::from_i64(&[0, 2, 4], &[3]).unwrap();
+        let idx = Tensor::from_i64(&[0, 2, 4], &[3], Device::CPU).unwrap();
         let sel = t.index_select(0, &idx).unwrap();
         assert_eq!(sel.to_f32_vec().unwrap(), vec![10.0, 30.0, 50.0]);
 
@@ -1890,14 +1939,14 @@ mod tests {
     fn test_gather_scatter_add() {
         // gather: pick elements by index
         let t = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0], &[2, 2], Device::CPU).unwrap();
-        let idx = Tensor::from_i64(&[1, 0, 0, 1], &[2, 2]).unwrap();
+        let idx = Tensor::from_i64(&[1, 0, 0, 1], &[2, 2], Device::CPU).unwrap();
         let g = t.gather(1, &idx).unwrap().to_f32_vec().unwrap();
         assert_eq!(g, vec![20.0, 10.0, 30.0, 40.0]);
 
         // scatter_add: accumulate into base at positions
         let base = Tensor::zeros(&[2, 3], TensorOptions::default()).unwrap();
         let src = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], Device::CPU).unwrap();
-        let idx2 = Tensor::from_i64(&[0, 2, 1, 0], &[2, 2]).unwrap();
+        let idx2 = Tensor::from_i64(&[0, 2, 1, 0], &[2, 2], Device::CPU).unwrap();
         let sa = base.scatter_add(1, &idx2, &src).unwrap();
         let data = sa.to_f32_vec().unwrap();
         // Row 0: pos 0 += 1.0, pos 2 += 2.0 → [1, 0, 2]
@@ -1949,5 +1998,57 @@ mod tests {
 
         let ol = Tensor::ones_like(&t).unwrap();
         assert_eq!(ol.to_f32_vec().unwrap(), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_unsqueeze_many() {
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
+        let u = t.unsqueeze_many(&[1, 2]).unwrap();
+        assert_eq!(u.shape(), vec![3, 1, 1]);
+        // Should match sequential unsqueeze
+        let u2 = t.unsqueeze(1).unwrap().unsqueeze(2).unwrap();
+        assert_eq!(u.shape(), u2.shape());
+        assert_eq!(u.to_f32_vec().unwrap(), u2.to_f32_vec().unwrap());
+    }
+
+    #[test]
+    fn test_meshgrid() {
+        let a = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
+        let b = Tensor::from_f32(&[4.0, 5.0], &[2], Device::CPU).unwrap();
+        let grids = Tensor::meshgrid(&[&a, &b]).unwrap();
+        assert_eq!(grids.len(), 2);
+        assert_eq!(grids[0].shape(), vec![3, 2]);
+        assert_eq!(grids[1].shape(), vec![3, 2]);
+        // Grid 0: rows repeat a values
+        assert_eq!(grids[0].to_f32_vec().unwrap(), vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        // Grid 1: cols repeat b values
+        assert_eq!(grids[1].to_f32_vec().unwrap(), vec![4.0, 5.0, 4.0, 5.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_cdist() {
+        // Two 2D points: [0,0] and [3,4] -> distance = 5
+        let x = Tensor::from_f32(&[0.0, 0.0], &[1, 1, 2], Device::CPU).unwrap();
+        let y = Tensor::from_f32(&[3.0, 4.0], &[1, 1, 2], Device::CPU).unwrap();
+        let d = x.cdist(&y).unwrap();
+        assert_eq!(d.shape(), vec![1, 1, 1]);
+        assert!((d.item().unwrap() - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_cdist_p1() {
+        // L1: |3| + |4| = 7
+        let x = Tensor::from_f32(&[0.0, 0.0], &[1, 1, 2], Device::CPU).unwrap();
+        let y = Tensor::from_f32(&[3.0, 4.0], &[1, 1, 2], Device::CPU).unwrap();
+        let d = x.cdist_p(&y, 1.0).unwrap();
+        assert!((d.item().unwrap() - 7.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_from_i64_device() {
+        let t = Tensor::from_i64(&[1, 2, 3], &[3], Device::CPU).unwrap();
+        assert_eq!(t.device(), Device::CPU);
+        assert_eq!(t.dtype(), DType::Int64);
+        assert_eq!(t.to_i64_vec().unwrap(), vec![1, 2, 3]);
     }
 }

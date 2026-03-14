@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::autograd::Variable;
-use crate::nn::{Module, Parameter};
+use crate::nn::Module;
 use crate::tensor::Result;
 
 use super::node::*;
@@ -148,14 +148,6 @@ struct GateComposite {
 impl Module for GateComposite {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.experts[0].forward(input)
-    }
-
-    fn parameters(&self) -> Vec<Parameter> {
-        let mut params = self.router.parameters();
-        for expert in &self.experts {
-            params.extend(expert.parameters());
-        }
-        params
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {

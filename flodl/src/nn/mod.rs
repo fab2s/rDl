@@ -22,6 +22,7 @@ pub mod conv_transpose2d;
 pub mod batchnorm;
 pub mod checkpoint;
 pub mod amp;
+pub mod functional;
 
 pub use parameter::Parameter;
 pub use linear::Linear;
@@ -36,7 +37,7 @@ pub use checkpoint::{
 pub use amp::{GradScaler, cast_parameters};
 pub use clip::{clip_grad_norm, clip_grad_value};
 pub use scheduler::{Scheduler, StepDecay, CosineScheduler, WarmupScheduler, PlateauScheduler};
-pub use dropout::Dropout;
+pub use dropout::{Dropout, Dropout2d};
 pub use layernorm::LayerNorm;
 pub use embedding::Embedding;
 pub use grucell::GRUCell;
@@ -45,6 +46,7 @@ pub use conv2d::Conv2d;
 pub use conv_transpose2d::ConvTranspose2d;
 pub use batchnorm::{BatchNorm, BatchNorm2d};
 pub use init::{xavier_uniform, xavier_normal};
+pub use functional::gaussian_blur_2d;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -65,8 +67,29 @@ use crate::tensor::Result;
 pub trait Module {
     /// Run the forward pass on `input` and return the result.
     fn forward(&self, input: &Variable) -> Result<Variable>;
-    /// Return this module's learnable parameters. Empty by default.
-    fn parameters(&self) -> Vec<Parameter> { vec![] }
+    /// Return this module's learnable parameters.
+    /// Default: recursively collects from `sub_modules()` with pointer dedup.
+    /// Leaf modules should override to return their own parameters.
+    fn parameters(&self) -> Vec<Parameter> {
+        let subs = self.sub_modules();
+        if subs.is_empty() {
+            return vec![];
+        }
+        let mut params = Vec::new();
+        let mut seen = HashSet::new();
+        let mut visited = HashSet::new();
+        for child in &subs {
+            walk_modules_visited(child.as_ref(), &mut visited, &mut |m| {
+                for p in m.parameters() {
+                    let ptr = Rc::as_ptr(&p.variable.inner) as usize;
+                    if seen.insert(ptr) {
+                        params.push(p);
+                    }
+                }
+            });
+        }
+        params
+    }
 
     /// Human-readable type name used as node ID prefix in graph visualization.
     /// Override to return a lowercase identifier (e.g., "linear", "gelu").
@@ -140,7 +163,7 @@ pub fn walk_modules_visited(
     }
 }
 
-/// Recursively collect parameters from a module and its sub-modules.
+/// Collect parameters from multiple modules (convenience function).
 ///
 /// ```ignore
 /// let l1 = Linear::new(3, 4)?;
@@ -1211,7 +1234,7 @@ mod tests {
             true,
         );
         let target_idx = Variable::new(
-            Tensor::from_i64(&[0, 1], &[2]).unwrap(),
+            Tensor::from_i64(&[0, 1], &[2], Device::CPU).unwrap(),
             false,
         );
         let loss_idx = cross_entropy_loss(&pred, &target_idx).unwrap();
@@ -1248,7 +1271,7 @@ mod tests {
         // 3 samples, 3 classes: class 0=[1,0], class 1=[0,1], class 2=[0.5,0.5]
         let x = Variable::new(from_f32(&[1.0, 0.0, 0.0, 1.0, 0.5, 0.5], &[3, 2]), false);
         let target = Variable::new(
-            Tensor::from_i64(&[0, 1, 2], &[3]).unwrap(),
+            Tensor::from_i64(&[0, 1, 2], &[3], Device::CPU).unwrap(),
             false,
         );
 
@@ -1310,8 +1333,8 @@ mod tests {
 
     #[test]
     fn test_eq_tensor_int64() {
-        let a = Tensor::from_i64(&[1, 2, 3], &[3]).unwrap();
-        let b = Tensor::from_i64(&[1, 5, 3], &[3]).unwrap();
+        let a = Tensor::from_i64(&[1, 2, 3], &[3], Device::CPU).unwrap();
+        let b = Tensor::from_i64(&[1, 5, 3], &[3], Device::CPU).unwrap();
         let eq = a.eq_tensor(&b).unwrap();
         // Should be Float32 (not Int64) so mean() works
         assert_eq!(eq.dtype(), crate::tensor::DType::Float32);

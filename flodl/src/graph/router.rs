@@ -3,7 +3,6 @@ use std::rc::Rc;
 
 use crate::autograd::Variable;
 use crate::nn::{Linear, Module, NamedInputModule};
-use crate::nn::parameter::Parameter;
 use crate::tensor::{Device, Result, Tensor};
 
 /// Softmax-normalized gate router for Mixture-of-Experts.
@@ -38,10 +37,6 @@ impl Module for SoftmaxRouter {
         let out = self.proj.forward(input)?;
         let dim = out.data().ndim() as i32 - 1;
         out.softmax(dim)
-    }
-
-    fn parameters(&self) -> Vec<Parameter> {
-        self.proj.parameters()
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
@@ -88,10 +83,6 @@ impl Module for SigmoidRouter {
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.proj.forward(input)?.sigmoid()
-    }
-
-    fn parameters(&self) -> Vec<Parameter> {
-        self.proj.parameters()
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
@@ -175,10 +166,6 @@ impl Module for ArgmaxSelector {
             Tensor::from_f32(&[best as f32], &[1], Device::CPU)?,
             false,
         ))
-    }
-
-    fn parameters(&self) -> Vec<Parameter> {
-        self.proj.parameters()
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {

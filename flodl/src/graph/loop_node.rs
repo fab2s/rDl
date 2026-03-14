@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::autograd::Variable;
-use crate::nn::{Module, Parameter};
+use crate::nn::Module;
 use crate::tensor::Result;
 
 use super::node::*;
@@ -276,14 +276,6 @@ struct LoopComposite {
 impl Module for LoopComposite {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.body.forward(input)
-    }
-
-    fn parameters(&self) -> Vec<Parameter> {
-        let mut params = self.body.parameters();
-        if let Some(ref cond) = self.cond {
-            params.extend(cond.parameters());
-        }
-        params
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {

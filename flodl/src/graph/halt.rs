@@ -2,7 +2,6 @@ use std::rc::Rc;
 
 use crate::autograd::Variable;
 use crate::nn::{Linear, Module};
-use crate::nn::parameter::Parameter;
 use crate::tensor::{Device, Result, Tensor};
 
 /// Threshold-based halt condition for Loop.While / Loop.Until.
@@ -67,10 +66,6 @@ impl Module for LearnedHalt {
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.proj.forward(input)
-    }
-
-    fn parameters(&self) -> Vec<Parameter> {
-        self.proj.parameters()
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {

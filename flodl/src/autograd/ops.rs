@@ -246,6 +246,11 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
+    pub fn unsqueeze_many(&self, dims: &[i32]) -> Result<Variable> {
+        let result = self.data().unsqueeze_many(dims)?;
+        Ok(Variable::wrap(result))
+    }
+
     pub fn flatten(&self, start_dim: i32, end_dim: i32) -> Result<Variable> {
         let result = self.data().flatten(start_dim, end_dim)?;
         Ok(Variable::wrap(result))

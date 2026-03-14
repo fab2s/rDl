@@ -323,7 +323,7 @@ impl Module for AttentionLikeOps {
         let first_half = row2d.narrow(-1, 0, half_dim)?;           // narrow
 
         // index_select: pick specific indices from first_half [1, half_dim]
-        let idx = Tensor::from_i64(&[0, 1], &[2])?;
+        let idx = Tensor::from_i64(&[0, 1], &[2], Device::CPU)?;
         let selected = first_half.index_select(-1, &idx)?;         // index_select
 
         // Combine: scale weights by mean of selected values

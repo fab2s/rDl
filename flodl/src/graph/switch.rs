@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::autograd::Variable;
-use crate::nn::{Module, Parameter};
+use crate::nn::Module;
 use crate::tensor::Result;
 
 use super::node::*;
@@ -137,14 +137,6 @@ struct SwitchComposite {
 impl Module for SwitchComposite {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.branches[0].forward(input)
-    }
-
-    fn parameters(&self) -> Vec<Parameter> {
-        let mut params = self.router.parameters();
-        for branch in &self.branches {
-            params.extend(branch.parameters());
-        }
-        params
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {

@@ -1,0 +1,26 @@
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-group">
+    <div class="sidebar-label">Getting Started</div>
+    <a href="{{ '/guide/rust-primer' | relative_url }}" {% if page.url == '/guide/rust-primer' %}class="active"{% endif %}>Rust for PyTorch Users</a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-label">Tutorials</div>
+    <a href="{{ '/guide/tensors' | relative_url }}" {% if page.url == '/guide/tensors' %}class="active"{% endif %}>1. Tensors</a>
+    <a href="{{ '/guide/autograd' | relative_url }}" {% if page.url == '/guide/autograd' %}class="active"{% endif %}>2. Autograd</a>
+    <a href="{{ '/guide/modules' | relative_url }}" {% if page.url == '/guide/modules' %}class="active"{% endif %}>3. Modules</a>
+    <a href="{{ '/guide/training' | relative_url }}" {% if page.url == '/guide/training' %}class="active"{% endif %}>4. Training</a>
+    <a href="{{ '/guide/graph-builder' | relative_url }}" {% if page.url == '/guide/graph-builder' %}class="active"{% endif %}>5. Graph Builder</a>
+    <a href="{{ '/guide/advanced-graphs' | relative_url }}" {% if page.url == '/guide/advanced-graphs' %}class="active"{% endif %}>6. Advanced Graphs</a>
+    <a href="{{ '/guide/visualization' | relative_url }}" {% if page.url == '/guide/visualization' %}class="active"{% endif %}>7. Visualization</a>
+    <a href="{{ '/guide/utilities' | relative_url }}" {% if page.url == '/guide/utilities' %}class="active"{% endif %}>8. Utilities</a>
+    <a href="{{ '/guide/monitor' | relative_url }}" {% if page.url == '/guide/monitor' %}class="active"{% endif %}>9. Training Monitor</a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-label">Reference</div>
+    <a href="{{ '/guide/migration' | relative_url }}" {% if page.url == '/guide/migration' %}class="active"{% endif %}>PyTorch Migration</a>
+    <a href="{{ '/guide/troubleshooting' | relative_url }}" {% if page.url == '/guide/troubleshooting' %}class="active"{% endif %}>Troubleshooting</a>
+    <a href="{{ '/api/flodl/' | relative_url }}">API Docs &rarr;</a>
+  </div>
+</aside>

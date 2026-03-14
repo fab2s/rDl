@@ -276,6 +276,16 @@ char* flodl_mul_scalar_(FlodlTensor t, double scalar);
 char* flodl_add_scalar_(FlodlTensor t, double scalar);
 char* flodl_zero_(FlodlTensor t);
 
+// --- Meshgrid ---
+
+char* flodl_meshgrid(FlodlTensor* tensors, int count,
+                    FlodlTensor** results, int* result_count);
+
+// --- Pairwise distance ---
+
+char* flodl_cdist(FlodlTensor x, FlodlTensor y, double p,
+                 FlodlTensor* result);
+
 // --- Utility ---
 
 void flodl_free_string(char* s);
