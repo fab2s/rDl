@@ -187,7 +187,8 @@ let model = FlowBuilder::from(Linear::new(1, 32)?)
     .build()?;
 
 let named = model.named_parameters();
-save_named_parameters_file("model.fdl", &named)?;
+let buffers = model.named_buffers();
+save_checkpoint_file("model.fdl", &named, &buffers)?;
 
 // Later — rebuild the SAME architecture before loading
 let model = FlowBuilder::from(Linear::new(1, 32)?)
@@ -196,7 +197,8 @@ let model = FlowBuilder::from(Linear::new(1, 32)?)
     .build()?;
 
 let named = model.named_parameters();
-let report = load_named_parameters_file("model.fdl", &named)?;
+let buffers = model.named_buffers();
+let report = load_checkpoint_file("model.fdl", &named, &buffers)?;
 ```
 
 ### `checkpoint error: invalid magic bytes`

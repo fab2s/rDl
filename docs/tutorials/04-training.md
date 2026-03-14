@@ -250,20 +250,22 @@ everywhere the parameter is referenced.
 Save and restore model parameters using named checkpoints:
 
 ```rust
-// Save
+// Save (parameters + buffers like BatchNorm running stats)
 let named = model.named_parameters();
-save_named_parameters_file("/tmp/model.fdl", &named)?;
+let buffers = model.named_buffers();
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
 
 // Load
 let named = model.named_parameters();
-let report = load_named_parameters_file("/tmp/model.fdl", &named)?;
+let buffers = model.named_buffers();
+let report = load_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
 ```
 
 The `io::Write` / `io::Read` variants are also available:
 
 ```rust
-save_named_parameters(&mut writer, &named)?;
-let report = load_named_parameters(&mut reader, &named)?;
+save_checkpoint(&mut writer, &named, &buffers)?;
+let report = load_checkpoint(&mut reader, &named, &buffers)?;
 ```
 
 ### Partial loading (transfer learning)
@@ -273,11 +275,13 @@ Named checkpoints match by qualified name, so you can load a subset of parameter
 ```rust
 // Save with qualified names
 let named = model.named_parameters();
-save_named_parameters_file("/tmp/model.fdl", &named)?;
+let buffers = model.named_buffers();
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
 
 // Load into a different model — matches by name
 let new_named = new_model.named_parameters();
-let report = load_named_parameters_file("/tmp/model.fdl", &new_named)?;
+let new_buffers = new_model.named_buffers();
+let report = load_checkpoint_file("/tmp/model.fdl", &new_named, &new_buffers)?;
 
 println!("loaded: {:?}", report.loaded);   // matched and loaded
 println!("skipped: {:?}", report.skipped); // in checkpoint, not in model

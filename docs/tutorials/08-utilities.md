@@ -44,26 +44,28 @@ Save and restore model parameters with a compact binary format.
 ### Saving and loading
 
 ```rust
-use flodl::{save_named_parameters_file, load_named_parameters_file};
+use flodl::{save_checkpoint_file, load_checkpoint_file};
 
-// Save
+// Save (parameters + buffers like BatchNorm running stats)
 let named = model.named_parameters();
-save_named_parameters_file("/tmp/model.fdl", &named)?;
+let buffers = model.named_buffers();
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
 
 // Load
 let named = model.named_parameters();
-let report = load_named_parameters_file("/tmp/model.fdl", &named)?;
+let buffers = model.named_buffers();
+let report = load_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
 ```
 
-`load_named_parameters_file` validates parameter names and shapes.
-The returned `LoadReport` tells you exactly which parameters were loaded,
+`load_checkpoint_file` validates names and shapes for both parameters and buffers.
+The returned `LoadReport` tells you exactly which entries were loaded,
 skipped, or missing.
 
 ### Details
 
-- Parameters store their native dtype — float16 params stay f16 on disk.
-- Named checkpoints match parameters by qualified name and validate shapes.
-- The `io::Write` / `io::Read` variants (`save_named_parameters`, `load_named_parameters`)
+- Parameters and buffers store their native dtype — float16 params stay f16 on disk.
+- Named checkpoints match entries by qualified name and validate shapes.
+- The `io::Write` / `io::Read` variants (`save_checkpoint`, `load_checkpoint`)
   work with any destination: files, buffers, network connections.
 
 ### Partial loading (transfer learning)
@@ -77,11 +79,13 @@ use flodl::*;
 
 // Save with qualified names from a Graph
 let named = model.named_parameters();
-save_named_parameters_file("/tmp/model.fdl", &named)?;
+let buffers = model.named_buffers();
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
 
 // Load into a different model — only matching names transfer
 let new_named = new_model.named_parameters();
-let report = load_named_parameters_file("/tmp/model.fdl", &new_named)?;
+let new_buffers = new_model.named_buffers();
+let report = load_checkpoint_file("/tmp/model.fdl", &new_named, &new_buffers)?;
 
 println!("loaded:  {:?}", report.loaded);   // matched and loaded
 println!("skipped: {:?}", report.skipped);  // in checkpoint, not in model
@@ -121,7 +125,8 @@ for epoch in 0..num_epochs {
     if (epoch + 1) % 10 == 0 {
         let path = format!("/tmp/checkpoint_epoch_{}.fdl", epoch + 1);
         let named = model.named_parameters();
-        save_named_parameters_file(&path, &named)?;
+        let buffers = model.named_buffers();
+        save_checkpoint_file(&path, &named, &buffers)?;
     }
 }
 ```
@@ -336,7 +341,8 @@ for epoch in 0..100 {
 // Save.
 g.set_training(false);
 let named = model.named_parameters();
-save_named_parameters_file("/tmp/model.fdl", &named)?;
+let buffers = model.named_buffers();
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
 ```
 
 ---

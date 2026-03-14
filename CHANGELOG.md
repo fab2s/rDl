@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **Parameter freezing**: `Parameter::freeze()`, `unfreeze()`, `is_frozen()` — disable/enable gradient tracking per parameter. Optimizers automatically skip frozen params (no grad). `Parameter::to_device()` now preserves frozen state.
-- **Named checkpoints**: `Graph::named_parameters()` returns qualified names (`"tag/weight"` or `"node_id/weight"`). `save_named_parameters` / `load_named_parameters` match by name for partial loading. `LoadReport` reports what was loaded, skipped, and missing.
+- **Named checkpoints**: `Graph::named_parameters()` and `named_buffers()` return qualified names (`"tag/weight"` or `"node_id/running_mean"`). `save_checkpoint` / `load_checkpoint` persist both parameters and buffers (e.g., BatchNorm running stats), matching by name for partial loading. `LoadReport` reports what was loaded, skipped, and missing.
 - **Optimizer parameter groups**: `Adam::with_groups()`, `SGD::with_groups()`, `AdamW::with_groups()` — builder API for per-group learning rates. `Optimizer::set_group_lr()` adjusts a single group; `set_lr()` updates all groups. Groups are persisted through `Stateful` save/load.
 
 ### Changed
@@ -40,7 +40,7 @@ Initial release. Rust port of [goDl](https://github.com/fab2s/goDl).
 - LR scheduling: StepDecay, CosineScheduler, WarmupScheduler (composable), PlateauScheduler.
 - Mixed precision: Float16/BFloat16 dtype casting, GradScaler for loss scaling.
 - Gradient clipping: clip_grad_norm, clip_grad_value.
-- Checkpointing: save_named_parameters/load_named_parameters (named binary format with LoadReport, file or io::Write).
+- Checkpointing: save_checkpoint/load_checkpoint (named binary format with LoadReport, persists parameters + buffers, file or io::Write).
 - Weight initialization: kaiming_uniform/normal, xavier_uniform/normal.
 
 ### Training Monitor

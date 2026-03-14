@@ -630,13 +630,14 @@ model.load_state_dict(torch.load("model.pt"))
 ```rust
 // flodl — named checkpoint (partial loading for transfer learning)
 let named = model.named_parameters();
-save_named_parameters_file("model.fdl", &named)?;
-let report = load_named_parameters_file("model.fdl", &named)?;
+let buffers = model.named_buffers();
+save_checkpoint_file("model.fdl", &named, &buffers)?;
+let report = load_checkpoint_file("model.fdl", &named, &buffers)?;
 // report.loaded, report.skipped, report.missing
 
 // Or with any io::Write / io::Read:
-save_named_parameters(&mut writer, &named)?;
-let report = load_named_parameters(&mut reader, &named)?;
+save_checkpoint(&mut writer, &named, &buffers)?;
+let report = load_checkpoint(&mut reader, &named, &buffers)?;
 ```
 
 ### Full training resume (model + optimizer)
@@ -646,13 +647,15 @@ Optimizers implement the `Stateful` trait for save/load:
 ```rust
 // Save
 let named = model.named_parameters();
-save_named_parameters_file("model.fdl", &named)?;
+let buffers = model.named_buffers();
+save_checkpoint_file("model.fdl", &named, &buffers)?;
 let mut f = File::create("optimizer.fdl")?;
 optimizer.save_state(&mut f)?;
 
 // Load
 let named = model.named_parameters();
-let report = load_named_parameters_file("model.fdl", &named)?;
+let buffers = model.named_buffers();
+let report = load_checkpoint_file("model.fdl", &named, &buffers)?;
 let mut f = File::open("optimizer.fdl")?;
 optimizer.load_state(&mut f)?;
 ```
@@ -1033,7 +1036,7 @@ to query them manually during training.
 | `with torch.no_grad():` | `no_grad(\|\| { })` | Closure-based |
 | `nn.Sequential(...)` | `FlowBuilder::from(...).through(...).build()?` | Fluent builder |
 | `model.train()` | `module.set_training(true)` | |
-| `torch.save(...)` / `torch.load(...)` | `save_named_parameters_file("m.fdl", ...)?` / `load_named_parameters_file("m.fdl", ...)?` | Named `.fdl` format with `LoadReport` |
+| `torch.save(...)` / `torch.load(...)` | `save_checkpoint_file("m.fdl", &params, &buffers)?` / `load_checkpoint_file(...)` | Named `.fdl` format with `LoadReport` |
 | `param.requires_grad = False` | `param.freeze()?` | Also: `unfreeze()`, `is_frozen()` |
 | `Adam([{"params":..., "lr":...}])` | `Adam::with_groups().group(&p, lr).build()` | Per-group LR |
 | `torch.cuda.memory_allocated()` | `cuda_memory_info()?` | `(used, total)` bytes |

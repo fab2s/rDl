@@ -14,4 +14,4 @@ cargo run --example sine_wave
 - `Adam` optimizer with `CosineScheduler`
 - `record_scalar` / `flush` with `Monitor::log(&model)`
 - `no_grad` for evaluation
-- `save_named_parameters_file` / `load_named_parameters_file` checkpoint round-trip
+- `save_checkpoint_file` / `load_checkpoint_file` checkpoint round-trip

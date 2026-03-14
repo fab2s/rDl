@@ -327,7 +327,7 @@ fn main() -> Result<()> {
 
     // --- Save checkpoint ---
     // PyTorch: torch.save(model.state_dict(), "model.fdl")
-    // save_named_parameters_file("model.fdl", &model.named_parameters())?;
+    // save_checkpoint_file("model.fdl", &model.named_parameters(), &model.named_buffers())?;
 
     Ok(())
 }
