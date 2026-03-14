@@ -163,6 +163,7 @@ let startTime=null;
 let elapsedTimer=null;
 // Solo filter: {chartId: seriesName|null}. null = show all.
 const soloState={metricsChart:null,resourceChart:null};
+let _skipDraw=false;
 
 // --- Epoch processing (shared by live SSE and archive replay) ---
 function processEpoch(d){
@@ -185,8 +186,7 @@ function processEpoch(d){
   updateHeader(d);
   updateResources(r);
   updateLog(d);
-  drawMetrics();
-  drawResources();
+  if(!_skipDraw){drawMetrics();drawResources()}
   ensureLogHeaders();
 }
 function markComplete(msg){
@@ -202,9 +202,14 @@ function showSvg(svg){
 // --- Data source: live SSE or archive replay ---
 // ARCHIVE_DATA is injected by monitor.save_html(); if absent, connect live.
 if(typeof ARCHIVE_DATA!=='undefined'){
+  _skipDraw=true;
   ARCHIVE_DATA.forEach(processEpoch);
+  _skipDraw=false;
+  drawMetrics();drawResources();
   markComplete(ARCHIVE_COMPLETE||'Complete');
   if(typeof ARCHIVE_SVG==='string')showSvg(ARCHIVE_SVG);
+  // Re-render after layout to ensure correct canvas dimensions
+  requestAnimationFrame(()=>{drawMetrics();drawResources()});
 }else{
   const es=new EventSource('/events');
   es.addEventListener('epoch',e=>processEpoch(JSON.parse(e.data)));

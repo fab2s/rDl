@@ -279,6 +279,8 @@ impl Monitor {
             self.set_svg(&String::from_utf8_lossy(&svg_bytes));
         } else if let Ok(svg_bytes) = graph.svg(None) {
             self.set_svg(&String::from_utf8_lossy(&svg_bytes));
+        } else {
+            eprintln!("  warning: could not generate graph SVG (is graphviz installed?)");
         }
         self.finish_inner();
     }
@@ -393,6 +395,10 @@ impl Monitor {
             let _ = write!(data_json, "{}", self.epoch_record_to_json(record));
         }
         data_json.push(']');
+        // Prevent HTML parser from seeing </script> in embedded JSON
+        let data_json = data_json
+            .replace("</script", "<\\/script")
+            .replace("</SCRIPT", "<\\/SCRIPT");
 
         // SVG as a JS string literal (template literal for safe escaping)
         let svg_js = match &self.svg_snapshot {
@@ -400,7 +406,9 @@ impl Monitor {
                 let escaped = svg
                     .replace('\\', "\\\\")
                     .replace('`', "\\`")
-                    .replace("${", "\\${");
+                    .replace("${", "\\${")
+                    .replace("</script", "<\\/script")
+                    .replace("</SCRIPT", "<\\/SCRIPT");
                 format!("`{}`", escaped)
             }
             None => "null".to_string(),
