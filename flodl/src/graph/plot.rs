@@ -384,7 +384,11 @@ canvas.addEventListener('mousemove',e=>{
     }
   });
   tooltip.innerHTML=html;tooltip.style.display='block';
-  tooltip.style.left=(e.pageX+12)+'px';tooltip.style.top=(e.pageY-10)+'px';
+  let tx=e.pageX+12,ty=e.pageY-10;
+  const tw=tooltip.offsetWidth,th=tooltip.offsetHeight;
+  if(tx+tw>window.innerWidth+window.scrollX)tx=e.pageX-tw-12;
+  if(ty+th>window.innerHeight+window.scrollY)ty=e.pageY-th-10;
+  tooltip.style.left=tx+'px';tooltip.style.top=ty+'px';
 });
 canvas.addEventListener('mouseleave',()=>{tooltip.style.display='none'});
 window.addEventListener('resize',resize);

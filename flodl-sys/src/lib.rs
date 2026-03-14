@@ -480,6 +480,10 @@ unsafe extern "C" {
     pub fn flodl_add_scalar_(t: FlodlTensor, scalar: f64) -> *mut i8;
     pub fn flodl_zero_(t: FlodlTensor) -> *mut i8;
 
+    // --- Memory diagnostics ---
+
+    pub fn flodl_malloc_trim() -> i32;
+
     // --- Utility ---
 
     pub fn flodl_free_string(s: *mut i8);

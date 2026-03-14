@@ -440,7 +440,11 @@ function updateLegend(id,names,colors,chartId,redrawFn,labels){
     });
     const tip=document.getElementById('tooltip');
     tip.innerHTML=html;tip.style.display='block';
-    tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-10)+'px';
+    let tx=e.clientX+14,ty=e.clientY-10;
+    const tw=tip.offsetWidth,th=tip.offsetHeight;
+    if(tx+tw>window.innerWidth)tx=e.clientX-tw-14;
+    if(ty+th>window.innerHeight)ty=e.clientY-th-10;
+    tip.style.left=tx+'px';tip.style.top=ty+'px';
   });
   canvas.addEventListener('mouseleave',()=>{document.getElementById('tooltip').style.display='none'});
 });

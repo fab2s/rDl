@@ -286,6 +286,13 @@ char* flodl_meshgrid(FlodlTensor* tensors, int count,
 char* flodl_cdist(FlodlTensor x, FlodlTensor y, double p,
                  FlodlTensor* result);
 
+// --- Memory diagnostics ---
+
+// Ask glibc to return free memory to the OS. Returns 1 if memory was
+// actually released, 0 otherwise. Useful for distinguishing allocator
+// fragmentation from real leaks.
+int flodl_malloc_trim(void);
+
 // --- Utility ---
 
 void flodl_free_string(char* s);

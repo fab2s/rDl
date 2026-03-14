@@ -12,6 +12,9 @@
 #include <torch/torch.h>
 #include <cstring>
 #include <string>
+#ifdef __linux__
+#include <malloc.h>
+#endif
 
 #ifdef FLODL_BUILD_CUDA
 #include <c10/cuda/CUDAFunctions.h>
@@ -1515,6 +1518,16 @@ extern "C" char* flodl_cdist(FlodlTensor x, FlodlTensor y, double p,
     } catch (const std::exception& e) {
         return make_error(e.what());
     }
+}
+
+// --- Memory diagnostics ---
+
+extern "C" int flodl_malloc_trim() {
+#ifdef __linux__
+    return malloc_trim(0);
+#else
+    return 0;
+#endif
 }
 
 // --- Utility ---

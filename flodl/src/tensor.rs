@@ -1568,6 +1568,15 @@ pub fn cuda_utilization() -> Option<u32> {
     if val >= 0 { Some(val as u32) } else { None }
 }
 
+/// Ask glibc to return free memory to the OS (Linux only).
+///
+/// Returns `true` if memory was actually released. Useful for
+/// distinguishing allocator fragmentation from real leaks:
+/// if RSS drops after calling this, the growth was fragmentation.
+pub fn malloc_trim() -> bool {
+    unsafe { ffi::flodl_malloc_trim() != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
