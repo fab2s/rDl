@@ -1,0 +1,88 @@
+name: Deploy site to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+env:
+  LIBTORCH_VERSION: "2.10.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Cargo docs ──────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wget unzip g++ pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + libtorch
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ${{ github.workspace }}/libtorch
+          key: docs-${{ env.LIBTORCH_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: docs-${{ env.LIBTORCH_VERSION }}-
+
+      - name: Download libtorch
+        run: |
+          if [ ! -d "${{ github.workspace }}/libtorch" ]; then
+            wget -q "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip"
+            unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cpu.zip"
+            rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cpu.zip"
+          fi
+
+      - name: Build cargo docs
+        env:
+          LIBTORCH_PATH: ${{ github.workspace }}/libtorch
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+          LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+        run: cargo doc --no-deps -p flodl -p flodl-sys
+
+      # ── Jekyll site ─────────────────────────────
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./site
+          destination: ./_site
+
+      # ── Merge cargo docs into site ──────────────
+      - name: Copy cargo docs into site
+        run: cp -r target/doc _site/api
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
