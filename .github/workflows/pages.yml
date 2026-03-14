@@ -66,6 +66,10 @@ jobs:
           LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
         run: cargo doc --no-deps -p flodl -p flodl-sys
 
+      # ── Merge cargo docs into Jekyll source ──────
+      - name: Copy cargo docs into site source
+        run: cp -r target/doc site/api
+
       # ── Jekyll site ─────────────────────────────
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -75,12 +79,6 @@ jobs:
         with:
           source: ./site
           destination: ./_site
-
-      # ── Merge cargo docs into site ──────────────
-      - name: Copy cargo docs into site
-        run: |
-          chmod -R u+w _site
-          cp -r target/doc _site/api
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
