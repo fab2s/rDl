@@ -253,6 +253,10 @@ unsafe extern "C" {
         a: FlodlTensor, b: FlodlTensor, dim: i32, result: *mut FlodlTensor,
     ) -> *mut i8;
 
+    pub fn flodl_cat(
+        tensors: *mut FlodlTensor, count: i32, dim: i32, result: *mut FlodlTensor,
+    ) -> *mut i8;
+
     pub fn flodl_stack(
         tensors: *mut FlodlTensor, count: i32, dim: i32, result: *mut FlodlTensor,
     ) -> *mut i8;

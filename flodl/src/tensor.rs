@@ -701,6 +701,23 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
+    /// Concatenate multiple tensors along an existing dimension.
+    ///
+    /// All tensors must have the same shape except in the concatenation dimension.
+    /// Uses a single kernel launch regardless of the number of tensors.
+    pub fn cat_many(tensors: &[&Tensor], dim: i32) -> Result<Tensor> {
+        if tensors.is_empty() {
+            return Err(TensorError::new("cat_many: empty tensor list"));
+        }
+        let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let mut result: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_cat(handles.as_mut_ptr(), handles.len() as i32, dim, &mut result)
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(result))
+    }
+
     /// Stack tensors along a new dimension.
     ///
     /// All tensors must have the same shape. A new dimension is inserted at `dim`.
@@ -1685,10 +1702,10 @@ pub fn cuda_utilization() -> Option<u32> {
     if val >= 0 { Some(val as u32) } else { None }
 }
 
-/// Returns the GPU device name (e.g. "NVIDIA GeForce GTX 1060 6GB").
-pub fn cuda_device_name() -> Option<String> {
+/// Returns the GPU device name for the given index (e.g. "NVIDIA GeForce GTX 1060 6GB").
+pub fn cuda_device_name_idx(device: i32) -> Option<String> {
     let mut buf = [0i8; 256];
-    let err = unsafe { ffi::flodl_cuda_device_name(0, buf.as_mut_ptr(), 256) };
+    let err = unsafe { ffi::flodl_cuda_device_name(device, buf.as_mut_ptr(), 256) };
     if err.is_null() {
         let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
             .to_string_lossy()
@@ -1700,24 +1717,48 @@ pub fn cuda_device_name() -> Option<String> {
     }
 }
 
+/// Returns the GPU device name for device 0 (e.g. "NVIDIA GeForce GTX 1060 6GB").
+pub fn cuda_device_name() -> Option<String> {
+    cuda_device_name_idx(0)
+}
+
 /// One-line hardware summary for dashboard headers.
 ///
 /// Returns something like:
 /// `"CPU: AMD Ryzen 9 5900X (64GB) | GPU: NVIDIA GeForce GTX 1060 (6GB)"`
 pub fn hardware_summary() -> String {
     let cpu = cpu_model_name().unwrap_or_else(|| "Unknown CPU".into());
+    let threads = cpu_thread_count();
     let ram = total_ram_gb();
-    let mut s = format!("{} ({}GB)", cpu, ram);
+    let mut s = format!("{} ({} threads, {}GB)", cpu, threads, ram);
 
-    if cuda_available() && let Some(gpu) = cuda_device_name() {
-        let vram = cuda_memory_info()
-            .map(|(_, total)| total / (1024 * 1024 * 1024))
-            .unwrap_or(0);
-        let _ = std::fmt::Write::write_fmt(&mut s, format_args!(
-            " | {} ({}GB)", gpu, vram
-        ));
+    if cuda_available() {
+        let n = cuda_device_count();
+        for i in 0..n {
+            if let Some(gpu) = cuda_device_name_idx(i) {
+                // VRAM: only available for device 0 via cudaMemGetInfo for now
+                let vram_str = if i == 0 {
+                    cuda_memory_info()
+                        .map(|(_, total)| format!(" ({}GB)", total / (1024 * 1024 * 1024)))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let _ = std::fmt::Write::write_fmt(&mut s, format_args!(
+                    " | {}{}", gpu, vram_str
+                ));
+            }
+        }
     }
     s
+}
+
+/// Count logical CPU threads from /proc/cpuinfo (Linux).
+fn cpu_thread_count() -> usize {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .map(|s| s.lines().filter(|l| l.starts_with("processor")).count())
+        .unwrap_or(1)
 }
 
 /// Read CPU model name from /proc/cpuinfo (Linux).
@@ -2016,6 +2057,37 @@ mod tests {
         assert_eq!(e.shape(), vec![4, 3]);
         let data = e.to_f32_vec().unwrap();
         assert_eq!(data, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_cat_many() {
+        let a = Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap();
+        let b = Tensor::from_f32(&[3.0, 4.0, 5.0], &[3], test_device()).unwrap();
+        let c = Tensor::from_f32(&[6.0], &[1], test_device()).unwrap();
+
+        // Concatenate 3 tensors along dim 0
+        let result = Tensor::cat_many(&[&a, &b, &c], 0).unwrap();
+        assert_eq!(result.shape(), vec![6]);
+        assert_eq!(result.to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // 2D: concat along dim 1
+        let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
+        let y = Tensor::from_f32(&[5.0, 6.0], &[2, 1], test_device()).unwrap();
+        let z = Tensor::from_f32(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &[2, 3], test_device()).unwrap();
+        let result2 = Tensor::cat_many(&[&x, &y, &z], 1).unwrap();
+        assert_eq!(result2.shape(), vec![2, 6]);
+        assert_eq!(
+            result2.to_f32_vec().unwrap(),
+            vec![1.0, 2.0, 5.0, 7.0, 8.0, 9.0, 3.0, 4.0, 6.0, 10.0, 11.0, 12.0]
+        );
+
+        // Single tensor — should just return a copy
+        let single = Tensor::cat_many(&[&a], 0).unwrap();
+        assert_eq!(single.to_f32_vec().unwrap(), vec![1.0, 2.0]);
+
+        // Empty list — should error
+        let empty: Vec<&Tensor> = vec![];
+        assert!(Tensor::cat_many(&empty, 0).is_err());
     }
 
     #[test]

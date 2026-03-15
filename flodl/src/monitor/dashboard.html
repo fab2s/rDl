@@ -13,9 +13,11 @@ background:var(--bg);color:var(--text);padding:0;min-height:100vh}
 
 /* Header */
 .header{background:var(--card);border-bottom:1px solid var(--border);padding:16px 24px;
-display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+display:flex;flex-direction:column;gap:8px}
+.header-row{display:flex;align-items:center;gap:24px;flex-wrap:wrap}
 .header h1{font-size:18px;font-weight:600;color:var(--accent);letter-spacing:-0.5px}
 .header h1 span{color:var(--dim);font-weight:400}
+.hw-info{color:var(--dim);font-size:11px;letter-spacing:0.3px;font-family:monospace}
 .stat{display:flex;flex-direction:column;gap:2px}
 .stat-label{font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:var(--dim)}
 .stat-value{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
@@ -85,27 +87,27 @@ animation:pulse 2s ease-in-out infinite}
 <body>
 
 <div class="header">
-  <div style="display:flex;flex-direction:column">
+  <div class="header-row">
     <h1>floDl <span>Training Dashboard</span></h1>
-    <div id="hwInfo" style="display:none;color:var(--dim);font-size:11px;letter-spacing:0.3px;margin:2px 0 0 0;font-family:monospace"></div>
+    <div class="status" id="status">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Waiting...</span>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Epoch</div>
+      <div class="stat-value" id="epochNum">—</div>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="stat">
+      <div class="stat-label">ETA</div>
+      <div class="stat-value" id="etaDisplay">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Elapsed</div>
+      <div class="stat-value" id="elapsedDisplay">—</div>
+    </div>
   </div>
-  <div class="status" id="status">
-    <div class="status-dot" id="statusDot"></div>
-    <span id="statusText">Waiting...</span>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Epoch</div>
-    <div class="stat-value" id="epochNum">—</div>
-  </div>
-  <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
-  <div class="stat">
-    <div class="stat-label">ETA</div>
-    <div class="stat-value" id="etaDisplay">—</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Elapsed</div>
-    <div class="stat-value" id="elapsedDisplay">—</div>
-  </div>
+  <div class="hw-info" id="hwInfo" style="display:none"></div>
 </div>
 
 <div class="grid">

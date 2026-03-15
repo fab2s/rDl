@@ -298,6 +298,13 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
+    pub fn cat_many(vars: &[&Variable], dim: i32) -> Result<Variable> {
+        let tensors: Vec<Tensor> = vars.iter().map(|v| v.data()).collect();
+        let refs: Vec<&Tensor> = tensors.iter().collect();
+        let result = Tensor::cat_many(&refs, dim)?;
+        Ok(Variable::wrap(result))
+    }
+
     pub fn stack(vars: &[Variable], dim: i32) -> Result<Variable> {
         let tensors: Vec<Tensor> = vars.iter().map(|v| v.data()).collect();
         let refs: Vec<&Tensor> = tensors.iter().collect();

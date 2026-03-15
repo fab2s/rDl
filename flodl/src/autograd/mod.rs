@@ -735,6 +735,24 @@ mod tests {
     }
 
     #[test]
+    fn test_cat_many_gradient() {
+        let a = Variable::new(from_f32(&[1.0, 2.0], &[2]), true);
+        let b = Variable::new(from_f32(&[3.0, 4.0, 5.0], &[3]), true);
+        let c = Variable::new(from_f32(&[6.0], &[1]), true);
+        let catted = Variable::cat_many(&[&a, &b, &c], 0).unwrap();
+        assert_eq!(catted.data().shape(), vec![6]);
+
+        // Weight each element differently to verify gradient routing
+        let w = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6]), false);
+        let loss = catted.mul(&w).unwrap().sum().unwrap();
+        loss.backward().unwrap();
+
+        assert_eq!(a.grad().unwrap().to_f32_vec().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(b.grad().unwrap().to_f32_vec().unwrap(), vec![3.0, 4.0, 5.0]);
+        assert_eq!(c.grad().unwrap().to_f32_vec().unwrap(), vec![6.0]);
+    }
+
+    #[test]
     fn test_stack_gradient() {
         let a = Variable::new(from_f32(&[1.0, 2.0], &[2]), true);
         let b = Variable::new(from_f32(&[3.0, 4.0], &[2]), true);
