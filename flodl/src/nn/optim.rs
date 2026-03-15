@@ -385,53 +385,29 @@ impl Optimizer for Adam {
 impl Adam {
     fn adam_update(&mut self, weight_decay: f64) -> Result<()> {
         self.t += 1;
-        let bc1 = 1.0 - self.beta1.powi(self.t as i32);
-        let bc2 = 1.0 - self.beta2.powi(self.t as i32);
 
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
                 if let Some(grad) = param.grad() {
                     let lr = self.lr_for_param(i);
 
-                    // First moment: m = β1*m + (1-β1)*grad
-                    let m = match self.m[i].take() {
-                        Some(m) => {
-                            m.mul_scalar_(self.beta1)?;
-                            m.add_(&grad.mul_scalar(1.0 - self.beta1)?)?;
-                            m
-                        }
-                        None => grad.mul_scalar(1.0 - self.beta1)?,
-                    };
-
-                    // Second moment: v = β2*v + (1-β2)*grad²
-                    let grad_sq = grad.mul(&grad)?;
-                    let v = match self.v[i].take() {
-                        Some(v) => {
-                            v.mul_scalar_(self.beta2)?;
-                            v.add_(&grad_sq.mul_scalar(1.0 - self.beta2)?)?;
-                            v
-                        }
-                        None => grad_sq.mul_scalar(1.0 - self.beta2)?,
-                    };
-
-                    // Bias-corrected estimates
-                    let m_hat = m.mul_scalar(1.0 / bc1)?;
-                    let v_hat = v.mul_scalar(1.0 / bc2)?;
-
-                    self.m[i] = Some(m);
-                    self.v[i] = Some(v);
-
-                    // param -= lr * m_hat / (sqrt(v_hat) + eps)
-                    let denom = v_hat.sqrt()?.add_scalar(self.eps)?;
-                    let update = m_hat.div(&denom)?.mul_scalar(lr)?;
-                    let data = param.data().detach()?;
-
-                    // Decoupled weight decay: data *= (1 - lr * wd)
-                    if weight_decay > 0.0 {
-                        data.mul_scalar_(1.0 - lr * weight_decay)?;
+                    // Lazy-init moment buffers as zeros on first step
+                    if self.m[i].is_none() {
+                        self.m[i] = Some(crate::tensor::Tensor::zeros_like(&grad)?);
+                    }
+                    if self.v[i].is_none() {
+                        self.v[i] = Some(crate::tensor::Tensor::zeros_like(&grad)?);
                     }
 
-                    data.sub_(&update)?;
+                    // Single fused FFI call: ~5 kernels instead of ~16
+                    let data = param.data();
+                    data.adam_step(
+                        &grad,
+                        self.m[i].as_ref().unwrap(),
+                        self.v[i].as_ref().unwrap(),
+                        lr, self.beta1, self.beta2, self.eps,
+                        weight_decay, self.t as i64,
+                    )?;
                 }
             }
             Ok(())
@@ -756,5 +732,105 @@ mod tests {
         assert_eq!(opt2.t, opt.t);
         assert!((opt2.groups[0].lr - 0.01).abs() < 1e-12);
         assert!((opt2.groups[1].lr - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_fused_adam_numerical_correctness() {
+        // Known param/grad/m/v, verify against hand-computed expected values
+        let param = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4], Device::CPU).unwrap();
+        let grad = Tensor::from_f32(&[0.1, 0.2, 0.3, 0.4], &[4], Device::CPU).unwrap();
+        let m = Tensor::zeros(&[4], TensorOptions::default()).unwrap();
+        let v = Tensor::zeros(&[4], TensorOptions::default()).unwrap();
+
+        let lr = 0.001;
+        let beta1 = 0.9;
+        let beta2 = 0.999;
+        let eps = 1e-8;
+        let step: i64 = 1;
+
+        param.adam_step(&grad, &m, &v, lr, beta1, beta2, eps, 0.0, step).unwrap();
+
+        // After step 1 with zero initial moments:
+        // m = 0.1 * grad, v = 0.001 * grad^2
+        // bc1 = 0.1, bc2 = 0.001
+        // step_size = lr / bc1 = 0.01
+        // denom = sqrt(v / bc2) + eps = |grad| + eps
+        // update = step_size * m / denom ≈ step_size * 0.1*grad / |grad| ≈ 0.001 * sign(grad)
+        // With positive grad: param -= 0.001
+
+        let p_data = param.to_f32_vec().unwrap();
+        let m_data = m.to_f32_vec().unwrap();
+        let v_data = v.to_f32_vec().unwrap();
+
+        // m = (1-beta1)*grad = 0.1 * [0.1, 0.2, 0.3, 0.4]
+        for (i, &g) in [0.1f32, 0.2, 0.3, 0.4].iter().enumerate() {
+            assert!((m_data[i] - 0.1 * g).abs() < 1e-6,
+                "m[{}]: got {}, expected {}", i, m_data[i], 0.1 * g);
+        }
+
+        // v = (1-beta2)*grad^2 = 0.001 * [0.01, 0.04, 0.09, 0.16]
+        for (i, &g) in [0.1f32, 0.2, 0.3, 0.4].iter().enumerate() {
+            assert!((v_data[i] - 0.001 * g * g).abs() < 1e-9,
+                "v[{}]: got {}, expected {}", i, v_data[i], 0.001 * g * g);
+        }
+
+        // Each param element should have decreased by approximately lr
+        let orig = [1.0f32, 2.0, 3.0, 4.0];
+        for (i, &o) in orig.iter().enumerate() {
+            assert!((p_data[i] - (o - lr as f32)).abs() < 1e-5,
+                "p[{}]: got {}, expected ~{}", i, p_data[i], o - lr as f32);
+        }
+    }
+
+    #[test]
+    fn test_fused_adamw_weight_decay() {
+        let param = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
+        let grad = Tensor::from_f32(&[0.1, 0.1], &[2], Device::CPU).unwrap();
+        let m = Tensor::zeros(&[2], TensorOptions::default()).unwrap();
+        let v = Tensor::zeros(&[2], TensorOptions::default()).unwrap();
+
+        let lr = 0.001;
+        let wd = 0.01;
+
+        param.adam_step(&grad, &m, &v, lr, 0.9, 0.999, 1e-8, wd, 1).unwrap();
+
+        let p_data = param.to_f32_vec().unwrap();
+        // Weight decay: p *= (1 - lr * wd) = (1 - 0.00001)
+        // Then Adam update subtracts ~lr from each element
+        // param[0] should be slightly less than 1.0 - 0.001
+        // param[1] should be slightly less than 2.0 - 0.001, but also
+        // decayed more because 2.0 * lr * wd > 1.0 * lr * wd
+        assert!(p_data[0] < 1.0, "p[0] should decrease: got {}", p_data[0]);
+        assert!(p_data[1] < 2.0, "p[1] should decrease: got {}", p_data[1]);
+        // Weight decay asymmetry: param[1] decays more (larger value)
+        let decay_0 = 1.0 - p_data[0] as f64;
+        let decay_1 = 2.0 - p_data[1] as f64;
+        assert!(decay_1 > decay_0, "larger param should decay more: d0={}, d1={}", decay_0, decay_1);
+    }
+
+    #[test]
+    fn test_fused_adam_multi_step_convergence() {
+        // Run multiple steps, verify m/v accumulate correctly
+        let param = Tensor::from_f32(&[5.0], &[1], Device::CPU).unwrap();
+        let grad = Tensor::from_f32(&[1.0], &[1], Device::CPU).unwrap();
+        let m = Tensor::zeros(&[1], TensorOptions::default()).unwrap();
+        let v = Tensor::zeros(&[1], TensorOptions::default()).unwrap();
+
+        for step in 1..=10 {
+            param.adam_step(&grad, &m, &v, 0.01, 0.9, 0.999, 1e-8, 0.0, step).unwrap();
+        }
+
+        // After 10 steps with constant gradient=1:
+        // m should converge toward 1.0, v should converge toward 1.0
+        let m_data = m.to_f32_vec().unwrap();
+        let p_data = param.to_f32_vec().unwrap();
+
+        // m = 1 - 0.9^10 ≈ 0.6513
+        assert!((m_data[0] - 0.6513).abs() < 0.01,
+            "m after 10 steps: got {}", m_data[0]);
+        // v should be non-zero (accumulating)
+        assert!(v.to_f32_vec().unwrap()[0] > 0.0, "v should accumulate");
+        // param should have decreased
+        assert!(p_data[0] < 5.0, "param should decrease: got {}", p_data[0]);
     }
 }

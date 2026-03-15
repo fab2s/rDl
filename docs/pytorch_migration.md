@@ -1038,4 +1038,6 @@ to query them manually during training.
 | `param.requires_grad = False` | `param.freeze()?` | Also: `unfreeze()`, `is_frozen()` |
 | `Adam([{"params":..., "lr":...}])` | `Adam::with_groups().group(&p, lr).build()` | Per-group LR |
 | `torch.cuda.memory_allocated()` | `cuda_memory_info()?` | `(used, total)` bytes |
+| `x.pin_memory()` | `x.pin_memory()?` | Page-locked CPU memory for async transfers |
+| `x.is_pinned()` | `x.is_pinned()` | Check if tensor is in pinned memory |
 | `SummaryWriter` + TensorBoard | `Monitor::new(n).serve(3000)?` | Built-in live dashboard |

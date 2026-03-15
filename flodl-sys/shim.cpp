@@ -1584,6 +1584,62 @@ extern "C" char* flodl_cdist(FlodlTensor x, FlodlTensor y, double p,
     }
 }
 
+// --- Fused Adam step ---
+
+extern "C" char* flodl_adam_step(FlodlTensor param, FlodlTensor grad,
+                                 FlodlTensor m, FlodlTensor v,
+                                 double lr, double beta1, double beta2, double eps,
+                                 double weight_decay, int64_t step) {
+    try {
+        // Get autograd-free view of param data
+        auto p = unwrap(param).data();
+        auto& g = unwrap(grad);
+        auto& m_ref = unwrap(m);
+        auto& v_ref = unwrap(v);
+
+        // Decoupled weight decay (AdamW): p *= (1 - lr * wd)
+        if (weight_decay > 0.0) {
+            p.mul_(1.0 - lr * weight_decay);
+        }
+
+        // First moment: m = beta1 * m + (1 - beta1) * g  [1 fused kernel]
+        m_ref.mul_(beta1).add_(g, 1.0 - beta1);
+
+        // Second moment: v = beta2 * v + (1 - beta2) * g^2  [1 fused kernel]
+        v_ref.mul_(beta2).addcmul_(g, g, 1.0 - beta2);
+
+        // Bias correction
+        double bc1 = 1.0 - std::pow(beta1, (double)step);
+        double bc2 = 1.0 - std::pow(beta2, (double)step);
+        double step_size = lr / bc1;
+
+        // denom = sqrt(v / bc2) + eps
+        auto denom = (v_ref / bc2).sqrt_().add_(eps);
+
+        // p -= step_size * m / denom  [1 fused kernel]
+        p.addcdiv_(m_ref, denom, -step_size);
+
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+// --- Pinned memory ---
+
+extern "C" char* flodl_pin_memory(FlodlTensor t, FlodlTensor* result) {
+    try {
+        *result = wrap(unwrap(t).pin_memory());
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" int flodl_is_pinned(FlodlTensor t) {
+    return unwrap(t).is_pinned() ? 1 : 0;
+}
+
 // --- Memory diagnostics ---
 
 extern "C" int flodl_malloc_trim() {

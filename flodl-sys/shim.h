@@ -301,6 +301,27 @@ char* flodl_meshgrid(FlodlTensor* tensors, int count,
 char* flodl_cdist(FlodlTensor x, FlodlTensor y, double p,
                  FlodlTensor* result);
 
+// --- Fused Adam step ---
+
+// Perform a full Adam/AdamW update in one fused call.
+// All tensors (param, m, v) are modified in-place. grad is read-only.
+// weight_decay: 0 for Adam, >0 for AdamW (decoupled).
+// step: timestep for bias correction (1-based).
+// Returns error string or NULL on success.
+char* flodl_adam_step(FlodlTensor param, FlodlTensor grad,
+                      FlodlTensor m, FlodlTensor v,
+                      double lr, double beta1, double beta2, double eps,
+                      double weight_decay, int64_t step);
+
+// --- Pinned memory ---
+
+// Copy a CPU tensor into page-locked (pinned) memory.
+// Returns error string or NULL on success.
+char* flodl_pin_memory(FlodlTensor t, FlodlTensor* result);
+
+// Returns 1 if the tensor is in pinned memory, 0 otherwise.
+int flodl_is_pinned(FlodlTensor t);
+
 // --- Memory diagnostics ---
 
 // Ask glibc to return free memory to the OS. Returns 1 if memory was

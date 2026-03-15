@@ -507,6 +507,20 @@ unsafe extern "C" {
     pub fn flodl_add_scalar_(t: FlodlTensor, scalar: f64) -> *mut i8;
     pub fn flodl_zero_(t: FlodlTensor) -> *mut i8;
 
+    // --- Fused Adam step ---
+
+    pub fn flodl_adam_step(
+        param: FlodlTensor, grad: FlodlTensor,
+        m: FlodlTensor, v: FlodlTensor,
+        lr: f64, beta1: f64, beta2: f64, eps: f64,
+        weight_decay: f64, step: i64,
+    ) -> *mut i8;
+
+    // --- Pinned memory ---
+
+    pub fn flodl_pin_memory(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
+    pub fn flodl_is_pinned(t: FlodlTensor) -> i32;
+
     // --- Memory diagnostics ---
 
     pub fn flodl_malloc_trim() -> i32;

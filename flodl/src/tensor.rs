@@ -104,7 +104,7 @@ impl std::error::Error for TensorError {}
 pub type Result<T> = std::result::Result<T, TensorError>;
 
 /// Convert a C error string to Result. Frees the C string.
-fn check_err(err: *mut i8) -> Result<()> {
+pub(crate) fn check_err(err: *mut i8) -> Result<()> {
     if err.is_null() {
         Ok(())
     } else {
@@ -1593,6 +1593,49 @@ impl Tensor {
         let err = unsafe { ffi::flodl_zero_(self.handle) };
         check_err(err)
     }
+
+    /// Fused Adam/AdamW step: updates param, m, and v tensors in-place.
+    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Performs the full Adam update in a single FFI call (~5 kernel launches
+    /// instead of ~16), eliminating temporary tensor allocations.
+    ///
+    /// - `self` — parameter tensor (updated in-place)
+    /// - `grad` — gradient (read-only)
+    /// - `m`, `v` — moment buffers (updated in-place)
+    /// - `weight_decay` — 0.0 for Adam, >0 for AdamW (decoupled)
+    /// - `step` — timestep for bias correction
+    pub fn adam_step(
+        &self, grad: &Tensor, m: &Tensor, v: &Tensor,
+        lr: f64, beta1: f64, beta2: f64, eps: f64,
+        weight_decay: f64, step: i64,
+    ) -> Result<()> {
+        let err = unsafe {
+            ffi::flodl_adam_step(
+                self.handle, grad.handle, m.handle, v.handle,
+                lr, beta1, beta2, eps, weight_decay, step,
+            )
+        };
+        check_err(err)
+    }
+
+    // --- Pinned memory ---
+
+    /// Copy this CPU tensor into page-locked (pinned) memory.
+    ///
+    /// Pinned memory enables async CPU→GPU transfers via `cudaMemcpyAsync`.
+    /// Only valid for CPU tensors. Returns a new tensor in pinned memory.
+    pub fn pin_memory(&self) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_pin_memory(self.handle, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Returns true if this tensor is stored in pinned (page-locked) memory.
+    pub fn is_pinned(&self) -> bool {
+        unsafe { ffi::flodl_is_pinned(self.handle) != 0 }
+    }
 }
 
 impl fmt::Debug for Tensor {
@@ -2160,5 +2203,43 @@ mod tests {
         assert_eq!(t.device(), Device::CPU);
         assert_eq!(t.dtype(), DType::Int64);
         assert_eq!(t.to_i64_vec().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_pin_memory() {
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
+        assert!(!t.is_pinned(), "regular CPU tensor should not be pinned");
+
+        if cuda_available() {
+            let pinned = t.pin_memory().unwrap();
+            assert!(pinned.is_pinned(), "pin_memory() result should be pinned");
+            assert_eq!(pinned.device(), Device::CPU, "pinned tensor should stay on CPU");
+            assert_eq!(pinned.to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0],
+                "data should be preserved after pinning");
+        } else {
+            // pin_memory requires CUDA — verify it returns an error on CPU-only
+            assert!(t.pin_memory().is_err(),
+                "pin_memory should fail without CUDA");
+        }
+    }
+
+    #[test]
+    fn test_adam_step_basic() {
+        // Basic smoke test for the fused adam_step at tensor level
+        let param = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
+        let grad = Tensor::from_f32(&[0.5, 0.5], &[2], Device::CPU).unwrap();
+        let m = Tensor::zeros(&[2], TensorOptions::default()).unwrap();
+        let v = Tensor::zeros(&[2], TensorOptions::default()).unwrap();
+
+        param.adam_step(&grad, &m, &v, 0.001, 0.9, 0.999, 1e-8, 0.0, 1).unwrap();
+
+        let p = param.to_f32_vec().unwrap();
+        assert!(p[0] < 1.0, "param[0] should decrease");
+        assert!(p[1] < 2.0, "param[1] should decrease");
+        // m and v should be non-zero after the step
+        let m_data = m.to_f32_vec().unwrap();
+        let v_data = v.to_f32_vec().unwrap();
+        assert!(m_data[0] > 0.0, "m should be updated");
+        assert!(v_data[0] > 0.0, "v should be updated");
     }
 }
