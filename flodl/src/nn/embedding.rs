@@ -26,12 +26,17 @@ pub struct Embedding {
 }
 
 impl Embedding {
-    /// Create an embedding table with `num_embeddings` entries of dimension `embedding_dim`.
+    /// Create an embedding table on CPU.
     pub fn new(num_embeddings: i64, embedding_dim: i64) -> Result<Self> {
+        Self::on_device(num_embeddings, embedding_dim, Device::CPU)
+    }
+
+    /// Create an embedding table on a specific device.
+    pub fn on_device(num_embeddings: i64, embedding_dim: i64, device: Device) -> Result<Self> {
         let weight = Variable::new(
             Tensor::randn(
                 &[num_embeddings, embedding_dim],
-                TensorOptions { dtype: DType::Float32, device: Device::CPU },
+                TensorOptions { dtype: DType::Float32, device },
             )?,
             true,
         );

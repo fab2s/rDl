@@ -20,6 +20,8 @@ pub(crate) enum ServerMsg {
     SetSvg(String),
     /// Graph label and structural hash for dashboard header.
     SetLabelHash(Option<String>, Option<String>),
+    /// Hardware summary for dashboard header.
+    SetHardware(String),
     /// Clean shutdown.
     Shutdown,
 }
@@ -43,6 +45,8 @@ struct SharedState {
     label: Mutex<Option<String>>,
     /// Structural hash for dashboard header.
     hash: Mutex<Option<String>>,
+    /// Hardware summary string.
+    hardware: Mutex<Option<String>>,
 }
 
 impl DashboardServer {
@@ -57,6 +61,7 @@ impl DashboardServer {
             sse_senders: Mutex::new(Vec::new()),
             label: Mutex::new(None),
             hash: Mutex::new(None),
+            hardware: Mutex::new(None),
         });
 
         // Message handler thread: receives from Monitor, broadcasts to SSE clients
@@ -99,6 +104,11 @@ impl DashboardServer {
         let _ = self.tx.send(ServerMsg::SetLabelHash(label, hash));
     }
 
+    /// Set hardware summary for the dashboard header.
+    pub fn set_hardware(&self, hw: String) {
+        let _ = self.tx.send(ServerMsg::SetHardware(hw));
+    }
+
     /// Signal shutdown and wait for the message handler to finish.
     pub fn shutdown(&mut self) {
         let _ = self.tx.send(ServerMsg::Shutdown);
@@ -124,6 +134,9 @@ fn handle_messages(rx: Receiver<ServerMsg>, state: Arc<SharedState>) {
             ServerMsg::SetLabelHash(label, hash) => {
                 *state.label.lock().unwrap() = label;
                 *state.hash.lock().unwrap() = hash;
+            }
+            ServerMsg::SetHardware(hw) => {
+                *state.hardware.lock().unwrap() = Some(hw);
             }
             ServerMsg::Shutdown => {
                 let event = "event: complete\ndata: {}\n\n".to_string();
@@ -172,8 +185,10 @@ fn parse_path(request: &str) -> &str {
 fn serve_html(stream: &mut TcpStream, state: &SharedState) {
     let label = state.label.lock().unwrap();
     let hash = state.hash.lock().unwrap();
+    let hardware = state.hardware.lock().unwrap();
 
-    let body = if label.is_some() || hash.is_some() {
+    let has_inject = label.is_some() || hash.is_some() || hardware.is_some();
+    let body = if has_inject {
         let label_js = match &*label {
             Some(l) => format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")),
             None => "null".to_string(),
@@ -182,9 +197,13 @@ fn serve_html(stream: &mut TcpStream, state: &SharedState) {
             Some(h) => format!("\"{}\"", h),
             None => "null".to_string(),
         };
+        let hw_js = match &*hardware {
+            Some(h) => format!("\"{}\"", h.replace('\\', "\\\\").replace('"', "\\\"")),
+            None => "null".to_string(),
+        };
         let inject = format!(
-            "<script>const LIVE_LABEL={};const LIVE_HASH={};</script>\n",
-            label_js, hash_js,
+            "<script>const LIVE_LABEL={};const LIVE_HASH={};const LIVE_HARDWARE={};</script>\n",
+            label_js, hash_js, hw_js,
         );
         DASHBOARD_HTML.replace("<script>", &format!("{}<script>", inject))
     } else {

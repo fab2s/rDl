@@ -319,6 +319,10 @@ unsafe extern "C" {
 
     pub fn flodl_cuda_utilization(device_index: i32) -> i32;
 
+    pub fn flodl_cuda_device_name(
+        device_index: i32, buf: *mut i8, buf_len: i32,
+    ) -> *mut i8;
+
     // --- Dtype casting ---
 
     pub fn flodl_to_dtype(

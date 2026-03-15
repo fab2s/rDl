@@ -930,11 +930,11 @@ mod tests {
     use super::*;
     use crate::autograd::Variable;
     use crate::nn::{Linear, NamedInputModule, ReLU, Sigmoid, mse_loss, Optimizer, SGD};
-    use crate::tensor::{Device, Tensor};
+    use crate::tensor::Tensor;
     use std::collections::HashMap;
 
     fn from_f32(data: &[f32], shape: &[i64]) -> Tensor {
-        Tensor::from_f32(data, shape, Device::CPU).unwrap()
+        Tensor::from_f32(data, shape, crate::tensor::test_device()).unwrap()
     }
 
     // --- Helper modules for testing ---
@@ -953,10 +953,7 @@ mod tests {
     }
     impl BiasStep {
         fn new(size: i64) -> Result<Self> {
-            let data = Tensor::zeros(&[size], crate::tensor::TensorOptions {
-                dtype: crate::tensor::DType::Float32,
-                device: Device::CPU,
-            })?;
+            let data = Tensor::zeros(&[size], crate::tensor::test_opts())?;
             let var = Variable::new(data, true);
             Ok(BiasStep {
                 bias: Parameter {
@@ -1001,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_single_module() {
-        let l = Linear::new(3, 2).unwrap();
+        let l = Linear::on_device(3, 2, crate::tensor::test_device()).unwrap();
         let graph = FlowBuilder::from(l).build().unwrap();
 
         let x = Variable::new(from_f32(&[1.0, 2.0, 3.0], &[1, 3]), false);
@@ -1011,9 +1008,9 @@ mod tests {
 
     #[test]
     fn test_linear_chain() {
-        let graph = FlowBuilder::from(Linear::new(3, 4).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(3, 4, crate::tensor::test_device()).unwrap())
             .through(ReLU::new())
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -1024,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_also_residual() {
-        let l1 = Linear::new(3, 3).unwrap();
+        let l1 = Linear::on_device(3, 3, crate::tensor::test_device()).unwrap();
         l1.weight.variable.set_data(from_f32(
             &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             &[3, 3],
@@ -1035,7 +1032,7 @@ mod tests {
             .variable
             .set_data(from_f32(&[0.0, 0.0, 0.0], &[3]));
 
-        let l2 = Linear::new(3, 3).unwrap();
+        let l2 = Linear::on_device(3, 3, crate::tensor::test_device()).unwrap();
         l2.weight.variable.set_data(from_f32(
             &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             &[3, 3],
@@ -1066,7 +1063,7 @@ mod tests {
         // identity(x) → fork(linear) tagged "side" → through(ReLU)
         // Main stream: ReLU(identity(x)) = ReLU(x)
         // Side output: linear(x) accessible via tagged("side")
-        let l = Linear::new(2, 3).unwrap();
+        let l = Linear::on_device(2, 3, crate::tensor::test_device()).unwrap();
 
         let graph = FlowBuilder::from(Identity)
             .fork(l)
@@ -1092,10 +1089,10 @@ mod tests {
     #[test]
     fn test_fork_multiple() {
         // Two forks from the same stream: letter_head and case_head pattern
-        let head_a = Linear::new(4, 3).unwrap();
-        let head_b = Linear::new(4, 2).unwrap();
+        let head_a = Linear::on_device(4, 3, crate::tensor::test_device()).unwrap();
+        let head_b = Linear::on_device(4, 2, crate::tensor::test_device()).unwrap();
 
-        let graph = FlowBuilder::from(Linear::new(2, 4).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 4, crate::tensor::test_device()).unwrap())
             .tag("latent")
             .fork(head_a)
             .tag("head_a")
@@ -1120,10 +1117,10 @@ mod tests {
     #[test]
     fn test_fork_backward() {
         // Gradients flow through both forks and the main stream
-        let graph = FlowBuilder::from(Linear::new(2, 4).unwrap())
-            .fork(Linear::new(4, 3).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 4, crate::tensor::test_device()).unwrap())
+            .fork(Linear::on_device(4, 3, crate::tensor::test_device()).unwrap())
             .tag("side")
-            .through(Linear::new(4, 1).unwrap())
+            .through(Linear::on_device(4, 1, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -1145,7 +1142,7 @@ mod tests {
 
     #[test]
     fn test_split_merge_add() {
-        let graph = FlowBuilder::from(Linear::new(3, 3).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(3, 3, crate::tensor::test_device()).unwrap())
             .split(vec![Box::new(ReLU::new()), Box::new(Sigmoid::new())])
             .merge(MergeOp::Add)
             .build()
@@ -1158,7 +1155,7 @@ mod tests {
 
     #[test]
     fn test_split_merge_mean() {
-        let l = Linear::new(2, 2).unwrap();
+        let l = Linear::on_device(2, 2, crate::tensor::test_device()).unwrap();
         l.weight
             .variable
             .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
@@ -1168,7 +1165,7 @@ mod tests {
             .variable
             .set_data(from_f32(&[0.0, 0.0], &[2]));
 
-        let b1 = Linear::new(2, 2).unwrap();
+        let b1 = Linear::on_device(2, 2, crate::tensor::test_device()).unwrap();
         b1.weight
             .variable
             .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
@@ -1177,7 +1174,7 @@ mod tests {
             .unwrap()
             .variable
             .set_data(from_f32(&[0.0, 0.0], &[2]));
-        let b2 = Linear::new(2, 2).unwrap();
+        let b2 = Linear::on_device(2, 2, crate::tensor::test_device()).unwrap();
         b2.weight
             .variable
             .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
@@ -1203,9 +1200,9 @@ mod tests {
 
     #[test]
     fn test_parameters() {
-        let graph = FlowBuilder::from(Linear::new(3, 4).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(3, 4, crate::tensor::test_device()).unwrap())
             .through(ReLU::new())
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -1215,8 +1212,8 @@ mod tests {
 
     #[test]
     fn test_graph_backward() {
-        let l1 = Linear::new(3, 2).unwrap();
-        let l2 = Linear::new(2, 1).unwrap();
+        let l1 = Linear::on_device(3, 2, crate::tensor::test_device()).unwrap();
+        let l2 = Linear::on_device(2, 1, crate::tensor::test_device()).unwrap();
 
         let graph = FlowBuilder::from(l1)
             .through(ReLU::new())
@@ -1237,13 +1234,13 @@ mod tests {
 
     #[test]
     fn test_graph_as_module() {
-        let inner = FlowBuilder::from(Linear::new(3, 4).unwrap())
+        let inner = FlowBuilder::from(Linear::on_device(3, 4, crate::tensor::test_device()).unwrap())
             .through(ReLU::new())
             .build()
             .unwrap();
 
         let outer = FlowBuilder::from(inner)
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -1255,7 +1252,7 @@ mod tests {
 
     #[test]
     fn test_training_loop() {
-        let graph = FlowBuilder::from(Linear::new(1, 1).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(1, 1, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -1280,8 +1277,8 @@ mod tests {
 
     #[test]
     fn test_also_backward() {
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
-            .also(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+            .also(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -1298,10 +1295,10 @@ mod tests {
 
     #[test]
     fn test_split_merge_backward() {
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .split(vec![
-                Box::new(Linear::new(2, 2).unwrap()),
-                Box::new(Linear::new(2, 2).unwrap()),
+                Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
+                Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
             ])
             .merge(MergeOp::Add)
             .build()
@@ -1320,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_build_error_open_streams() {
-        let result = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let result = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .split(vec![Box::new(ReLU::new()), Box::new(Sigmoid::new())])
             .build();
         assert!(result.is_err());
@@ -1328,7 +1325,7 @@ mod tests {
 
     #[test]
     fn test_build_error_duplicate_tag() {
-        let result = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let result = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .tag("features")
             .through(ReLU::new())
             .tag("features")
@@ -1343,7 +1340,7 @@ mod tests {
         // Tag a point, then use it downstream
         // Graph: linear(x) → tag("ctx") → through(AddRef).using("ctx")
         // AddRef adds ctx to stream: stream + ctx = 2 * linear(x)
-        let l = Linear::new(2, 2).unwrap();
+        let l = Linear::on_device(2, 2, crate::tensor::test_device()).unwrap();
         l.weight
             .variable
             .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
@@ -1371,7 +1368,7 @@ mod tests {
 
     #[test]
     fn test_using_backward_gradients() {
-        let l = Linear::new(2, 2).unwrap();
+        let l = Linear::on_device(2, 2, crate::tensor::test_device()).unwrap();
         let graph = FlowBuilder::from(l)
             .tag("ctx")
             .through(AddRefModule)
@@ -1393,7 +1390,7 @@ mod tests {
     #[test]
     fn test_using_error_plain_module() {
         // Using on a plain module (not NamedInputModule) should error
-        let result = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let result = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .tag("ctx")
             .through(ReLU::new())
             .using(&["ctx"])
@@ -1403,7 +1400,7 @@ mod tests {
 
     #[test]
     fn test_using_error_unknown_tag() {
-        let result = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let result = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .through(AddRefModule)
             .using(&["nonexistent"])
             .build();
@@ -1415,7 +1412,7 @@ mod tests {
     #[test]
     fn test_loop_for() {
         // Doubler × 3 iterations: [1, 2] → [8, 16]
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .loop_body(Doubler)
             .for_n(3)
             .build()
@@ -1438,7 +1435,7 @@ mod tests {
     fn test_loop_for_backward() {
         // Loop with a learnable bias — gradient should accumulate across iterations
         let bias_step = BiasStep::new(2).unwrap();
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .loop_body(bias_step)
             .for_n(3)
             .build()
@@ -1476,7 +1473,7 @@ mod tests {
         // Iter 2: check [4,8] max=8 < 10 → double → [8,16]
         // Iter 3: check [8,16] max=16 >= 10 → halt
         // Result: [8, 16]
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .loop_body(Doubler)
             .while_cond(ThresholdHalt::new(10.0), 20)
             .build()
@@ -1498,7 +1495,7 @@ mod tests {
     fn test_loop_while_immediate_halt() {
         // Threshold 0.5 — input [1, 2] max=2 > 0.5, halt immediately
         // While checks before body, so body never runs
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .loop_body(Doubler)
             .while_cond(ThresholdHalt::new(0.5), 20)
             .build()
@@ -1525,7 +1522,7 @@ mod tests {
         // Iter 1: double → [4, 8], check max=8 <= 10 → continue
         // Iter 2: double → [8, 16], check max=16 > 10 → halt
         // Result: [8, 16]
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .loop_body(Doubler)
             .until_cond(ThresholdHalt::new(10.0), 20)
             .build()
@@ -1547,7 +1544,7 @@ mod tests {
     fn test_loop_until_at_least_once() {
         // Until with threshold 0.5 — input [1, 2] would halt immediately in While,
         // but Until always runs body at least once
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .loop_body(Doubler)
             .until_cond(ThresholdHalt::new(0.5), 20)
             .build()
@@ -1569,8 +1566,8 @@ mod tests {
     #[test]
     fn test_loop_parameters() {
         // Loop with learnable body — parameters should include body params
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
-            .loop_body(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+            .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .for_n(3)
             .build()
             .unwrap();
@@ -1583,9 +1580,9 @@ mod tests {
     #[test]
     fn test_loop_while_parameters() {
         // While loop with body + condition — both contribute parameters
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
-            .loop_body(Linear::new(2, 2).unwrap())
-            .while_cond(Linear::new(2, 1).unwrap(), 10)
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+            .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+            .while_cond(Linear::on_device(2, 1, crate::tensor::test_device()).unwrap(), 10)
             .build()
             .unwrap();
 
@@ -1597,10 +1594,10 @@ mod tests {
     #[test]
     fn test_loop_in_chain() {
         // Linear → Loop(ReLU) × 3 → Linear
-        let graph = FlowBuilder::from(Linear::new(3, 4).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(3, 4, crate::tensor::test_device()).unwrap())
             .loop_body(ReLU::new())
             .for_n(3)
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -1635,7 +1632,7 @@ mod tests {
     #[test]
     fn test_loop_using_backward_gradients() {
         // Ensure gradients flow through loop+using
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .tag("ctx")
             .loop_body(AddRefModule)
             .for_n(2)
@@ -1685,7 +1682,7 @@ mod tests {
         // FlowBuilder::new() starts with implicit Identity
         let graph = FlowBuilder::new()
             .tag("input")
-            .through(Linear::new(3, 2).unwrap())
+            .through(Linear::on_device(3, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -1784,7 +1781,7 @@ mod tests {
     #[test]
     fn test_forward_ref_backward() {
         // Gradients should flow through forward-ref connections
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .through(NilSafeAdd)
             .using(&["memory"])
             .through(Identity)
@@ -1883,10 +1880,10 @@ mod tests {
 
     #[test]
     fn test_switch_backward() {
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .switch(FixedSelector::new(0), vec![
-                Box::new(Linear::new(2, 2).unwrap()),
-                Box::new(Linear::new(2, 2).unwrap()),
+                Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
+                Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
             ])
             .build()
             .unwrap();
@@ -1905,10 +1902,10 @@ mod tests {
     fn test_switch_parameters() {
         let graph = FlowBuilder::from(Identity)
             .switch(
-                Linear::new(2, 1).unwrap(),
+                Linear::on_device(2, 1, crate::tensor::test_device()).unwrap(),
                 vec![
-                    Box::new(Linear::new(2, 2).unwrap()),
-                    Box::new(Linear::new(2, 2).unwrap()),
+                    Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
+                    Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
                 ],
             )
             .build()
@@ -1929,7 +1926,7 @@ mod tests {
             let w = 1.0 / self.0 as f32;
             let data = vec![w; batch as usize * self.0];
             Ok(Variable::new(
-                Tensor::from_f32(&data, &[batch, self.0 as i64], Device::CPU)?,
+                Tensor::from_f32(&data, &[batch, self.0 as i64], crate::tensor::test_device())?,
                 false,
             ))
         }
@@ -1954,12 +1951,12 @@ mod tests {
 
     #[test]
     fn test_gate_backward() {
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .gate(
-                Linear::new(2, 2).unwrap(),
+                Linear::on_device(2, 2, crate::tensor::test_device()).unwrap(),
                 vec![
-                    Box::new(Linear::new(2, 2).unwrap()),
-                    Box::new(Linear::new(2, 2).unwrap()),
+                    Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
+                    Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
                 ],
             )
             .build()
@@ -1980,10 +1977,10 @@ mod tests {
     fn test_gate_parameters() {
         let graph = FlowBuilder::from(Identity)
             .gate(
-                Linear::new(2, 2).unwrap(),
+                Linear::on_device(2, 2, crate::tensor::test_device()).unwrap(),
                 vec![
-                    Box::new(Linear::new(2, 2).unwrap()),
-                    Box::new(Linear::new(2, 2).unwrap()),
+                    Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
+                    Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
                 ],
             )
             .build()
@@ -2033,8 +2030,8 @@ mod tests {
 
     #[test]
     fn test_map_backward() {
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
-            .map(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+            .map(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .each()
             .build()
             .unwrap();
@@ -2370,7 +2367,7 @@ mod tests {
     fn test_graph_set_training() {
         use crate::nn::Dropout;
 
-        let graph = FlowBuilder::from(Linear::new(3, 3).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(3, 3, crate::tensor::test_device()).unwrap())
             .through(Dropout::new(0.5))
             .build()
             .unwrap();
@@ -2399,7 +2396,7 @@ mod tests {
     fn test_walk_modules() {
         use crate::nn::walk_modules;
 
-        let l1 = Linear::new(2, 2).unwrap();
+        let l1 = Linear::on_device(2, 2, crate::tensor::test_device()).unwrap();
         let mut count = 0;
         walk_modules(&l1, &mut |_| count += 1);
         assert_eq!(count, 1); // leaf module, no children
@@ -2409,10 +2406,10 @@ mod tests {
 
     #[test]
     fn test_profiling_basic() {
-        let graph = FlowBuilder::from(Linear::new(3, 4).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(3, 4, crate::tensor::test_device()).unwrap())
             .tag("encoder")
             .through(ReLU::new())
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, crate::tensor::test_device()).unwrap())
             .tag("decoder")
             .build()
             .unwrap();
@@ -2487,10 +2484,10 @@ mod tests {
 
     #[test]
     fn test_dot_basic() {
-        let graph = FlowBuilder::from(Linear::new(3, 4).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(3, 4, crate::tensor::test_device()).unwrap())
             .tag("enc")
             .through(ReLU::new())
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2503,9 +2500,9 @@ mod tests {
 
     #[test]
     fn test_dot_with_profile() {
-        let graph = FlowBuilder::from(Linear::new(3, 4).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(3, 4, crate::tensor::test_device()).unwrap())
             .tag("enc")
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2618,7 +2615,7 @@ mod tests {
         // SoftmaxRouter with 2 experts: double + triple, weights from learned router
         let graph = FlowBuilder::from(Identity)
             .gate(
-                SoftmaxRouter::new(2, 2).unwrap(),
+                SoftmaxRouter::on_device(2, 2, crate::tensor::test_device()).unwrap(),
                 vec![Box::new(Doubler), Box::new(Tripler)],
             )
             .build()
@@ -2635,12 +2632,12 @@ mod tests {
 
     #[test]
     fn test_softmax_router_backward() {
-        let graph = FlowBuilder::from(Linear::new(2, 2).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
             .gate(
-                SoftmaxRouter::new(2, 2).unwrap(),
+                SoftmaxRouter::on_device(2, 2, crate::tensor::test_device()).unwrap(),
                 vec![
-                    Box::new(Linear::new(2, 2).unwrap()),
-                    Box::new(Linear::new(2, 2).unwrap()),
+                    Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
+                    Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
                 ],
             )
             .build()
@@ -2661,7 +2658,7 @@ mod tests {
     fn test_sigmoid_router_gate() {
         let graph = FlowBuilder::from(Identity)
             .gate(
-                SigmoidRouter::new(2, 2).unwrap(),
+                SigmoidRouter::on_device(2, 2, crate::tensor::test_device()).unwrap(),
                 vec![Box::new(Doubler), Box::new(Tripler)],
             )
             .build()
@@ -2691,7 +2688,7 @@ mod tests {
     fn test_argmax_selector_switch() {
         let graph = FlowBuilder::from(Identity)
             .switch(
-                ArgmaxSelector::new(2, 2).unwrap(),
+                ArgmaxSelector::on_device(2, 2, crate::tensor::test_device()).unwrap(),
                 vec![Box::new(Doubler), Box::new(Tripler)],
             )
             .build()
@@ -2765,8 +2762,8 @@ mod tests {
     #[test]
     fn test_learned_halt_parameters() {
         let graph = FlowBuilder::from(Identity)
-            .loop_body(Linear::new(2, 2).unwrap())
-            .until_cond(LearnedHalt::new(2).unwrap(), 5)
+            .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+            .until_cond(LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(), 5)
             .build()
             .unwrap();
 
@@ -2777,9 +2774,9 @@ mod tests {
 
     #[test]
     fn test_named_parameters_unique() {
-        let graph = FlowBuilder::from(Linear::new(4, 8).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
             .through(ReLU::new())
-            .through(Linear::new(8, 2).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2795,9 +2792,9 @@ mod tests {
 
     #[test]
     fn test_named_parameters_tagged_prefix() {
-        let graph = FlowBuilder::from(Linear::new(4, 8).unwrap())
+        let graph = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
             .tag("encoder")
-            .through(Linear::new(8, 2).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2822,15 +2819,15 @@ mod tests {
 
     #[test]
     fn test_structural_hash_deterministic() {
-        let g1 = FlowBuilder::from(Linear::new(4, 8).unwrap())
+        let g1 = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
             .through(ReLU::new())
-            .through(Linear::new(8, 2).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
-        let g2 = FlowBuilder::from(Linear::new(4, 8).unwrap())
+        let g2 = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
             .through(ReLU::new())
-            .through(Linear::new(8, 2).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2839,14 +2836,14 @@ mod tests {
 
     #[test]
     fn test_structural_hash_differs() {
-        let g1 = FlowBuilder::from(Linear::new(4, 8).unwrap())
-            .through(Linear::new(8, 2).unwrap())
+        let g1 = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
         // Different architecture: different hidden size
-        let g2 = FlowBuilder::from(Linear::new(4, 16).unwrap())
-            .through(Linear::new(16, 2).unwrap())
+        let g2 = FlowBuilder::from(Linear::on_device(4, 16, crate::tensor::test_device()).unwrap())
+            .through(Linear::on_device(16, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2855,7 +2852,7 @@ mod tests {
 
     #[test]
     fn test_short_hash_length() {
-        let g = FlowBuilder::from(Linear::new(2, 3).unwrap())
+        let g = FlowBuilder::from(Linear::on_device(2, 3, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2866,7 +2863,7 @@ mod tests {
 
     #[test]
     fn test_label_default_none() {
-        let g = FlowBuilder::from(Linear::new(2, 3).unwrap())
+        let g = FlowBuilder::from(Linear::on_device(2, 3, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
         assert!(g.label().is_none());
@@ -2874,7 +2871,7 @@ mod tests {
 
     #[test]
     fn test_label_set() {
-        let g = FlowBuilder::from(Linear::new(2, 3).unwrap())
+        let g = FlowBuilder::from(Linear::on_device(2, 3, crate::tensor::test_device()).unwrap())
             .label("my-model")
             .build()
             .unwrap();
@@ -2883,13 +2880,13 @@ mod tests {
 
     #[test]
     fn test_label_does_not_affect_hash() {
-        let g1 = FlowBuilder::from(Linear::new(4, 8).unwrap())
-            .through(Linear::new(8, 2).unwrap())
+        let g1 = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
-        let g2 = FlowBuilder::from(Linear::new(4, 8).unwrap())
-            .through(Linear::new(8, 2).unwrap())
+        let g2 = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .label("different-label")
             .build()
             .unwrap();
@@ -2899,10 +2896,10 @@ mod tests {
 
     #[test]
     fn test_graph_save_load_checkpoint() {
-        let g = FlowBuilder::from(Linear::new(4, 8).unwrap())
+        let g = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
             .tag("enc")
             .through(ReLU::new())
-            .through(Linear::new(8, 2).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .tag("dec")
             .build()
             .unwrap();
@@ -2915,10 +2912,10 @@ mod tests {
         g.save_checkpoint(path_str).unwrap();
 
         // Build identical architecture, load into it
-        let g2 = FlowBuilder::from(Linear::new(4, 8).unwrap())
+        let g2 = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
             .tag("enc")
             .through(ReLU::new())
-            .through(Linear::new(8, 2).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .tag("dec")
             .build()
             .unwrap();
@@ -2940,8 +2937,8 @@ mod tests {
 
     #[test]
     fn test_graph_checkpoint_hash_mismatch() {
-        let g1 = FlowBuilder::from(Linear::new(4, 8).unwrap())
-            .through(Linear::new(8, 2).unwrap())
+        let g1 = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2952,8 +2949,8 @@ mod tests {
         g1.save_checkpoint(path_str).unwrap();
 
         // Different architecture
-        let g2 = FlowBuilder::from(Linear::new(4, 16).unwrap())
-            .through(Linear::new(16, 2).unwrap())
+        let g2 = FlowBuilder::from(Linear::on_device(4, 16, crate::tensor::test_device()).unwrap())
+            .through(Linear::on_device(16, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2966,8 +2963,8 @@ mod tests {
 
     #[test]
     fn test_graph_checkpoint_gz() {
-        let g = FlowBuilder::from(Linear::new(4, 8).unwrap())
-            .through(Linear::new(8, 2).unwrap())
+        let g = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 
@@ -2977,8 +2974,8 @@ mod tests {
 
         g.save_checkpoint(path_str).unwrap();
 
-        let g2 = FlowBuilder::from(Linear::new(4, 8).unwrap())
-            .through(Linear::new(8, 2).unwrap())
+        let g2 = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
+            .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
             .build()
             .unwrap();
 

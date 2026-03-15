@@ -41,9 +41,10 @@ title: Deep learning in Rust
 
     // auto-size input to content
     function resize() {
-      input.style.width = Math.max(input.value.length, 6) + 2 + 'ch';
+      input.style.width = Math.max(input.value.length, 6) + 3 + 'ch';
     }
     input.addEventListener('input', resize);
+    input.addEventListener('focus', function() { this.select(); });
     resize();
   })();
 

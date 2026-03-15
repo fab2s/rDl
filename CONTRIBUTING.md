@@ -56,12 +56,30 @@ Open an issue to discuss before investing significant effort on these.
 
 ## Testing
 
-Every PR should pass the existing test suite. If you add new functionality:
+Every PR should pass the existing test suite on **both CPU and CUDA**:
+
+```bash
+make test          # CPU tests
+make cuda-test     # CUDA tests (requires NVIDIA GPU + Container Toolkit)
+make test-all      # CPU first, then CUDA if a GPU is available
+```
+
+All tests use `test_device()` / `test_opts()` from `tensor.rs` so the same
+test code runs on whichever device is available. When writing new tests:
+
+- Use `test_device()` instead of `Device::CPU` for device selection
+- Use `test_opts()` instead of `TensorOptions::default()` or `Default::default()`
+- Use `on_device(..., test_device())` constructors instead of `::new()` for modules
+- Tests that are inherently CPU-only (e.g. RSS-based leak checks) should guard
+  with `if test_device() != Device::CPU { return; }` at the top
+
+If you add new functionality:
 
 - **Tensor ops**: add tests in `tensor.rs`
 - **Autograd ops**: add a numerical gradient check
 - **NN modules**: add both a functional test and a gradient check
 - **Graph features**: add a test in the graph module
+- **Module constructors**: always provide an `on_device()` variant alongside `new()`
 
 ## License
 

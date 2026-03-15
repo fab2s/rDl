@@ -260,6 +260,10 @@ char* flodl_cuda_mem_info(uint64_t* used_bytes, uint64_t* total_bytes);
 // Returns -1 if NVML is not available or query fails.
 int flodl_cuda_utilization(int device_index);
 
+// Query GPU device name (e.g. "NVIDIA GeForce GTX 1060 6GB").
+// Writes into caller-provided buffer. Returns error string on failure.
+char* flodl_cuda_device_name(int device_index, char* buf, int buf_len);
+
 // --- Dtype casting ---
 
 char* flodl_to_dtype(FlodlTensor t, int dtype, FlodlTensor* result);

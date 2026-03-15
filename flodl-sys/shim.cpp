@@ -1055,6 +1055,26 @@ extern "C" int flodl_cuda_utilization(int device_index) {
 #endif
 }
 
+// --- GPU device name ---
+
+extern "C" char* flodl_cuda_device_name(int device_index, char* buf, int buf_len) {
+#ifdef FLODL_BUILD_CUDA
+    if (!torch::cuda::is_available()) {
+        return make_error("CUDA not available");
+    }
+    cudaDeviceProp prop;
+    auto err = cudaGetDeviceProperties(&prop, device_index);
+    if (err != cudaSuccess) {
+        return make_error(cudaGetErrorString(err));
+    }
+    snprintf(buf, buf_len, "%s", prop.name);
+    return nullptr;
+#else
+    (void)device_index; (void)buf; (void)buf_len;
+    return make_error("CUDA not available (built without cuda feature)");
+#endif
+}
+
 // --- Comparison (tensor-tensor, return float masks: 0.0 or 1.0) ---
 
 extern "C" char* flodl_gt_tensor(FlodlTensor a, FlodlTensor b, FlodlTensor* result) {

@@ -24,8 +24,12 @@ pub struct SoftmaxRouter {
 
 impl SoftmaxRouter {
     pub fn new(input_dim: i64, num_experts: i64) -> Result<Self> {
+        Self::on_device(input_dim, num_experts, Device::CPU)
+    }
+
+    pub fn on_device(input_dim: i64, num_experts: i64, device: Device) -> Result<Self> {
         Ok(SoftmaxRouter {
-            proj: Rc::new(Linear::new(input_dim, num_experts)?),
+            proj: Rc::new(Linear::on_device(input_dim, num_experts, device)?),
         })
     }
 }
@@ -72,8 +76,12 @@ pub struct SigmoidRouter {
 
 impl SigmoidRouter {
     pub fn new(input_dim: i64, num_experts: i64) -> Result<Self> {
+        Self::on_device(input_dim, num_experts, Device::CPU)
+    }
+
+    pub fn on_device(input_dim: i64, num_experts: i64, device: Device) -> Result<Self> {
         Ok(SigmoidRouter {
-            proj: Rc::new(Linear::new(input_dim, num_experts)?),
+            proj: Rc::new(Linear::on_device(input_dim, num_experts, device)?),
         })
     }
 }
@@ -124,9 +132,9 @@ impl FixedSelector {
 impl Module for FixedSelector {
     fn name(&self) -> &str { "fixed_selector" }
 
-    fn forward(&self, _input: &Variable) -> Result<Variable> {
+    fn forward(&self, input: &Variable) -> Result<Variable> {
         Ok(Variable::new(
-            Tensor::from_f32(&[self.index], &[1], Device::CPU)?,
+            Tensor::from_f32(&[self.index], &[1], input.device())?,
             false,
         ))
     }
@@ -144,8 +152,12 @@ pub struct ArgmaxSelector {
 
 impl ArgmaxSelector {
     pub fn new(input_dim: i64, num_branches: i64) -> Result<Self> {
+        Self::on_device(input_dim, num_branches, Device::CPU)
+    }
+
+    pub fn on_device(input_dim: i64, num_branches: i64, device: Device) -> Result<Self> {
         Ok(ArgmaxSelector {
-            proj: Rc::new(Linear::new(input_dim, num_branches)?),
+            proj: Rc::new(Linear::on_device(input_dim, num_branches, device)?),
         })
     }
 }
@@ -163,7 +175,7 @@ impl Module for ArgmaxSelector {
             .map(|(i, _)| i)
             .unwrap_or(0);
         Ok(Variable::new(
-            Tensor::from_f32(&[best as f32], &[1], Device::CPU)?,
+            Tensor::from_f32(&[best as f32], &[1], input.device())?,
             false,
         ))
     }

@@ -414,6 +414,12 @@ let cell = LSTMCell::new(128, 256)?;
 
 // On a specific device:
 let layer = Linear::on_device(784, 128, Device::CUDA)?;
+let layer = LayerNorm::on_device(128, Device::CUDA)?;
+let layer = BatchNorm::on_device(128, Device::CUDA)?;
+let layer = BatchNorm2d::on_device(64, Device::CUDA)?;
+let layer = Embedding::on_device(1000, 128, Device::CUDA)?;
+let cell = GRUCell::on_device(128, 256, Device::CUDA)?;
+let cell = LSTMCell::on_device(128, 256, Device::CUDA)?;
 ```
 
 ## Activations (as Modules)

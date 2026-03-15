@@ -34,7 +34,7 @@ impl Module for ThresholdHalt {
             .fold(f32::NEG_INFINITY, f32::max);
         let val = max_val - self.threshold; // positive when exceeded → halt
         Ok(Variable::new(
-            Tensor::from_f32(&[val], &[1], Device::CPU)?,
+            Tensor::from_f32(&[val], &[1], input.device())?,
             false,
         ))
     }
@@ -55,8 +55,12 @@ pub struct LearnedHalt {
 
 impl LearnedHalt {
     pub fn new(input_dim: i64) -> Result<Self> {
+        Self::on_device(input_dim, Device::CPU)
+    }
+
+    pub fn on_device(input_dim: i64, device: Device) -> Result<Self> {
         Ok(LearnedHalt {
-            proj: Rc::new(Linear::new(input_dim, 1)?),
+            proj: Rc::new(Linear::on_device(input_dim, 1, device)?),
         })
     }
 }

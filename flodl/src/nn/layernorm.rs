@@ -1,5 +1,5 @@
 use crate::autograd::{Variable, layer_norm};
-use crate::tensor::{Result, Tensor};
+use crate::tensor::{Device, DType, Result, Tensor, TensorOptions};
 
 use super::parameter::Parameter;
 use super::Module;
@@ -15,10 +15,16 @@ pub struct LayerNorm {
 }
 
 impl LayerNorm {
-    /// Create a LayerNorm normalizing over the last `size` elements.
+    /// Create a LayerNorm normalizing over the last `size` elements on CPU.
     pub fn new(size: i64) -> Result<Self> {
-        let weight = Variable::new(Tensor::ones(&[size], Default::default())?, true);
-        let bias = Variable::new(Tensor::zeros(&[size], Default::default())?, true);
+        Self::on_device(size, Device::CPU)
+    }
+
+    /// Create a LayerNorm on a specific device.
+    pub fn on_device(size: i64, device: Device) -> Result<Self> {
+        let opts = TensorOptions { dtype: DType::Float32, device };
+        let weight = Variable::new(Tensor::ones(&[size], opts)?, true);
+        let bias = Variable::new(Tensor::zeros(&[size], opts)?, true);
 
         Ok(LayerNorm {
             weight: Parameter {

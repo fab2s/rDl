@@ -63,18 +63,17 @@ impl std::fmt::Debug for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::TensorOptions;
 
     #[test]
     fn test_buffer_shared_via_clone() {
         let buf = Buffer::new(
-            Tensor::zeros(&[3], TensorOptions::default()).unwrap(),
+            Tensor::zeros(&[3], crate::tensor::test_opts()).unwrap(),
             "running_mean",
         );
         let clone = buf.clone();
 
         // Write through one handle, read through the other
-        let new_data = Tensor::ones(&[3], TensorOptions::default()).unwrap();
+        let new_data = Tensor::ones(&[3], crate::tensor::test_opts()).unwrap();
         clone.set(new_data);
 
         let vals = buf.get().to_f32_vec().unwrap();
@@ -84,12 +83,12 @@ mod tests {
     #[test]
     fn test_buffer_to_device() {
         let buf = Buffer::new(
-            Tensor::zeros(&[4], TensorOptions::default()).unwrap(),
+            Tensor::zeros(&[4], crate::tensor::test_opts()).unwrap(),
             "stats",
         );
-        assert_eq!(buf.device(), Device::CPU);
-        // Moving CPU → CPU is a no-op
-        buf.to_device(Device::CPU).unwrap();
+        assert_eq!(buf.device(), crate::tensor::test_device());
+        // Moving to same device is a no-op
+        buf.to_device(crate::tensor::test_device()).unwrap();
         assert_eq!(buf.shape(), vec![4]);
     }
 }

@@ -212,15 +212,15 @@ pub fn collect_parameters(modules: &[&dyn Module]) -> Vec<Parameter> {
 mod tests {
     use super::*;
     use crate::autograd::Variable;
-    use crate::tensor::{Device, Tensor};
+    use crate::tensor::Tensor;
 
     fn from_f32(data: &[f32], shape: &[i64]) -> Tensor {
-        Tensor::from_f32(data, shape, Device::CPU).unwrap()
+        Tensor::from_f32(data, shape, crate::tensor::test_device()).unwrap()
     }
 
     #[test]
     fn test_linear_forward() {
-        let model = Linear::new(3, 2).unwrap();
+        let model = Linear::on_device(3, 2, crate::tensor::test_device()).unwrap();
 
         // Set known weights for deterministic test
         // W = [[1,2,3],[4,5,6]] shape [2,3]
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_linear_backward() {
-        let model = Linear::new(3, 2).unwrap();
+        let model = Linear::on_device(3, 2, crate::tensor::test_device()).unwrap();
         model.weight.variable.set_data(
             from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]),
         );
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_sgd_step() {
-        let model = Linear::new(2, 1).unwrap();
+        let model = Linear::on_device(2, 1, crate::tensor::test_device()).unwrap();
         model.weight.variable.set_data(from_f32(&[1.0, 1.0], &[1, 2]));
         model.bias.as_ref().unwrap().variable.set_data(from_f32(&[0.0], &[1]));
 
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn test_linear_regression_sgd() {
         // y = 2*x + 1
-        let model = Linear::new(1, 1).unwrap();
+        let model = Linear::on_device(1, 1, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         let mut optim = SGD::new(&params, 0.01, 0.0);
 
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn test_linear_regression_adam() {
         // y = 2*x + 1
-        let model = Linear::new(1, 1).unwrap();
+        let model = Linear::on_device(1, 1, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         let mut optim = Adam::new(&params, 0.1);
 
@@ -388,8 +388,8 @@ mod tests {
 
     #[test]
     fn test_collect_parameters() {
-        let l1 = Linear::new(3, 4).unwrap();
-        let l2 = Linear::new(4, 2).unwrap();
+        let l1 = Linear::on_device(3, 4, crate::tensor::test_device()).unwrap();
+        let l2 = Linear::on_device(4, 2, crate::tensor::test_device()).unwrap();
         let params = collect_parameters(&[&l1, &l2]);
         // l1: weight + bias = 2, l2: weight + bias = 2
         assert_eq!(params.len(), 4);
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_sgd_momentum() {
-        let model = Linear::new(1, 1).unwrap();
+        let model = Linear::on_device(1, 1, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         let mut optim = SGD::new(&params, 0.01, 0.9);
 
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_cross_entropy_converges() {
         // Train a Linear to classify 2 classes
-        let model = Linear::new(2, 2).unwrap();
+        let model = Linear::on_device(2, 2, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         let mut optim = SGD::new(&params, 0.1, 0.0);
 
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_clip_grad_norm() {
-        let model = Linear::new(2, 1).unwrap();
+        let model = Linear::on_device(2, 1, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
 
         let x = Variable::new(from_f32(&[10.0, 20.0], &[1, 2]), false);
@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_clip_grad_value() {
-        let model = Linear::new(2, 1).unwrap();
+        let model = Linear::on_device(2, 1, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
 
         let x = Variable::new(from_f32(&[10.0, 20.0], &[1, 2]), false);
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn test_layernorm() {
-        let ln = LayerNorm::new(4).unwrap();
+        let ln = LayerNorm::on_device(4, crate::tensor::test_device()).unwrap();
         let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]), true);
         let y = ln.forward(&x).unwrap();
         let data = y.data().to_f32_vec().unwrap();
@@ -751,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_embedding() {
-        let emb = Embedding::new(5, 3).unwrap();
+        let emb = Embedding::on_device(5, 3, crate::tensor::test_device()).unwrap();
 
         // Look up indices [0, 2, 4]
         let indices = Variable::new(from_f32(&[0.0, 2.0, 4.0], &[3]), false);
@@ -769,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_embedding_backward() {
-        let emb = Embedding::new(5, 3).unwrap();
+        let emb = Embedding::on_device(5, 3, crate::tensor::test_device()).unwrap();
         let indices = Variable::new(from_f32(&[0.0, 2.0], &[2]), false);
         let y = emb.forward(&indices).unwrap();
         let loss = y.sum().unwrap();
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_grucell() {
-        let gru = GRUCell::new(4, 3).unwrap();
+        let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
 
         let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]), true);
         let h1 = gru.forward_step(&x, None).unwrap();
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn test_lstmcell() {
-        let lstm = LSTMCell::new(4, 3).unwrap();
+        let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
 
         let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]), true);
         let state1 = lstm.forward_step(&x, None).unwrap();
@@ -835,10 +835,10 @@ mod tests {
 
     #[test]
     fn test_conv2d() {
-        let conv = Conv2d::new(1, 2, 3).unwrap();
+        let conv = Conv2d::build(1, 2, 3, true, [1, 1], [0, 0], [1, 1], 1, crate::tensor::test_device()).unwrap();
         // Input: [batch=1, channels=1, h=5, w=5]
         let x = Variable::new(
-            Tensor::randn(&[1, 1, 5, 5], Default::default()).unwrap(),
+            Tensor::randn(&[1, 1, 5, 5], crate::tensor::test_opts()).unwrap(),
             true,
         );
         let out = conv.forward(&x).unwrap();
@@ -856,9 +856,9 @@ mod tests {
 
     #[test]
     fn test_conv2d_no_bias() {
-        let conv = Conv2d::no_bias(3, 8, 3).unwrap();
+        let conv = Conv2d::build(3, 8, 3, false, [1, 1], [0, 0], [1, 1], 1, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 3, 8, 8], Default::default()).unwrap(),
+            Tensor::randn(&[2, 3, 8, 8], crate::tensor::test_opts()).unwrap(),
             true,
         );
         let out = conv.forward(&x).unwrap();
@@ -868,9 +868,9 @@ mod tests {
 
     #[test]
     fn test_conv2d_with_padding() {
-        let conv = Conv2d::build(1, 1, 3, true, [1, 1], [1, 1], [1, 1], 1, Device::CPU).unwrap();
+        let conv = Conv2d::build(1, 1, 3, true, [1, 1], [1, 1], [1, 1], 1, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[1, 1, 5, 5], Default::default()).unwrap(),
+            Tensor::randn(&[1, 1, 5, 5], crate::tensor::test_opts()).unwrap(),
             true,
         );
         let out = conv.forward(&x).unwrap();
@@ -880,10 +880,10 @@ mod tests {
 
     #[test]
     fn test_conv_transpose2d() {
-        let conv = ConvTranspose2d::new(2, 1, 3).unwrap();
+        let conv = ConvTranspose2d::build(2, 1, 3, true, [1, 1], [0, 0], [0, 0], [1, 1], 1, crate::tensor::test_device()).unwrap();
         // Input: [batch=1, channels=2, h=3, w=3]
         let x = Variable::new(
-            Tensor::randn(&[1, 2, 3, 3], Default::default()).unwrap(),
+            Tensor::randn(&[1, 2, 3, 3], crate::tensor::test_opts()).unwrap(),
             true,
         );
         let out = conv.forward(&x).unwrap();
@@ -898,10 +898,10 @@ mod tests {
 
     #[test]
     fn test_batchnorm_training() {
-        let bn = BatchNorm::new(4).unwrap();
+        let bn = BatchNorm::on_device(4, crate::tensor::test_device()).unwrap();
         // Input: [batch=8, features=4]
         let x = Variable::new(
-            Tensor::randn(&[8, 4], Default::default()).unwrap(),
+            Tensor::randn(&[8, 4], crate::tensor::test_opts()).unwrap(),
             true,
         );
         let out = bn.forward(&x).unwrap();
@@ -921,12 +921,12 @@ mod tests {
 
     #[test]
     fn test_batchnorm_eval() {
-        let bn = BatchNorm::new(3).unwrap();
+        let bn = BatchNorm::on_device(3, crate::tensor::test_device()).unwrap();
 
         // Run a few training steps to populate running stats
         for _ in 0..5 {
             let x = Variable::new(
-                Tensor::randn(&[4, 3], Default::default()).unwrap(),
+                Tensor::randn(&[4, 3], crate::tensor::test_opts()).unwrap(),
                 false,
             );
             bn.forward(&x).unwrap();
@@ -935,7 +935,7 @@ mod tests {
         // Switch to eval mode
         bn.set_training(false);
         let x = Variable::new(
-            Tensor::randn(&[2, 3], Default::default()).unwrap(),
+            Tensor::randn(&[2, 3], crate::tensor::test_opts()).unwrap(),
             false,
         );
         let out = bn.forward(&x).unwrap();
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_xavier_init() {
-        let t = init::xavier_uniform(&[10, 20], 10, 20, Device::CPU).unwrap();
+        let t = init::xavier_uniform(&[10, 20], 10, 20, crate::tensor::test_device()).unwrap();
         assert_eq!(t.shape(), vec![10, 20]);
         let data = t.to_f32_vec().unwrap();
         let bound = (6.0 / 30.0_f64).sqrt() as f32;
@@ -975,7 +975,7 @@ mod tests {
                 "xavier_uniform value {} out of bounds [{}, {}]", v, -bound, bound);
         }
 
-        let t = init::xavier_normal(&[10, 20], 10, 20, Device::CPU).unwrap();
+        let t = init::xavier_normal(&[10, 20], 10, 20, crate::tensor::test_device()).unwrap();
         assert_eq!(t.shape(), vec![10, 20]);
     }
 
@@ -983,13 +983,13 @@ mod tests {
 
     #[test]
     fn test_linspace_arange() {
-        let t = Tensor::linspace(0.0, 1.0, 5, Default::default()).unwrap();
+        let t = Tensor::linspace(0.0, 1.0, 5, crate::tensor::test_opts()).unwrap();
         assert_eq!(t.shape(), vec![5]);
         let data = t.to_f32_vec().unwrap();
         assert!((data[0] - 0.0).abs() < 1e-5);
         assert!((data[4] - 1.0).abs() < 1e-5);
 
-        let t = Tensor::arange(0.0, 5.0, 1.0, Default::default()).unwrap();
+        let t = Tensor::arange(0.0, 5.0, 1.0, crate::tensor::test_opts()).unwrap();
         assert_eq!(t.shape(), vec![5]);
         let data = t.to_f32_vec().unwrap();
         assert_eq!(data, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn test_save_load_checkpoint() {
-        let model = Linear::new(3, 2).unwrap();
+        let model = Linear::on_device(3, 2, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
 
         // Set known weights
@@ -1083,7 +1083,7 @@ mod tests {
         checkpoint::save_checkpoint(&mut buf, &named, &[], None).unwrap();
 
         // Create new model, load by name
-        let model2 = Linear::new(3, 2).unwrap();
+        let model2 = Linear::on_device(3, 2, crate::tensor::test_device()).unwrap();
         let named2: Vec<(String, Parameter)> = model2.parameters().into_iter()
             .map(|p| (format!("linear/{}", p.name), p))
             .collect();
@@ -1103,7 +1103,7 @@ mod tests {
     #[test]
     fn test_save_load_sgd_state() {
         use optim::Stateful;
-        let model = Linear::new(2, 1).unwrap();
+        let model = Linear::on_device(2, 1, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         let mut optim = SGD::new(&params, 0.1, 0.9);
 
@@ -1130,7 +1130,7 @@ mod tests {
     #[test]
     fn test_save_load_adam_state() {
         use optim::Stateful;
-        let model = Linear::new(2, 1).unwrap();
+        let model = Linear::on_device(2, 1, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         let mut optim = Adam::new(&params, 0.01);
 
@@ -1162,7 +1162,7 @@ mod tests {
     #[test]
     fn test_cast_parameters() {
         use crate::tensor::DType;
-        let model = Linear::new(3, 2).unwrap();
+        let model = Linear::on_device(3, 2, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         assert_eq!(params[0].variable.data().dtype(), DType::Float32);
 
@@ -1178,7 +1178,7 @@ mod tests {
     #[test]
     fn test_grad_scaler_finite() {
         use optim::Stateful;
-        let model = Linear::new(2, 1).unwrap();
+        let model = Linear::on_device(2, 1, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         let mut optim = SGD::new(&params, 0.1, 0.0);
 
@@ -1211,7 +1211,7 @@ mod tests {
         use crate::autograd::adaptive_avg_pool2d;
         // Input: [batch=1, channels=1, h=4, w=4]
         let x = Variable::new(
-            Tensor::randn(&[1, 1, 4, 4], Default::default()).unwrap(),
+            Tensor::randn(&[1, 1, 4, 4], crate::tensor::test_opts()).unwrap(),
             true,
         );
         let out = adaptive_avg_pool2d(&x, [2, 2]).unwrap();
@@ -1228,12 +1228,12 @@ mod tests {
         use crate::autograd::grid_sample;
         // Input: [batch=1, channels=1, h=4, w=4]
         let input = Variable::new(
-            Tensor::randn(&[1, 1, 4, 4], Default::default()).unwrap(),
+            Tensor::randn(&[1, 1, 4, 4], crate::tensor::test_opts()).unwrap(),
             true,
         );
         // Grid: [batch=1, out_h=2, out_w=2, 2]
         let grid = Variable::new(
-            Tensor::rand(&[1, 2, 2, 2], Default::default()).unwrap()
+            Tensor::rand(&[1, 2, 2, 2], crate::tensor::test_opts()).unwrap()
                 .mul_scalar(2.0).unwrap()
                 .add_scalar(-1.0).unwrap(), // map to [-1, 1]
             true,
@@ -1271,7 +1271,7 @@ mod tests {
             true,
         );
         let target_idx = Variable::new(
-            Tensor::from_i64(&[0, 1], &[2], Device::CPU).unwrap(),
+            Tensor::from_i64(&[0, 1], &[2], crate::tensor::test_device()).unwrap(),
             false,
         );
         let loss_idx = cross_entropy_loss(&pred, &target_idx).unwrap();
@@ -1301,14 +1301,14 @@ mod tests {
 
     #[test]
     fn test_cross_entropy_indices_converges() {
-        let model = Linear::new(2, 3).unwrap();
+        let model = Linear::on_device(2, 3, crate::tensor::test_device()).unwrap();
         let params = model.parameters();
         let mut optim = Adam::new(&params, 0.05);
 
         // 3 samples, 3 classes: class 0=[1,0], class 1=[0,1], class 2=[0.5,0.5]
         let x = Variable::new(from_f32(&[1.0, 0.0, 0.0, 1.0, 0.5, 0.5], &[3, 2]), false);
         let target = Variable::new(
-            Tensor::from_i64(&[0, 1, 2], &[3], Device::CPU).unwrap(),
+            Tensor::from_i64(&[0, 1, 2], &[3], crate::tensor::test_device()).unwrap(),
             false,
         );
 
@@ -1328,10 +1328,10 @@ mod tests {
 
     #[test]
     fn test_batchnorm2d() {
-        let bn = BatchNorm2d::new(3).unwrap();
+        let bn = BatchNorm2d::on_device(3, crate::tensor::test_device()).unwrap();
         // [batch=4, channels=3, height=8, width=8]
         let x = Variable::new(
-            Tensor::randn(&[4, 3, 8, 8], Default::default()).unwrap(),
+            Tensor::randn(&[4, 3, 8, 8], crate::tensor::test_opts()).unwrap(),
             true,
         );
         let out = bn.forward(&x).unwrap();
@@ -1346,12 +1346,12 @@ mod tests {
 
     #[test]
     fn test_batchnorm2d_eval() {
-        let bn = BatchNorm2d::new(4).unwrap();
+        let bn = BatchNorm2d::on_device(4, crate::tensor::test_device()).unwrap();
 
         // Run training to populate running stats
         for _ in 0..3 {
             let x = Variable::new(
-                Tensor::randn(&[4, 4, 6, 6], Default::default()).unwrap(),
+                Tensor::randn(&[4, 4, 6, 6], crate::tensor::test_opts()).unwrap(),
                 false,
             );
             bn.forward(&x).unwrap();
@@ -1359,7 +1359,7 @@ mod tests {
 
         bn.set_training(false);
         let x = Variable::new(
-            Tensor::randn(&[2, 4, 6, 6], Default::default()).unwrap(),
+            Tensor::randn(&[2, 4, 6, 6], crate::tensor::test_opts()).unwrap(),
             false,
         );
         let out = bn.forward(&x).unwrap();
@@ -1370,8 +1370,8 @@ mod tests {
 
     #[test]
     fn test_eq_tensor_int64() {
-        let a = Tensor::from_i64(&[1, 2, 3], &[3], Device::CPU).unwrap();
-        let b = Tensor::from_i64(&[1, 5, 3], &[3], Device::CPU).unwrap();
+        let a = Tensor::from_i64(&[1, 2, 3], &[3], crate::tensor::test_device()).unwrap();
+        let b = Tensor::from_i64(&[1, 5, 3], &[3], crate::tensor::test_device()).unwrap();
         let eq = a.eq_tensor(&b).unwrap();
         // Should be Float32 (not Int64) so mean() works
         assert_eq!(eq.dtype(), crate::tensor::DType::Float32);

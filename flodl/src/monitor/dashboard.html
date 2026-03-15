@@ -86,6 +86,7 @@ animation:pulse 2s ease-in-out infinite}
 
 <div class="header">
   <h1>floDl <span>Training Dashboard</span></h1>
+  <div id="hwInfo" style="display:none;color:var(--dim);font-size:11px;letter-spacing:0.3px;margin:-6px 0 4px 0;font-family:monospace"></div>
   <div class="status" id="status">
     <div class="status-dot" id="statusDot"></div>
     <span id="statusText">Waiting...</span>
@@ -256,15 +257,24 @@ function showMeta(meta){
   catch(e){pre.textContent=String(meta)}
   card.style.display='block';
 }
+function showHardware(hw){
+  if(!hw)return;
+  const el=document.getElementById('hwInfo');
+  if(!el)return;
+  el.textContent=hw;
+  el.style.display='block';
+}
 // Apply from archive constants
 if(typeof ARCHIVE_LABEL!=='undefined'||typeof ARCHIVE_HASH!=='undefined'){
   applyLabelHash(typeof ARCHIVE_LABEL!=='undefined'?ARCHIVE_LABEL:null,typeof ARCHIVE_HASH!=='undefined'?ARCHIVE_HASH:null);
 }
 if(typeof ARCHIVE_META!=='undefined'&&ARCHIVE_META!==null){showMeta(ARCHIVE_META)}
+if(typeof ARCHIVE_HARDWARE!=='undefined'){showHardware(ARCHIVE_HARDWARE)}
 // Apply from live server injection
 if(typeof LIVE_LABEL!=='undefined'||typeof LIVE_HASH!=='undefined'){
   applyLabelHash(typeof LIVE_LABEL!=='undefined'?LIVE_LABEL:null,typeof LIVE_HASH!=='undefined'?LIVE_HASH:null);
 }
+if(typeof LIVE_HARDWARE!=='undefined'){showHardware(LIVE_HARDWARE)}
 
 // --- Header ---
 function updateHeader(d){

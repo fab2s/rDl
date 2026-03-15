@@ -27,7 +27,7 @@ mod tests {
     use crate::tensor::{Tensor, Device};
 
     fn from_f32(data: &[f32], shape: &[i64]) -> Tensor {
-        Tensor::from_f32(data, shape, Device::CPU).unwrap()
+        Tensor::from_f32(data, shape, crate::tensor::test_device()).unwrap()
     }
 
     #[test]
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn test_gather_gradient() {
         let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), true);
-        let idx = Tensor::from_i64(&[0, 0, 1, 0], &[2, 2], Device::CPU).unwrap();
+        let idx = Tensor::from_i64(&[0, 0, 1, 0], &[2, 2], crate::tensor::test_device()).unwrap();
         let y = x.gather(1, &idx).unwrap().sum().unwrap();
         y.backward().unwrap();
 
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn test_index_select_gradient() {
         let x = Variable::new(from_f32(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5]), true);
-        let idx = Tensor::from_f32(&[0.0, 2.0, 2.0], &[3], crate::tensor::Device::CPU).unwrap()
+        let idx = Tensor::from_f32(&[0.0, 2.0, 2.0], &[3], crate::tensor::test_device()).unwrap()
             .to_dtype(crate::tensor::DType::Int64).unwrap();
         let y = x.index_select(0, &idx).unwrap().sum().unwrap();
         y.backward().unwrap();
@@ -780,11 +780,11 @@ mod tests {
 
     #[test]
     fn test_backward_frees_grad_fn_chain() {
+        if crate::tensor::test_device() != Device::CPU { return; }
         // Verify that backward() + detach_() doesn't leak C++ autograd Nodes.
         // Simulates a training loop: multiple loss terms per step, many steps.
         use crate::nn::{Module, Linear};
         use crate::nn::optim::{Adam, Optimizer};
-        use crate::tensor::TensorOptions;
 
         fn get_rss_kb() -> usize {
             std::fs::read_to_string("/proc/self/statm")
@@ -794,10 +794,10 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        let linear = Linear::new(256, 256).unwrap();
+        let linear = Linear::on_device(256, 256, crate::tensor::test_device()).unwrap();
         let params = linear.parameters();
         let mut opt = Adam::new(&params, 0.001);
-        let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device: Device::CPU };
+        let opts = crate::tensor::test_opts();
 
         // Warm up — let allocators settle
         for _ in 0..50 {
@@ -837,20 +837,21 @@ mod tests {
     /// each training phase independently. Run with --nocapture to see output.
     #[test]
     fn test_leak_isolation_phases() {
+        if crate::tensor::test_device() != Device::CPU { return; }
         use crate::nn::{Module, Linear, clip_grad_norm, cross_entropy_loss};
         use crate::nn::optim::{Adam, Optimizer};
         use crate::nn::parameter::Parameter;
         use crate::tensor::{TensorOptions, live_tensor_count, rss_kb, malloc_trim};
 
-        let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device: Device::CPU };
+        let opts = crate::tensor::test_opts();
         let iters = 1000;
         let batch = 32;
         let dim = 128;
         let classes: i64 = 26;
 
         // Build a model similar to FBRL: two linears + loss
-        let linear1 = Linear::new(dim, dim).unwrap();
-        let linear2 = Linear::new(dim, classes).unwrap();
+        let linear1 = Linear::on_device(dim, dim, crate::tensor::test_device()).unwrap();
+        let linear2 = Linear::on_device(dim, classes, crate::tensor::test_device()).unwrap();
         let params: Vec<Parameter> = linear1.parameters().into_iter()
             .chain(linear2.parameters()).collect();
         let mut opt = Adam::new(&params, 0.001);
@@ -949,23 +950,24 @@ mod tests {
     /// multiple loss terms, optimizer). Run with --nocapture to see diagnostics.
     #[test]
     fn test_graph_loop_leak() {
+        if crate::tensor::test_device() != Device::CPU { return; }
         use crate::nn::{Module, Linear, cross_entropy_loss, clip_grad_norm};
         use crate::nn::optim::{Adam, Optimizer};
         use crate::nn::parameter::Parameter;
         use crate::graph::FlowBuilder;
         use crate::tensor::{TensorOptions, live_tensor_count, rss_kb, malloc_trim};
 
-        let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device: Device::CPU };
+        let opts = crate::tensor::test_opts();
         let batch: i64 = 16;
         let dim = 64;
         let classes: i64 = 26;
         let loop_iters = 4;
 
         // Build a graph: Linear → loop(Linear+ReLU, 4 iters) → tag("out") → Linear
-        let graph = FlowBuilder::from(Linear::new(dim, dim).unwrap())
-            .loop_body(Linear::new(dim, dim).unwrap()).for_n(loop_iters)
+        let graph = FlowBuilder::from(Linear::on_device(dim, dim, crate::tensor::test_device()).unwrap())
+            .loop_body(Linear::on_device(dim, dim, crate::tensor::test_device()).unwrap()).for_n(loop_iters)
             .tag("loop_out")
-            .through(Linear::new(dim, classes).unwrap())
+            .through(Linear::on_device(dim, classes, crate::tensor::test_device()).unwrap())
             .tag("logits")
             .build()
             .unwrap();

@@ -24,9 +24,14 @@ pub struct BatchNorm {
 }
 
 impl BatchNorm {
-    /// Create a BatchNorm layer for `num_features` channels/features.
+    /// Create a BatchNorm layer for `num_features` channels/features on CPU.
     pub fn new(num_features: i64) -> Result<Self> {
-        let opts = TensorOptions::default();
+        Self::on_device(num_features, crate::tensor::Device::CPU)
+    }
+
+    /// Create a BatchNorm layer on a specific device.
+    pub fn on_device(num_features: i64, device: crate::tensor::Device) -> Result<Self> {
+        let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device };
         let weight = Variable::new(Tensor::ones(&[num_features], opts)?, true);
         let bias = Variable::new(Tensor::zeros(&[num_features], opts)?, true);
 
@@ -73,9 +78,14 @@ pub struct BatchNorm2d {
 }
 
 impl BatchNorm2d {
-    /// Create a BatchNorm2d layer for `num_channels` channels.
+    /// Create a BatchNorm2d layer for `num_channels` channels on CPU.
     pub fn new(num_channels: i64) -> Result<Self> {
         Ok(Self { inner: BatchNorm::new(num_channels)? })
+    }
+
+    /// Create a BatchNorm2d layer on a specific device.
+    pub fn on_device(num_channels: i64, device: crate::tensor::Device) -> Result<Self> {
+        Ok(Self { inner: BatchNorm::on_device(num_channels, device)? })
     }
 }
 

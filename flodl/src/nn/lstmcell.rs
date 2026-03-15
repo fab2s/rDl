@@ -70,8 +70,9 @@ impl LSTMCell {
                 (h, c)
             }
             None => {
-                let h = Variable::new(Tensor::zeros(&[batch, hs], Default::default())?, false);
-                let c = Variable::new(Tensor::zeros(&[batch, hs], Default::default())?, false);
+                let opts = TensorOptions { dtype: DType::Float32, device: self.w_ih.variable.device() };
+                let h = Variable::new(Tensor::zeros(&[batch, hs], opts)?, false);
+                let c = Variable::new(Tensor::zeros(&[batch, hs], opts)?, false);
                 (h, c)
             }
         };
@@ -109,16 +110,15 @@ impl Module for LSTMCell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::Device;
 
     fn from_f32(data: &[f32], shape: &[i64]) -> Tensor {
-        Tensor::from_f32(data, shape, Device::CPU).unwrap()
+        Tensor::from_f32(data, shape, crate::tensor::test_device()).unwrap()
     }
 
     #[test]
     fn test_lstmcell_forward() {
-        let lstm = LSTMCell::new(4, 3).unwrap();
-        let x = Variable::new(Tensor::randn(&[2, 4], Default::default()).unwrap(), false);
+        let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
+        let x = Variable::new(Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
         let state = lstm.forward_step(&x, None).unwrap();
         assert_eq!(state.shape(), vec![2, 6]); // h + c packed
 
@@ -135,9 +135,9 @@ mod tests {
 
     #[test]
     fn test_lstmcell_gradient() {
-        let lstm = LSTMCell::new(4, 3).unwrap();
+        let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 4], Default::default()).unwrap(), true);
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), true);
         let state = lstm.forward_step(&x, None).unwrap();
         let loss = state.sum().unwrap();
         loss.backward().unwrap();
@@ -152,9 +152,9 @@ mod tests {
 
     #[test]
     fn test_lstmcell_multi_step() {
-        let lstm = LSTMCell::new(4, 3).unwrap();
+        let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 4], Default::default()).unwrap(), false);
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
 
         // Run 5 steps, each feeding previous state
         let mut state: Option<Variable> = None;
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn test_lstmcell_finite_difference() {
         let eps = 1e-3;
-        let lstm = LSTMCell::new(2, 2).unwrap();
+        let lstm = LSTMCell::on_device(2, 2, crate::tensor::test_device()).unwrap();
         let x_data = vec![0.5_f32, -0.3, 0.1, 0.8];
         let x = Variable::new(from_f32(&x_data, &[2, 2]), true);
 
@@ -202,8 +202,8 @@ mod tests {
     #[test]
     fn test_lstmcell_module_forward() {
         use crate::nn::Module;
-        let lstm = LSTMCell::new(4, 3).unwrap();
-        let x = Variable::new(Tensor::randn(&[2, 4], Default::default()).unwrap(), false);
+        let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
+        let x = Variable::new(Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
         let y = lstm.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 3]); // Only h returned from Module::forward
     }

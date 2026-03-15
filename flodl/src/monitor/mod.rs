@@ -106,6 +106,7 @@ pub struct Monitor {
     metadata: Option<serde_json::Value>,
     graph_label: Option<String>,
     graph_hash: Option<String>,
+    hardware: String,
 }
 
 impl Monitor {
@@ -122,6 +123,7 @@ impl Monitor {
             metadata: None,
             graph_label: None,
             graph_hash: None,
+            hardware: crate::tensor::hardware_summary(),
         }
     }
 
@@ -132,6 +134,7 @@ impl Monitor {
     pub fn serve(&mut self, port: u16) -> std::io::Result<()> {
         let srv = server::DashboardServer::start(port)?;
         eprintln!("  dashboard: http://localhost:{}", port);
+        srv.set_hardware(self.hardware.clone());
         self.server = Some(srv);
         Ok(())
     }
@@ -459,15 +462,18 @@ impl Monitor {
 
         let total_time = self.start_time.elapsed().as_secs_f64();
 
+        let hw_js = format!("\"{}\"", self.hardware.replace('\\', "\\\\").replace('"', "\\\""));
+
         // Inject archive constants before the main <script> tag
         let archive_block = format!(
-            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\n</script>",
+            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\n</script>",
             data_json,
             svg_js,
             format_eta(total_time),
             label_js,
             hash_js,
             meta_js,
+            hw_js,
         );
 
         let template = include_str!("dashboard.html");
@@ -599,8 +605,9 @@ mod tests {
     fn test_log_with_graph() {
         use crate::*;
 
-        let model = FlowBuilder::from(Linear::new(2, 4).unwrap())
-            .through(Linear::new(4, 2).unwrap())
+        let dev = crate::tensor::test_device();
+        let model = FlowBuilder::from(Linear::on_device(2, 4, dev).unwrap())
+            .through(Linear::on_device(4, 2, dev).unwrap())
             .tag("output")
             .build()
             .unwrap();
@@ -629,8 +636,9 @@ mod tests {
     fn test_log_graph_only() {
         use crate::*;
 
-        let model = FlowBuilder::from(Linear::new(2, 4).unwrap())
-            .through(Linear::new(4, 2).unwrap())
+        let dev = crate::tensor::test_device();
+        let model = FlowBuilder::from(Linear::on_device(2, 4, dev).unwrap())
+            .through(Linear::on_device(4, 2, dev).unwrap())
             .build()
             .unwrap();
 
@@ -661,9 +669,10 @@ mod tests {
     fn test_watch_captures_label_hash() {
         use crate::*;
 
-        let model = FlowBuilder::from(Linear::new(2, 4).unwrap())
+        let dev = crate::tensor::test_device();
+        let model = FlowBuilder::from(Linear::on_device(2, 4, dev).unwrap())
             .label("test-model")
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, dev).unwrap())
             .build()
             .unwrap();
 
@@ -679,9 +688,10 @@ mod tests {
     fn test_build_archive_with_metadata() {
         use crate::*;
 
-        let model = FlowBuilder::from(Linear::new(2, 4).unwrap())
+        let dev = crate::tensor::test_device();
+        let model = FlowBuilder::from(Linear::on_device(2, 4, dev).unwrap())
             .label("meta-test")
-            .through(Linear::new(4, 2).unwrap())
+            .through(Linear::on_device(4, 2, dev).unwrap())
             .build()
             .unwrap();
 

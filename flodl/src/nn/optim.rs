@@ -573,12 +573,12 @@ impl Stateful for AdamW {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{Device, Tensor, TensorOptions};
+    use crate::tensor::{Tensor, TensorOptions};
 
     fn make_param(name: &str, shape: &[i64]) -> Parameter {
         let t = Tensor::randn(shape, TensorOptions {
             dtype: crate::tensor::DType::Float32,
-            device: Device::CPU,
+            device: crate::tensor::test_device(),
         }).unwrap();
         Parameter::new(t, name)
     }
@@ -590,7 +590,7 @@ mod tests {
         let mut opt = Adam::new(std::slice::from_ref(&p), 0.01);
 
         let x = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], Device::CPU).unwrap(),
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
             false,
         );
         let y = x.matmul(&p.variable).unwrap();
@@ -615,7 +615,7 @@ mod tests {
             .build();
 
         let x = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], Device::CPU).unwrap(),
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
             false,
         );
         // Both params participate
@@ -683,7 +683,7 @@ mod tests {
             .build();
 
         let x = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], Device::CPU).unwrap(),
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
             false,
         );
         let y = x.matmul(&p2.variable).unwrap();
@@ -707,7 +707,7 @@ mod tests {
 
         // Do a step to populate moment buffers
         let x = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], Device::CPU).unwrap(),
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
             false,
         );
         let y1 = x.matmul(&p1.variable).unwrap();
@@ -737,10 +737,10 @@ mod tests {
     #[test]
     fn test_fused_adam_numerical_correctness() {
         // Known param/grad/m/v, verify against hand-computed expected values
-        let param = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4], Device::CPU).unwrap();
-        let grad = Tensor::from_f32(&[0.1, 0.2, 0.3, 0.4], &[4], Device::CPU).unwrap();
-        let m = Tensor::zeros(&[4], TensorOptions::default()).unwrap();
-        let v = Tensor::zeros(&[4], TensorOptions::default()).unwrap();
+        let param = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4], crate::tensor::test_device()).unwrap();
+        let grad = Tensor::from_f32(&[0.1, 0.2, 0.3, 0.4], &[4], crate::tensor::test_device()).unwrap();
+        let m = Tensor::zeros(&[4], crate::tensor::test_opts()).unwrap();
+        let v = Tensor::zeros(&[4], crate::tensor::test_opts()).unwrap();
 
         let lr = 0.001;
         let beta1 = 0.9;
@@ -784,10 +784,10 @@ mod tests {
 
     #[test]
     fn test_fused_adamw_weight_decay() {
-        let param = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
-        let grad = Tensor::from_f32(&[0.1, 0.1], &[2], Device::CPU).unwrap();
-        let m = Tensor::zeros(&[2], TensorOptions::default()).unwrap();
-        let v = Tensor::zeros(&[2], TensorOptions::default()).unwrap();
+        let param = Tensor::from_f32(&[1.0, 2.0], &[2], crate::tensor::test_device()).unwrap();
+        let grad = Tensor::from_f32(&[0.1, 0.1], &[2], crate::tensor::test_device()).unwrap();
+        let m = Tensor::zeros(&[2], crate::tensor::test_opts()).unwrap();
+        let v = Tensor::zeros(&[2], crate::tensor::test_opts()).unwrap();
 
         let lr = 0.001;
         let wd = 0.01;
@@ -811,10 +811,10 @@ mod tests {
     #[test]
     fn test_fused_adam_multi_step_convergence() {
         // Run multiple steps, verify m/v accumulate correctly
-        let param = Tensor::from_f32(&[5.0], &[1], Device::CPU).unwrap();
-        let grad = Tensor::from_f32(&[1.0], &[1], Device::CPU).unwrap();
-        let m = Tensor::zeros(&[1], TensorOptions::default()).unwrap();
-        let v = Tensor::zeros(&[1], TensorOptions::default()).unwrap();
+        let param = Tensor::from_f32(&[5.0], &[1], crate::tensor::test_device()).unwrap();
+        let grad = Tensor::from_f32(&[1.0], &[1], crate::tensor::test_device()).unwrap();
+        let m = Tensor::zeros(&[1], crate::tensor::test_opts()).unwrap();
+        let v = Tensor::zeros(&[1], crate::tensor::test_opts()).unwrap();
 
         for step in 1..=10 {
             param.adam_step(&grad, &m, &v, 0.01, 0.9, 0.999, 1e-8, 0.0, step).unwrap();

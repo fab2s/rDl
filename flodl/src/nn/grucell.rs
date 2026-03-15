@@ -63,10 +63,13 @@ impl GRUCell {
 
         let h = match h {
             Some(h) => h.clone(),
-            None => Variable::new(
-                Tensor::zeros(&[batch, self.hidden_size], Default::default())?,
-                false,
-            ),
+            None => {
+                let opts = TensorOptions { dtype: DType::Float32, device: self.w_ih.variable.device() };
+                Variable::new(
+                    Tensor::zeros(&[batch, self.hidden_size], opts)?,
+                    false,
+                )
+            }
         };
 
         autograd::gru_cell(
@@ -100,16 +103,15 @@ impl Module for GRUCell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::Device;
 
     fn from_f32(data: &[f32], shape: &[i64]) -> Tensor {
-        Tensor::from_f32(data, shape, Device::CPU).unwrap()
+        Tensor::from_f32(data, shape, crate::tensor::test_device()).unwrap()
     }
 
     #[test]
     fn test_grucell_forward() {
-        let gru = GRUCell::new(4, 3).unwrap();
-        let x = Variable::new(Tensor::randn(&[2, 4], Default::default()).unwrap(), false);
+        let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
+        let x = Variable::new(Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
         let h = gru.forward_step(&x, None).unwrap();
         assert_eq!(h.shape(), vec![2, 3]);
 
@@ -120,9 +122,9 @@ mod tests {
 
     #[test]
     fn test_grucell_gradient() {
-        let gru = GRUCell::new(4, 3).unwrap();
+        let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 4], Default::default()).unwrap(), true);
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), true);
         let h = gru.forward_step(&x, None).unwrap();
         let loss = h.sum().unwrap();
         loss.backward().unwrap();
@@ -137,9 +139,9 @@ mod tests {
 
     #[test]
     fn test_grucell_multi_step() {
-        let gru = GRUCell::new(4, 3).unwrap();
+        let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 4], Default::default()).unwrap(), false);
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
 
         // Run 5 steps, each feeding previous hidden state
         let mut h: Option<Variable> = None;
@@ -153,7 +155,7 @@ mod tests {
     #[test]
     fn test_grucell_finite_difference() {
         let eps = 1e-3;
-        let gru = GRUCell::new(2, 2).unwrap();
+        let gru = GRUCell::on_device(2, 2, crate::tensor::test_device()).unwrap();
         let x_data = vec![0.5_f32, -0.3, 0.1, 0.8];
         let x = Variable::new(from_f32(&x_data, &[2, 2]), true);
 
@@ -186,8 +188,8 @@ mod tests {
     #[test]
     fn test_grucell_module_forward() {
         use crate::nn::Module;
-        let gru = GRUCell::new(4, 3).unwrap();
-        let x = Variable::new(Tensor::randn(&[2, 4], Default::default()).unwrap(), false);
+        let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
+        let x = Variable::new(Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
         let y = gru.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 3]);
     }

@@ -62,11 +62,10 @@ pub fn gaussian_blur_2d(input: &Variable, sigma: f64) -> Result<Variable> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{Device, TensorOptions};
 
     #[test]
     fn test_gaussian_blur_preserves_shape() {
-        let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device: Device::CPU };
+        let opts = crate::tensor::test_opts();
         let input = Variable::new(Tensor::randn(&[1, 3, 16, 16], opts).unwrap(), false);
         let output = gaussian_blur_2d(&input, 1.0).unwrap();
         assert_eq!(output.shape(), vec![1, 3, 16, 16]);
@@ -74,7 +73,7 @@ mod tests {
 
     #[test]
     fn test_gaussian_blur_smooths() {
-        let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device: Device::CPU };
+        let opts = crate::tensor::test_opts();
         let input = Variable::new(Tensor::randn(&[1, 1, 8, 8], opts).unwrap(), false);
         let output = gaussian_blur_2d(&input, 2.0).unwrap();
 
@@ -87,7 +86,7 @@ mod tests {
     #[test]
     fn test_gaussian_blur_no_autograd_graph() {
         // Verify blur doesn't build autograd graph even with requires_grad input
-        let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device: Device::CPU };
+        let opts = crate::tensor::test_opts();
         let input = Variable::new(Tensor::randn(&[1, 3, 8, 8], opts).unwrap(), true);
         let output = gaussian_blur_2d(&input, 1.0).unwrap();
         // Output should not require grad (NoGradGuard prevents graph construction)
@@ -101,6 +100,7 @@ mod tests {
     /// repeated many times. RSS should stay roughly flat.
     #[test]
     fn test_gaussian_blur_no_ram_leak() {
+        if crate::tensor::test_device() != crate::tensor::Device::CPU { return; }
         use crate::nn::{Linear, Module, Adam, Optimizer};
 
         fn get_rss_kb() -> usize {
@@ -111,7 +111,7 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device: Device::CPU };
+        let opts = crate::tensor::test_opts();
         let model = Linear::new(128, 128).unwrap();
         let params = model.parameters();
         let mut opt = Adam::new(&params, 0.001);

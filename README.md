@@ -180,10 +180,12 @@ cd my-project && make run
 ```bash
 git clone https://github.com/fab2s/floDl.git
 cd floDl
-make image    # build dev container (Rust + libtorch)
-make test     # run all tests
-make clippy   # lint
-make shell    # interactive shell in container
+make image      # build dev container (Rust + libtorch)
+make test       # run all tests (CPU)
+make cuda-test  # run all tests on CUDA (requires NVIDIA GPU)
+make test-all   # CPU first, then CUDA if a GPU is available
+make clippy     # lint
+make shell      # interactive shell in container
 ```
 
 ### Train a model in 30 lines
@@ -338,7 +340,7 @@ Every differentiable path is verified against finite-difference gradients:
 - 37 autograd op-level checks (every op + compositions)
 - Module-level checks (every NN module, input + parameter gradients)
 - Exact optimizer step verifications (SGD, Adam, AdamW)
-- 258 library tests + 15 showcase tests, zero clippy warnings
+- 308 library tests, zero clippy warnings — all tests run on both CPU and CUDA
 
 ## Why Rust for Deep Learning?
 

@@ -59,7 +59,7 @@ mod tests {
     fn make_param(name: &str) -> Parameter {
         let t = Tensor::randn(&[3, 2], TensorOptions {
             dtype: crate::tensor::DType::Float32,
-            device: Device::CPU,
+            device: crate::tensor::test_device(),
         }).unwrap();
         Parameter::new(t, name)
     }
@@ -93,7 +93,7 @@ mod tests {
 
         // Forward + backward: unfrozen param should accumulate gradient
         let x = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], Device::CPU).unwrap(),
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
             false,
         );
         let y = x.matmul(&p.variable).unwrap();
@@ -113,7 +113,7 @@ mod tests {
         let mut opt = Adam::new(&[p1.clone(), p2.clone()], 0.01);
 
         let x = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], Device::CPU).unwrap(),
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
             false,
         );
         // Only p2 participates in grad-tracked computation

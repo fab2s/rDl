@@ -110,12 +110,12 @@ impl Module for Dropout2d {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{Device, DType};
+    use crate::tensor::DType;
 
     #[test]
     fn test_dropout2d_whole_channels_zeroed() {
         let d = Dropout2d::new(0.5);
-        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
         let input = Variable::new(Tensor::ones(&[2, 8, 4, 4], opts).unwrap(), false);
 
         let output = d.forward(&input).unwrap();
@@ -145,7 +145,7 @@ mod tests {
     fn test_dropout2d_eval_identity() {
         let d = Dropout2d::new(0.5);
         d.set_training(false);
-        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
         let input = Variable::new(Tensor::ones(&[1, 3, 4, 4], opts).unwrap(), false);
 
         let output = d.forward(&input).unwrap();

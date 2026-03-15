@@ -497,7 +497,7 @@ mod tests {
         sizes.iter().enumerate().map(|(i, &(rows, cols))| {
             let t = Tensor::randn(&[rows, cols], TensorOptions {
                 dtype: DType::Float32,
-                device: Device::CPU,
+                device: crate::tensor::test_device(),
             }).unwrap();
             let name = format!("layer_{}/weight", i);
             (name.clone(), Parameter::new(t, "weight"))
@@ -508,7 +508,7 @@ mod tests {
         sizes.iter().enumerate().map(|(i, &features)| {
             let t = Tensor::randn(&[features], TensorOptions {
                 dtype: DType::Float32,
-                device: Device::CPU,
+                device: crate::tensor::test_device(),
             }).unwrap();
             let name = format!("bn_{}/running_mean", i);
             (name.clone(), Buffer::new(t, "running_mean"))
@@ -613,7 +613,7 @@ mod tests {
             Parameter::new(
                 Tensor::randn(&[4, 4], TensorOptions {
                     dtype: DType::Float32,
-                    device: Device::CPU,
+                    device: crate::tensor::test_device(),
                 }).unwrap(),
                 "weight",
             ),
@@ -635,7 +635,7 @@ mod tests {
         let wrong_buffers = vec![(
             "bn_0/running_mean".to_string(),
             Buffer::new(
-                Tensor::zeros(&[4], TensorOptions::default()).unwrap(),
+                Tensor::zeros(&[4], crate::tensor::test_opts()).unwrap(),
                 "running_mean",
             ),
         )];

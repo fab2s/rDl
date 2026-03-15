@@ -8,7 +8,7 @@ RUN     = $(COMPOSE) run --rm dev
 RUN_GPU = $(COMPOSE) run --rm cuda
 
 .PHONY: build test test-release check clippy doc shell clean image \
-        cuda-image cuda-build cuda-test cuda-shell
+        cuda-image cuda-build cuda-test cuda-shell test-all
 
 # --- CPU targets ---
 
@@ -65,6 +65,19 @@ cuda-clippy: cuda-image
 # Interactive shell (CUDA)
 cuda-shell: cuda-image
 	$(COMPOSE) run --rm cuda bash
+
+# --- Combined ---
+
+# Run CPU tests, then CUDA tests if a GPU is available
+test-all: test
+	@if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then \
+		echo ""; \
+		echo "=== GPU detected — running CUDA tests ==="; \
+		$(MAKE) cuda-test; \
+	else \
+		echo ""; \
+		echo "=== No GPU available — skipping CUDA tests ==="; \
+	fi
 
 # --- Cleanup ---
 

@@ -1685,6 +1685,68 @@ pub fn cuda_utilization() -> Option<u32> {
     if val >= 0 { Some(val as u32) } else { None }
 }
 
+/// Returns the GPU device name (e.g. "NVIDIA GeForce GTX 1060 6GB").
+pub fn cuda_device_name() -> Option<String> {
+    let mut buf = [0i8; 256];
+    let err = unsafe { ffi::flodl_cuda_device_name(0, buf.as_mut_ptr(), 256) };
+    if err.is_null() {
+        let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Some(name)
+    } else {
+        unsafe { ffi::flodl_free_string(err) };
+        None
+    }
+}
+
+/// One-line hardware summary for dashboard headers.
+///
+/// Returns something like:
+/// `"CPU: AMD Ryzen 9 5900X (64GB) | GPU: NVIDIA GeForce GTX 1060 (6GB)"`
+pub fn hardware_summary() -> String {
+    let cpu = cpu_model_name().unwrap_or_else(|| "Unknown CPU".into());
+    let ram = total_ram_gb();
+    let mut s = format!("{} ({}GB)", cpu, ram);
+
+    if cuda_available() && let Some(gpu) = cuda_device_name() {
+        let vram = cuda_memory_info()
+            .map(|(_, total)| total / (1024 * 1024 * 1024))
+            .unwrap_or(0);
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!(
+            " | {} ({}GB)", gpu, vram
+        ));
+    }
+    s
+}
+
+/// Read CPU model name from /proc/cpuinfo (Linux).
+fn cpu_model_name() -> Option<String> {
+    let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    for line in info.lines() {
+        if line.starts_with("model name") && let Some(val) = line.split(':').nth(1) {
+            return Some(val.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Total physical RAM in GB (Linux).
+fn total_ram_gb() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            for line in s.lines() {
+                if line.starts_with("MemTotal:") {
+                    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+                    return Some(kb / (1024 * 1024));
+                }
+            }
+            None
+        })
+        .unwrap_or(0)
+}
+
 /// Enable or disable cuDNN benchmark mode.
 ///
 /// When enabled, cuDNN will benchmark multiple convolution algorithms
@@ -1721,16 +1783,33 @@ pub fn rss_kb() -> usize {
         .unwrap_or(0)
 }
 
+/// Returns the device to use in tests: CUDA when compiled with `--features cuda`
+/// and a GPU is available, CPU otherwise.
+#[cfg(test)]
+pub fn test_device() -> Device {
+    use std::sync::Once;
+    static PRINT: Once = Once::new();
+    let dev = if cfg!(feature = "cuda") && cuda_available() { Device::CUDA } else { Device::CPU };
+    PRINT.call_once(|| eprintln!("\n*** flodl test device: {} ***\n", dev));
+    dev
+}
+
+/// Returns `TensorOptions` for tests (Float32 on `test_device()`).
+#[cfg(test)]
+pub fn test_opts() -> TensorOptions {
+    TensorOptions { dtype: DType::Float32, device: test_device() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_zeros() {
-        let t = Tensor::zeros(&[2, 3], TensorOptions::default()).unwrap();
+        let t = Tensor::zeros(&[2, 3], test_opts()).unwrap();
         assert_eq!(t.shape(), vec![2, 3]);
         assert_eq!(t.dtype(), DType::Float32);
-        assert_eq!(t.device(), Device::CPU);
+        assert_eq!(t.device(), test_device());
         assert_eq!(t.numel(), 6);
 
         let data = t.to_f32_vec().unwrap();
@@ -1739,7 +1818,7 @@ mod tests {
 
     #[test]
     fn test_from_f32() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
         assert_eq!(t.shape(), vec![3]);
         let data = t.to_f32_vec().unwrap();
         assert_eq!(data, vec![1.0, 2.0, 3.0]);
@@ -1747,24 +1826,24 @@ mod tests {
 
     #[test]
     fn test_add() {
-        let a = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[4.0, 5.0, 6.0], &[3], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
+        let b = Tensor::from_f32(&[4.0, 5.0, 6.0], &[3], test_device()).unwrap();
         let c = a.add(&b).unwrap();
         assert_eq!(c.to_f32_vec().unwrap(), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn test_matmul() {
-        let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0], &[2, 2], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
+        let b = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0], &[2, 2], test_device()).unwrap();
         let c = a.matmul(&b).unwrap();
         assert_eq!(c.to_f32_vec().unwrap(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 
     #[test]
     fn test_chaining() {
-        let a = Tensor::from_f32(&[1.0, -2.0, 3.0], &[3], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[1.0, 1.0, 1.0], &[3], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[1.0, -2.0, 3.0], &[3], test_device()).unwrap();
+        let b = Tensor::from_f32(&[1.0, 1.0, 1.0], &[3], test_device()).unwrap();
         let result = a.add(&b).unwrap().relu().unwrap().sum().unwrap();
         // [1+1, -2+1, 3+1] = [2, -1, 4] -> relu -> [2, 0, 4] -> sum -> 6
         let val = result.item().unwrap();
@@ -1774,13 +1853,13 @@ mod tests {
     #[test]
     fn test_drop_frees_memory() {
         // Create and immediately drop — verifies Drop doesn't crash.
-        let _ = Tensor::zeros(&[1000, 1000], TensorOptions::default()).unwrap();
+        let _ = Tensor::zeros(&[1000, 1000], test_opts()).unwrap();
         // If Drop is broken, this would leak or crash.
     }
 
     #[test]
     fn test_debug_format() {
-        let t = Tensor::zeros(&[2, 3], TensorOptions::default()).unwrap();
+        let t = Tensor::zeros(&[2, 3], test_opts()).unwrap();
         let s = format!("{:?}", t);
         assert!(s.contains("[2, 3]"));
         assert!(s.contains("Float32"));
@@ -1788,7 +1867,7 @@ mod tests {
 
     #[test]
     fn test_div_scalar() {
-        let t = Tensor::from_f32(&[6.0, 9.0], &[2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[6.0, 9.0], &[2], test_device()).unwrap();
         let r = t.div_scalar(3.0).unwrap();
         let data = r.to_f32_vec().unwrap();
         assert!((data[0] - 2.0).abs() < 1e-5);
@@ -1797,23 +1876,23 @@ mod tests {
 
     #[test]
     fn test_mean() {
-        let t = Tensor::from_f32(&[2.0, 4.0, 6.0], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[2.0, 4.0, 6.0], &[3], test_device()).unwrap();
         let m = t.mean().unwrap();
         assert!((m.item().unwrap() - 4.0).abs() < 1e-5);
     }
 
     #[test]
     fn test_flatten() {
-        let t = Tensor::ones(&[2, 3, 4], TensorOptions::default()).unwrap();
+        let t = Tensor::ones(&[2, 3, 4], test_opts()).unwrap();
         let f = t.flatten(1, 2).unwrap();
         assert_eq!(f.shape(), vec![2, 12]);
     }
 
     #[test]
     fn test_stack() {
-        let a = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[3.0, 4.0], &[2], Device::CPU).unwrap();
-        let c = Tensor::from_f32(&[5.0, 6.0], &[2], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap();
+        let b = Tensor::from_f32(&[3.0, 4.0], &[2], test_device()).unwrap();
+        let c = Tensor::from_f32(&[5.0, 6.0], &[2], test_device()).unwrap();
 
         // Stack along dim 0: [3, 2]
         let s = Tensor::stack(&[&a, &b, &c], 0).unwrap();
@@ -1830,22 +1909,22 @@ mod tests {
 
     #[test]
     fn test_ones_from_f64_from_i64() {
-        let o = Tensor::ones(&[2, 3], TensorOptions::default()).unwrap();
+        let o = Tensor::ones(&[2, 3], test_opts()).unwrap();
         assert_eq!(o.to_f32_vec().unwrap(), vec![1.0; 6]);
 
-        let f = Tensor::from_f64(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
+        let f = Tensor::from_f64(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
         assert_eq!(f.dtype(), DType::Float64);
         assert_eq!(f.to_f64_vec().unwrap(), vec![1.0, 2.0, 3.0]);
 
-        let i = Tensor::from_i64(&[10, 20, 30], &[3], Device::CPU).unwrap();
+        let i = Tensor::from_i64(&[10, 20, 30], &[3], test_device()).unwrap();
         assert_eq!(i.dtype(), DType::Int64);
         assert_eq!(i.to_i64_vec().unwrap(), vec![10, 20, 30]);
     }
 
     #[test]
     fn test_sub_mul_div() {
-        let a = Tensor::from_f32(&[6.0, 8.0], &[2], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[2.0, 3.0], &[2], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[6.0, 8.0], &[2], test_device()).unwrap();
+        let b = Tensor::from_f32(&[2.0, 3.0], &[2], test_device()).unwrap();
         assert_eq!(a.sub(&b).unwrap().to_f32_vec().unwrap(), vec![4.0, 5.0]);
         assert_eq!(a.mul(&b).unwrap().to_f32_vec().unwrap(), vec![12.0, 24.0]);
         let d = a.div(&b).unwrap().to_f32_vec().unwrap();
@@ -1855,7 +1934,7 @@ mod tests {
 
     #[test]
     fn test_scalar_ops() {
-        let t = Tensor::from_f32(&[2.0, 4.0], &[2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[2.0, 4.0], &[2], test_device()).unwrap();
         assert_eq!(t.add_scalar(1.0).unwrap().to_f32_vec().unwrap(), vec![3.0, 5.0]);
         assert_eq!(t.mul_scalar(3.0).unwrap().to_f32_vec().unwrap(), vec![6.0, 12.0]);
         assert_eq!(t.neg().unwrap().to_f32_vec().unwrap(), vec![-2.0, -4.0]);
@@ -1863,7 +1942,7 @@ mod tests {
 
     #[test]
     fn test_exp_log_sqrt_abs_pow() {
-        let t = Tensor::from_f32(&[1.0, 4.0], &[2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 4.0], &[2], test_device()).unwrap();
         let e = t.exp().unwrap().to_f32_vec().unwrap();
         assert!((e[0] - 1.0_f32.exp()).abs() < 1e-5);
 
@@ -1873,7 +1952,7 @@ mod tests {
         let s = t.sqrt().unwrap().to_f32_vec().unwrap();
         assert!((s[1] - 2.0).abs() < 1e-5);
 
-        let a = Tensor::from_f32(&[-3.0, 5.0], &[2], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[-3.0, 5.0], &[2], test_device()).unwrap();
         assert_eq!(a.abs().unwrap().to_f32_vec().unwrap(), vec![3.0, 5.0]);
 
         let p = t.pow_scalar(2.0).unwrap().to_f32_vec().unwrap();
@@ -1883,14 +1962,14 @@ mod tests {
 
     #[test]
     fn test_clamp() {
-        let t = Tensor::from_f32(&[-1.0, 0.5, 2.0], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[-1.0, 0.5, 2.0], &[3], test_device()).unwrap();
         let c = t.clamp(0.0, 1.0).unwrap().to_f32_vec().unwrap();
         assert_eq!(c, vec![0.0, 0.5, 1.0]);
     }
 
     #[test]
     fn test_sum_dim_mean_dim() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
         let s = t.sum_dim(1, false).unwrap().to_f32_vec().unwrap();
         assert_eq!(s, vec![3.0, 7.0]);
 
@@ -1901,14 +1980,14 @@ mod tests {
 
     #[test]
     fn test_norm() {
-        let t = Tensor::from_f32(&[3.0, 4.0], &[2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[3.0, 4.0], &[2], test_device()).unwrap();
         let n = t.norm().unwrap().item().unwrap();
         assert!((n - 5.0).abs() < 1e-5);
     }
 
     #[test]
     fn test_reshape_transpose_narrow_select() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], test_device()).unwrap();
         let r = t.reshape(&[3, 2]).unwrap();
         assert_eq!(r.shape(), vec![3, 2]);
         assert_eq!(r.to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -1928,11 +2007,11 @@ mod tests {
 
     #[test]
     fn test_permute_expand() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], test_device()).unwrap();
         let p = t.permute(&[1, 0]).unwrap();
         assert_eq!(p.shape(), vec![3, 2]);
 
-        let s = Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], Device::CPU).unwrap();
+        let s = Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], test_device()).unwrap();
         let e = s.expand(&[4, 3]).unwrap();
         assert_eq!(e.shape(), vec![4, 3]);
         let data = e.to_f32_vec().unwrap();
@@ -1941,18 +2020,18 @@ mod tests {
 
     #[test]
     fn test_cat_index_select_index_add() {
-        let a = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[3.0, 4.0, 5.0], &[3], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap();
+        let b = Tensor::from_f32(&[3.0, 4.0, 5.0], &[3], test_device()).unwrap();
         let c = a.cat(&b, 0).unwrap();
         assert_eq!(c.to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
 
-        let t = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5], Device::CPU).unwrap();
-        let idx = Tensor::from_i64(&[0, 2, 4], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5], test_device()).unwrap();
+        let idx = Tensor::from_i64(&[0, 2, 4], &[3], test_device()).unwrap();
         let sel = t.index_select(0, &idx).unwrap();
         assert_eq!(sel.to_f32_vec().unwrap(), vec![10.0, 30.0, 50.0]);
 
-        let base = Tensor::zeros(&[5], TensorOptions::default()).unwrap();
-        let src = Tensor::from_f32(&[1.0, 1.0, 1.0], &[3], Device::CPU).unwrap();
+        let base = Tensor::zeros(&[5], test_opts()).unwrap();
+        let src = Tensor::from_f32(&[1.0, 1.0, 1.0], &[3], test_device()).unwrap();
         let r = base.index_add(0, &idx, &src).unwrap();
         let data = r.to_f32_vec().unwrap();
         assert!((data[0] - 1.0).abs() < 1e-5);
@@ -1962,20 +2041,20 @@ mod tests {
 
     #[test]
     fn test_narrow_scatter_select_scatter() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4], Device::CPU).unwrap();
-        let src = Tensor::from_f32(&[10.0, 20.0], &[2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4], test_device()).unwrap();
+        let src = Tensor::from_f32(&[10.0, 20.0], &[2], test_device()).unwrap();
         let ns = t.narrow_scatter(&src, 0, 1).unwrap();
         assert_eq!(ns.to_f32_vec().unwrap(), vec![1.0, 10.0, 20.0, 4.0]);
 
-        let t2 = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], Device::CPU).unwrap();
-        let row = Tensor::from_f32(&[10.0, 20.0, 30.0], &[3], Device::CPU).unwrap();
+        let t2 = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], test_device()).unwrap();
+        let row = Tensor::from_f32(&[10.0, 20.0, 30.0], &[3], test_device()).unwrap();
         let ss = t2.select_scatter(&row, 0, 0).unwrap();
         assert_eq!(ss.to_f32_vec().unwrap(), vec![10.0, 20.0, 30.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]
     fn test_activations() {
-        let t = Tensor::from_f32(&[-1.0, 0.0, 1.0], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[-1.0, 0.0, 1.0], &[3], test_device()).unwrap();
         assert_eq!(t.relu().unwrap().to_f32_vec().unwrap(), vec![0.0, 0.0, 1.0]);
 
         let sig = t.sigmoid().unwrap().to_f32_vec().unwrap();
@@ -1991,7 +2070,7 @@ mod tests {
 
     #[test]
     fn test_softmax_log_softmax() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
         let sm = t.softmax(0).unwrap().to_f32_vec().unwrap();
         let total: f32 = sm.iter().sum();
         assert!((total - 1.0).abs() < 1e-5);
@@ -2003,8 +2082,8 @@ mod tests {
 
     #[test]
     fn test_eq_ne_tensor() {
-        let a = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[1.0, 5.0, 3.0], &[3], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
+        let b = Tensor::from_f32(&[1.0, 5.0, 3.0], &[3], test_device()).unwrap();
 
         let eq = a.eq_tensor(&b).unwrap().to_f32_vec().unwrap();
         assert_eq!(eq, vec![1.0, 0.0, 1.0]);
@@ -2015,8 +2094,8 @@ mod tests {
 
     #[test]
     fn test_gt_lt_ge_le_tensor() {
-        let a = Tensor::from_f32(&[1.0, 3.0, 2.0], &[3], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[2.0, 2.0, 2.0], &[3], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[1.0, 3.0, 2.0], &[3], test_device()).unwrap();
+        let b = Tensor::from_f32(&[2.0, 2.0, 2.0], &[3], test_device()).unwrap();
 
         assert_eq!(a.gt(&b).unwrap().to_f32_vec().unwrap(), vec![0.0, 1.0, 0.0]);
         assert_eq!(a.lt(&b).unwrap().to_f32_vec().unwrap(), vec![1.0, 0.0, 0.0]);
@@ -2026,12 +2105,12 @@ mod tests {
 
     #[test]
     fn test_sign_floor_ceil_round() {
-        let t = Tensor::from_f32(&[-2.7, 0.0, 1.3], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[-2.7, 0.0, 1.3], &[3], test_device()).unwrap();
         assert_eq!(t.sign().unwrap().to_f32_vec().unwrap(), vec![-1.0, 0.0, 1.0]);
         assert_eq!(t.floor().unwrap().to_f32_vec().unwrap(), vec![-3.0, 0.0, 1.0]);
         assert_eq!(t.ceil().unwrap().to_f32_vec().unwrap(), vec![-2.0, 0.0, 2.0]);
 
-        let r = Tensor::from_f32(&[-0.6, 0.4, 1.5], &[3], Device::CPU).unwrap();
+        let r = Tensor::from_f32(&[-0.6, 0.4, 1.5], &[3], test_device()).unwrap();
         let rv = r.round().unwrap().to_f32_vec().unwrap();
         assert!((rv[0] - (-1.0)).abs() < 1e-5);
         assert!((rv[1] - 0.0).abs() < 1e-5);
@@ -2040,20 +2119,20 @@ mod tests {
 
     #[test]
     fn test_argmin() {
-        let t = Tensor::from_f32(&[3.0, 1.0, 2.0], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[3.0, 1.0, 2.0], &[3], test_device()).unwrap();
         let idx = t.argmin(0, false).unwrap().to_i64_vec().unwrap();
         assert_eq!(idx, vec![1]);
     }
 
     #[test]
     fn test_var_std() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
         // Bessel: var = ((1-2)²+(2-2)²+(3-2)²)/2 = 1.0
         assert!((t.var().unwrap().item().unwrap() - 1.0).abs() < 1e-5);
         assert!((t.std().unwrap().item().unwrap() - 1.0).abs() < 1e-5);
 
         // dim variant: [[1,2],[3,4]] var along dim=1 = [0.5, 0.5]
-        let t2 = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], Device::CPU).unwrap();
+        let t2 = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
         let vd = t2.var_dim(1, false).unwrap().to_f32_vec().unwrap();
         assert!((vd[0] - 0.5).abs() < 1e-5);
         assert!((vd[1] - 0.5).abs() < 1e-5);
@@ -2061,7 +2140,7 @@ mod tests {
 
     #[test]
     fn test_sin_cos_reciprocal() {
-        let t = Tensor::from_f32(&[0.0, 1.0], &[2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[0.0, 1.0], &[2], test_device()).unwrap();
         let s = t.sin().unwrap().to_f32_vec().unwrap();
         assert!((s[0] - 0.0).abs() < 1e-5);
         assert!((s[1] - 1.0_f32.sin()).abs() < 1e-5);
@@ -2070,7 +2149,7 @@ mod tests {
         assert!((c[0] - 1.0).abs() < 1e-5);
         assert!((c[1] - 1.0_f32.cos()).abs() < 1e-5);
 
-        let r = Tensor::from_f32(&[2.0, 5.0], &[2], Device::CPU).unwrap();
+        let r = Tensor::from_f32(&[2.0, 5.0], &[2], test_device()).unwrap();
         let rec = r.reciprocal().unwrap().to_f32_vec().unwrap();
         assert!((rec[0] - 0.5).abs() < 1e-5);
         assert!((rec[1] - 0.2).abs() < 1e-5);
@@ -2078,12 +2157,12 @@ mod tests {
 
     #[test]
     fn test_eye_full() {
-        let eye = Tensor::eye(3, TensorOptions::default()).unwrap();
+        let eye = Tensor::eye(3, test_opts()).unwrap();
         assert_eq!(eye.shape(), vec![3, 3]);
         let data = eye.to_f32_vec().unwrap();
         assert_eq!(data, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
 
-        let f = Tensor::full(&[2, 3], 7.0, TensorOptions::default()).unwrap();
+        let f = Tensor::full(&[2, 3], 7.0, test_opts()).unwrap();
         assert_eq!(f.shape(), vec![2, 3]);
         assert_eq!(f.to_f32_vec().unwrap(), vec![7.0; 6]);
     }
@@ -2091,15 +2170,15 @@ mod tests {
     #[test]
     fn test_gather_scatter_add() {
         // gather: pick elements by index
-        let t = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0], &[2, 2], Device::CPU).unwrap();
-        let idx = Tensor::from_i64(&[1, 0, 0, 1], &[2, 2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0], &[2, 2], test_device()).unwrap();
+        let idx = Tensor::from_i64(&[1, 0, 0, 1], &[2, 2], test_device()).unwrap();
         let g = t.gather(1, &idx).unwrap().to_f32_vec().unwrap();
         assert_eq!(g, vec![20.0, 10.0, 30.0, 40.0]);
 
         // scatter_add: accumulate into base at positions
-        let base = Tensor::zeros(&[2, 3], TensorOptions::default()).unwrap();
-        let src = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], Device::CPU).unwrap();
-        let idx2 = Tensor::from_i64(&[0, 2, 1, 0], &[2, 2], Device::CPU).unwrap();
+        let base = Tensor::zeros(&[2, 3], test_opts()).unwrap();
+        let src = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
+        let idx2 = Tensor::from_i64(&[0, 2, 1, 0], &[2, 2], test_device()).unwrap();
         let sa = base.scatter_add(1, &idx2, &src).unwrap();
         let data = sa.to_f32_vec().unwrap();
         // Row 0: pos 0 += 1.0, pos 2 += 2.0 → [1, 0, 2]
@@ -2112,7 +2191,7 @@ mod tests {
 
     #[test]
     fn test_topk_sort() {
-        let t = Tensor::from_f32(&[3.0, 1.0, 4.0, 1.0, 5.0], &[5], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[3.0, 1.0, 4.0, 1.0, 5.0], &[5], test_device()).unwrap();
         let (vals, idxs) = t.topk(3, 0, true, true).unwrap();
         assert_eq!(vals.to_f32_vec().unwrap(), vec![5.0, 4.0, 3.0]);
         let idx_data = idxs.to_i64_vec().unwrap();
@@ -2126,14 +2205,14 @@ mod tests {
 
     #[test]
     fn test_chunk_repeat_pad() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6], test_device()).unwrap();
         let chunks = t.chunk(3, 0).unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].to_f32_vec().unwrap(), vec![1.0, 2.0]);
         assert_eq!(chunks[1].to_f32_vec().unwrap(), vec![3.0, 4.0]);
         assert_eq!(chunks[2].to_f32_vec().unwrap(), vec![5.0, 6.0]);
 
-        let s = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
+        let s = Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap();
         let rep = s.repeat(&[3]).unwrap();
         assert_eq!(rep.to_f32_vec().unwrap(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
 
@@ -2144,7 +2223,7 @@ mod tests {
 
     #[test]
     fn test_zeros_like_ones_like() {
-        let t = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap();
         let zl = Tensor::zeros_like(&t).unwrap();
         assert_eq!(zl.to_f32_vec().unwrap(), vec![0.0, 0.0]);
         assert_eq!(zl.dtype(), DType::Float32);
@@ -2155,7 +2234,7 @@ mod tests {
 
     #[test]
     fn test_unsqueeze_many() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
         let u = t.unsqueeze_many(&[1, 2]).unwrap();
         assert_eq!(u.shape(), vec![3, 1, 1]);
         // Should match sequential unsqueeze
@@ -2166,8 +2245,8 @@ mod tests {
 
     #[test]
     fn test_meshgrid() {
-        let a = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
-        let b = Tensor::from_f32(&[4.0, 5.0], &[2], Device::CPU).unwrap();
+        let a = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
+        let b = Tensor::from_f32(&[4.0, 5.0], &[2], test_device()).unwrap();
         let grids = Tensor::meshgrid(&[&a, &b]).unwrap();
         assert_eq!(grids.len(), 2);
         assert_eq!(grids[0].shape(), vec![3, 2]);
@@ -2181,8 +2260,8 @@ mod tests {
     #[test]
     fn test_cdist() {
         // Two 2D points: [0,0] and [3,4] -> distance = 5
-        let x = Tensor::from_f32(&[0.0, 0.0], &[1, 1, 2], Device::CPU).unwrap();
-        let y = Tensor::from_f32(&[3.0, 4.0], &[1, 1, 2], Device::CPU).unwrap();
+        let x = Tensor::from_f32(&[0.0, 0.0], &[1, 1, 2], test_device()).unwrap();
+        let y = Tensor::from_f32(&[3.0, 4.0], &[1, 1, 2], test_device()).unwrap();
         let d = x.cdist(&y).unwrap();
         assert_eq!(d.shape(), vec![1, 1, 1]);
         assert!((d.item().unwrap() - 5.0).abs() < 1e-4);
@@ -2191,16 +2270,16 @@ mod tests {
     #[test]
     fn test_cdist_p1() {
         // L1: |3| + |4| = 7
-        let x = Tensor::from_f32(&[0.0, 0.0], &[1, 1, 2], Device::CPU).unwrap();
-        let y = Tensor::from_f32(&[3.0, 4.0], &[1, 1, 2], Device::CPU).unwrap();
+        let x = Tensor::from_f32(&[0.0, 0.0], &[1, 1, 2], test_device()).unwrap();
+        let y = Tensor::from_f32(&[3.0, 4.0], &[1, 1, 2], test_device()).unwrap();
         let d = x.cdist_p(&y, 1.0).unwrap();
         assert!((d.item().unwrap() - 7.0).abs() < 1e-4);
     }
 
     #[test]
     fn test_from_i64_device() {
-        let t = Tensor::from_i64(&[1, 2, 3], &[3], Device::CPU).unwrap();
-        assert_eq!(t.device(), Device::CPU);
+        let t = Tensor::from_i64(&[1, 2, 3], &[3], test_device()).unwrap();
+        assert_eq!(t.device(), test_device());
         assert_eq!(t.dtype(), DType::Int64);
         assert_eq!(t.to_i64_vec().unwrap(), vec![1, 2, 3]);
     }
@@ -2226,10 +2305,10 @@ mod tests {
     #[test]
     fn test_adam_step_basic() {
         // Basic smoke test for the fused adam_step at tensor level
-        let param = Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap();
-        let grad = Tensor::from_f32(&[0.5, 0.5], &[2], Device::CPU).unwrap();
-        let m = Tensor::zeros(&[2], TensorOptions::default()).unwrap();
-        let v = Tensor::zeros(&[2], TensorOptions::default()).unwrap();
+        let param = Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap();
+        let grad = Tensor::from_f32(&[0.5, 0.5], &[2], test_device()).unwrap();
+        let m = Tensor::zeros(&[2], test_opts()).unwrap();
+        let v = Tensor::zeros(&[2], test_opts()).unwrap();
 
         param.adam_step(&grad, &m, &v, 0.001, 0.9, 0.999, 1e-8, 0.0, 1).unwrap();
 
