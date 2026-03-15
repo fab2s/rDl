@@ -253,19 +253,21 @@ Save and restore model parameters using named checkpoints:
 // Save (parameters + buffers like BatchNorm running stats)
 let named = model.named_parameters();
 let buffers = model.named_buffers();
-save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
+let hash = Some(model.structural_hash()); // validates architecture on load
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers, hash)?;
 
 // Load
 let named = model.named_parameters();
 let buffers = model.named_buffers();
-let report = load_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
+let hash = Some(model.structural_hash());
+let report = load_checkpoint_file("/tmp/model.fdl", &named, &buffers, hash)?;
 ```
 
 The `io::Write` / `io::Read` variants are also available:
 
 ```rust
-save_checkpoint(&mut writer, &named, &buffers)?;
-let report = load_checkpoint(&mut reader, &named, &buffers)?;
+save_checkpoint(&mut writer, &named, &buffers, hash)?;
+let report = load_checkpoint(&mut reader, &named, &buffers, hash)?;
 ```
 
 ### Partial loading (transfer learning)
@@ -276,12 +278,13 @@ Named checkpoints match by qualified name, so you can load a subset of parameter
 // Save with qualified names
 let named = model.named_parameters();
 let buffers = model.named_buffers();
-save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers, Some(model.structural_hash()))?;
 
 // Load into a different model — matches by name
+// Pass None for hash to skip architecture validation (architectures differ)
 let new_named = new_model.named_parameters();
 let new_buffers = new_model.named_buffers();
-let report = load_checkpoint_file("/tmp/model.fdl", &new_named, &new_buffers)?;
+let report = load_checkpoint_file("/tmp/model.fdl", &new_named, &new_buffers, None)?;
 
 println!("loaded: {:?}", report.loaded);   // matched and loaded
 println!("skipped: {:?}", report.skipped); // in checkpoint, not in model

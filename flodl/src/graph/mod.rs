@@ -27,12 +27,13 @@ pub mod halt;
 pub mod reshape;
 pub mod state;
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
 use indexmap::IndexMap;
+use sha2::{Sha256, Digest};
 
 use node::*;
 use crate::autograd::Variable;
@@ -121,9 +122,13 @@ pub struct Graph {
     // Step/epoch counters
     step_count: Cell<usize>,
     epoch_count: Cell<usize>,
+    // Identity: label + structural hash
+    label: Option<String>,
+    structural_hash_cache: OnceCell<String>,
 }
 
 impl Graph {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
         mut node_map: IndexMap<String, Node>,
         edges: Vec<Edge>,
@@ -132,6 +137,7 @@ impl Graph {
         tags: HashMap<String, NodeRef>,
         forward_refs: Vec<ForwardRefSpec>,
         tag_groups: HashMap<String, Vec<String>>,
+        label: Option<String>,
     ) -> Result<Self> {
         // Set up forward-reference state buffers and wire state read nodes
         let mut state = Vec::with_capacity(forward_refs.len());
@@ -251,6 +257,8 @@ impl Graph {
             training_start: Cell::new(0.0),
             step_count: Cell::new(0),
             epoch_count: Cell::new(0),
+            label,
+            structural_hash_cache: OnceCell::new(),
         })
     }
 
@@ -674,10 +682,125 @@ impl Graph {
 
         result
     }
+
+    /// Human-readable label set via `FlowBuilder::label()`.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// Full 64-character hex structural hash (computed lazily, cached).
+    pub fn structural_hash(&self) -> &str {
+        self.structural_hash_cache.get_or_init(|| self.compute_structural_hash())
+    }
+
+    /// First 8 characters of the structural hash.
+    pub fn short_hash(&self) -> &str {
+        &self.structural_hash()[..8]
+    }
+
+    fn compute_structural_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+
+        // 1. Nodes in topological order
+        for &ni in &self.order {
+            let node = &self.nodes[ni];
+            hasher.update(node.id.as_bytes());
+            hasher.update(b"\0");
+
+            if let Some(ref module) = node.module {
+                hasher.update(module.name().as_bytes());
+                hasher.update(b"\0");
+
+                // Sorted parameters
+                let mut params: Vec<_> = module.parameters().into_iter()
+                    .map(|p| (p.name.clone(), p.variable.shape()))
+                    .collect();
+                params.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, shape) in &params {
+                    hasher.update(b"P");
+                    hasher.update(name.as_bytes());
+                    hasher.update(b"\0");
+                    for &dim in shape {
+                        hasher.update(dim.to_le_bytes());
+                    }
+                }
+
+                // Sorted buffers
+                let mut bufs: Vec<_> = module.buffers().into_iter()
+                    .map(|b| (b.name.clone(), b.shape()))
+                    .collect();
+                bufs.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, shape) in &bufs {
+                    hasher.update(b"B");
+                    hasher.update(name.as_bytes());
+                    hasher.update(b"\0");
+                    for &dim in shape {
+                        hasher.update(dim.to_le_bytes());
+                    }
+                }
+
+                // Nested graph hash
+                if let Some(nested_hash) = module.structural_hash() {
+                    hasher.update(b"G");
+                    hasher.update(nested_hash.as_bytes());
+                }
+            }
+        }
+
+        // 2. Edges
+        hasher.update(b"EDGES");
+        for edge in &self.edges {
+            hasher.update(edge.from_node.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(edge.from_port.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(edge.to_node.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(edge.to_port.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // 3. Tags (sorted)
+        hasher.update(b"TAGS");
+        let mut tags: Vec<_> = self.tag_names.iter().collect();
+        tags.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, (node_idx, port_idx)) in &tags {
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update((*node_idx as u64).to_le_bytes());
+            hasher.update((*port_idx as u64).to_le_bytes());
+        }
+
+        // 4. Input/output ports
+        hasher.update(b"INPUTS");
+        for port in &self.inputs {
+            hasher.update(port.name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(port.node_id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(port.port.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.update(b"OUTPUTS");
+        for port in &self.outputs {
+            hasher.update(port.name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(port.node_id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(port.port.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        format!("{:064x}", hasher.finalize())
+    }
 }
 
 impl Module for Graph {
     fn name(&self) -> &str { "graph" }
+
+    fn structural_hash(&self) -> Option<String> {
+        Some(self.structural_hash().to_string())
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.forward_impl(std::slice::from_ref(input))
@@ -2670,5 +2793,84 @@ mod tests {
             .collect();
         assert_eq!(untagged.len(), 2, "untagged node should have 2 params");
         assert!(untagged[0].contains('/'), "should have prefix/name format: {}", untagged[0]);
+    }
+
+    // --- Structural hash tests ---
+
+    #[test]
+    fn test_structural_hash_deterministic() {
+        let g1 = FlowBuilder::from(Linear::new(4, 8).unwrap())
+            .through(ReLU::new())
+            .through(Linear::new(8, 2).unwrap())
+            .build()
+            .unwrap();
+
+        let g2 = FlowBuilder::from(Linear::new(4, 8).unwrap())
+            .through(ReLU::new())
+            .through(Linear::new(8, 2).unwrap())
+            .build()
+            .unwrap();
+
+        assert_eq!(g1.structural_hash(), g2.structural_hash());
+    }
+
+    #[test]
+    fn test_structural_hash_differs() {
+        let g1 = FlowBuilder::from(Linear::new(4, 8).unwrap())
+            .through(Linear::new(8, 2).unwrap())
+            .build()
+            .unwrap();
+
+        // Different architecture: different hidden size
+        let g2 = FlowBuilder::from(Linear::new(4, 16).unwrap())
+            .through(Linear::new(16, 2).unwrap())
+            .build()
+            .unwrap();
+
+        assert_ne!(g1.structural_hash(), g2.structural_hash());
+    }
+
+    #[test]
+    fn test_short_hash_length() {
+        let g = FlowBuilder::from(Linear::new(2, 3).unwrap())
+            .build()
+            .unwrap();
+
+        assert_eq!(g.structural_hash().len(), 64);
+        assert_eq!(g.short_hash().len(), 8);
+        assert!(g.structural_hash().starts_with(g.short_hash()));
+    }
+
+    #[test]
+    fn test_label_default_none() {
+        let g = FlowBuilder::from(Linear::new(2, 3).unwrap())
+            .build()
+            .unwrap();
+        assert!(g.label().is_none());
+    }
+
+    #[test]
+    fn test_label_set() {
+        let g = FlowBuilder::from(Linear::new(2, 3).unwrap())
+            .label("my-model")
+            .build()
+            .unwrap();
+        assert_eq!(g.label(), Some("my-model"));
+    }
+
+    #[test]
+    fn test_label_does_not_affect_hash() {
+        let g1 = FlowBuilder::from(Linear::new(4, 8).unwrap())
+            .through(Linear::new(8, 2).unwrap())
+            .build()
+            .unwrap();
+
+        let g2 = FlowBuilder::from(Linear::new(4, 8).unwrap())
+            .through(Linear::new(8, 2).unwrap())
+            .label("different-label")
+            .build()
+            .unwrap();
+
+        assert_eq!(g1.structural_hash(), g2.structural_hash());
     }
 }

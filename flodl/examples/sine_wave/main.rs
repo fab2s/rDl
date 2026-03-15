@@ -113,7 +113,7 @@ fn main() -> Result<()> {
     let path = "sine_model.fdl";
     let named = model.named_parameters();
     let named_bufs = model.named_buffers();
-    save_checkpoint_file(path, &named, &named_bufs)?;
+    save_checkpoint_file(path, &named, &named_bufs, Some(model.structural_hash()))?;
     println!("Checkpoint saved to {}", path);
 
     // Rebuild architecture and load weights.
@@ -126,7 +126,7 @@ fn main() -> Result<()> {
 
     let named2 = model2.named_parameters();
     let named_bufs2 = model2.named_buffers();
-    load_checkpoint_file(path, &named2, &named_bufs2)?;
+    load_checkpoint_file(path, &named2, &named_bufs2, Some(model2.structural_hash()))?;
     model2.set_training(false);
 
     // Verify loaded model produces the same output.

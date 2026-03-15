@@ -103,6 +103,9 @@ pub struct Monitor {
     server: Option<server::DashboardServer>,
     save_html: Option<String>,
     svg_snapshot: Option<String>,
+    metadata: Option<serde_json::Value>,
+    graph_label: Option<String>,
+    graph_hash: Option<String>,
 }
 
 impl Monitor {
@@ -116,6 +119,9 @@ impl Monitor {
             server: None,
             save_html: None,
             svg_snapshot: None,
+            metadata: None,
+            graph_label: None,
+            graph_hash: None,
         }
     }
 
@@ -145,11 +151,18 @@ impl Monitor {
         self.save_html = Some(path.to_string());
     }
 
+    /// Attach arbitrary JSON metadata (hyperparameters, config, etc.)
+    /// that will be included in the HTML archive.
+    pub fn set_metadata(&mut self, meta: serde_json::Value) {
+        self.metadata = Some(meta);
+    }
+
     /// Display the graph architecture in the dashboard (and HTML archive).
     ///
     /// Generates an SVG from the graph. Requires Graphviz (`dot`) to be
     /// installed. Silently does nothing if SVG generation fails.
     pub fn watch(&mut self, graph: &Graph) {
+        self.capture_graph_identity(graph);
         if let Ok(svg_bytes) = graph.svg(None) {
             self.set_svg(&String::from_utf8_lossy(&svg_bytes));
         }
@@ -161,11 +174,12 @@ impl Monitor {
     /// `graph.enable_profiling()` and run at least one forward pass before
     /// calling this, otherwise falls back to the plain graph SVG.
     pub fn watch_profiled(&mut self, graph: &Graph) {
+        self.capture_graph_identity(graph);
         // Try profiled SVG first, fall back to plain
         if let Ok(svg_bytes) = graph.svg_with_profile(None) {
             self.set_svg(&String::from_utf8_lossy(&svg_bytes));
-        } else {
-            self.watch(graph);
+        } else if let Ok(svg_bytes) = graph.svg(None) {
+            self.set_svg(&String::from_utf8_lossy(&svg_bytes));
         }
     }
 
@@ -174,6 +188,17 @@ impl Monitor {
         self.svg_snapshot = Some(svg.to_string());
         if let Some(ref srv) = self.server {
             srv.set_svg(svg.to_string());
+        }
+    }
+
+    fn capture_graph_identity(&mut self, graph: &Graph) {
+        self.graph_label = graph.label().map(|s| s.to_string());
+        self.graph_hash = Some(graph.structural_hash().to_string());
+        if let Some(ref srv) = self.server {
+            srv.set_label_hash(
+                self.graph_label.clone(),
+                self.graph_hash.clone(),
+            );
         }
     }
 
@@ -414,14 +439,35 @@ impl Monitor {
             None => "null".to_string(),
         };
 
+        // Label, hash, and metadata for archive
+        let label_js = match &self.graph_label {
+            Some(l) => format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")),
+            None => "null".to_string(),
+        };
+        let hash_js = match &self.graph_hash {
+            Some(h) => format!("\"{}\"", h),
+            None => "null".to_string(),
+        };
+        let meta_js = match &self.metadata {
+            Some(v) => {
+                v.to_string()
+                    .replace("</script", "<\\/script")
+                    .replace("</SCRIPT", "<\\/SCRIPT")
+            }
+            None => "null".to_string(),
+        };
+
         let total_time = self.start_time.elapsed().as_secs_f64();
 
         // Inject archive constants before the main <script> tag
         let archive_block = format!(
-            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\n</script>",
+            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\n</script>",
             data_json,
             svg_js,
             format_eta(total_time),
+            label_js,
+            hash_js,
+            meta_js,
         );
 
         let template = include_str!("dashboard.html");
@@ -609,5 +655,49 @@ mod tests {
         assert_eq!(digit_count(10), 2);
         assert_eq!(digit_count(100), 3);
         assert_eq!(digit_count(999), 3);
+    }
+
+    #[test]
+    fn test_watch_captures_label_hash() {
+        use crate::*;
+
+        let model = FlowBuilder::from(Linear::new(2, 4).unwrap())
+            .label("test-model")
+            .through(Linear::new(4, 2).unwrap())
+            .build()
+            .unwrap();
+
+        let mut monitor = Monitor::new(5);
+        monitor.watch(&model);
+
+        assert_eq!(monitor.graph_label.as_deref(), Some("test-model"));
+        assert!(monitor.graph_hash.is_some());
+        assert_eq!(monitor.graph_hash.as_ref().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn test_build_archive_with_metadata() {
+        use crate::*;
+
+        let model = FlowBuilder::from(Linear::new(2, 4).unwrap())
+            .label("meta-test")
+            .through(Linear::new(4, 2).unwrap())
+            .build()
+            .unwrap();
+
+        let mut monitor = Monitor::new(5);
+        monitor.watch(&model);
+        monitor.set_metadata(serde_json::json!({
+            "lr": 0.001,
+            "batch_size": 32
+        }));
+        monitor.log(0, Duration::from_millis(50), &[("loss", 1.0)]);
+
+        let html = monitor.build_archive().unwrap();
+        assert!(html.contains("ARCHIVE_LABEL"));
+        assert!(html.contains("ARCHIVE_HASH"));
+        assert!(html.contains("ARCHIVE_META"));
+        assert!(html.contains("meta-test"));
+        assert!(html.contains("batch_size"));
     }
 }

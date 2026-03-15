@@ -64,6 +64,8 @@ pub struct FlowBuilder {
     pub(super) forward_refs: Vec<ForwardRefSpec>,
     /// Tag group name → suffixed tag names (from TagGroup).
     pub(super) tag_groups: HashMap<String, Vec<String>>,
+    /// Human-readable label for dashboard display.
+    label: Option<String>,
 }
 
 impl Default for FlowBuilder {
@@ -104,6 +106,7 @@ impl FlowBuilder {
             pending: HashMap::new(),
             forward_refs: Vec::new(),
             tag_groups: HashMap::new(),
+            label: None,
         };
 
         let node_ref = fb.add_module(module);
@@ -117,6 +120,13 @@ impl FlowBuilder {
         fb.on_target = Some(node_ref.clone());
         fb.current = vec![node_ref];
         fb
+    }
+
+    /// Set a human-readable label for the graph (displayed in dashboard).
+    /// Does not affect the structural hash or `Module::name()`.
+    pub fn label(mut self, name: &str) -> Self {
+        self.label = Some(name.to_string());
+        self
     }
 
     /// Chain a module sequentially: `stream → module → stream`.
@@ -525,6 +535,7 @@ impl FlowBuilder {
             self.taps,
             self.forward_refs,
             self.tag_groups,
+            self.label,
         )
     }
 

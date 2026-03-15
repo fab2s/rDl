@@ -49,12 +49,14 @@ use flodl::{save_checkpoint_file, load_checkpoint_file};
 // Save (parameters + buffers like BatchNorm running stats)
 let named = model.named_parameters();
 let buffers = model.named_buffers();
-save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
+let hash = Some(model.structural_hash()); // embeds architecture identity
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers, hash)?;
 
-// Load
+// Load — validates architecture matches before loading weights
 let named = model.named_parameters();
 let buffers = model.named_buffers();
-let report = load_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
+let hash = Some(model.structural_hash());
+let report = load_checkpoint_file("/tmp/model.fdl", &named, &buffers, hash)?;
 ```
 
 `load_checkpoint_file` validates names and shapes for both parameters and buffers.
@@ -80,12 +82,13 @@ use flodl::*;
 // Save with qualified names from a Graph
 let named = model.named_parameters();
 let buffers = model.named_buffers();
-save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers, Some(model.structural_hash()))?;
 
 // Load into a different model — only matching names transfer
+// Pass None for hash since architectures differ
 let new_named = new_model.named_parameters();
 let new_buffers = new_model.named_buffers();
-let report = load_checkpoint_file("/tmp/model.fdl", &new_named, &new_buffers)?;
+let report = load_checkpoint_file("/tmp/model.fdl", &new_named, &new_buffers, None)?;
 
 println!("loaded:  {:?}", report.loaded);   // matched and loaded
 println!("skipped: {:?}", report.skipped);  // in checkpoint, not in model
@@ -126,7 +129,7 @@ for epoch in 0..num_epochs {
         let path = format!("/tmp/checkpoint_epoch_{}.fdl", epoch + 1);
         let named = model.named_parameters();
         let buffers = model.named_buffers();
-        save_checkpoint_file(&path, &named, &buffers)?;
+        save_checkpoint_file(&path, &named, &buffers, Some(model.structural_hash()))?;
     }
 }
 ```
@@ -342,7 +345,7 @@ for epoch in 0..100 {
 g.set_training(false);
 let named = model.named_parameters();
 let buffers = model.named_buffers();
-save_checkpoint_file("/tmp/model.fdl", &named, &buffers)?;
+save_checkpoint_file("/tmp/model.fdl", &named, &buffers, Some(model.structural_hash()))?;
 ```
 
 ---

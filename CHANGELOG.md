@@ -8,18 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Graph identity**: `Graph::structural_hash()` — deterministic SHA-256 hash of graph topology, module names, and parameter/buffer shapes. Any architecture change produces a different hash. `Graph::short_hash()` returns the first 8 chars. `FlowBuilder::label()` sets a human-readable name (does not affect hash).
+- **Checkpoint architecture validation**: Checkpoint format v1 embeds a 32-byte structural hash. `load_checkpoint` / `load_checkpoint_file` accept an optional hash and error on architecture mismatch.
+- **Dashboard metadata**: `Monitor::set_metadata(serde_json::Value)` attaches hyperparameters/config to the HTML archive. `watch()` / `watch_profiled()` capture graph label and hash. Dashboard header shows `"floDl — {label} [{hash8}]"`.
 - **Parameter freezing**: `Parameter::freeze()`, `unfreeze()`, `is_frozen()` — disable/enable gradient tracking per parameter. Optimizers automatically skip frozen params (no grad). `Parameter::to_device()` now preserves frozen state.
 - **Named checkpoints**: `Graph::named_parameters()` and `named_buffers()` return qualified names (`"tag/weight"` or `"node_id/running_mean"`). `save_checkpoint` / `load_checkpoint` persist both parameters and buffers (e.g., BatchNorm running stats), matching by name for partial loading. `LoadReport` reports what was loaded, skipped, and missing.
 - **Optimizer parameter groups**: `Adam::with_groups()`, `SGD::with_groups()`, `AdamW::with_groups()` — builder API for per-group learning rates. `Optimizer::set_group_lr()` adjusts a single group; `set_lr()` updates all groups. Groups are persisted through `Stateful` save/load.
-
-### Changed
-- `Variable::set_requires_grad()` added — replaces inner data handle while preserving shared `Rc<RefCell>` visibility.
-- `Optimizer` trait now includes `set_group_lr()` with a default fallback to `set_lr()`.
-- Optimizer `Stateful` format extended with group metadata (backward-compatible: old checkpoints load with zero groups).
-
-## [0.1.0] - 2026-03-13
-
-Initial release. Rust port of [goDl](https://github.com/fab2s/goDl).
 
 ### Core Stack
 - **Tensor**: Owned RAII tensors with Drop, ~72 operations. CPU and CUDA (feature-gated).
@@ -40,14 +34,14 @@ Initial release. Rust port of [goDl](https://github.com/fab2s/goDl).
 - LR scheduling: StepDecay, CosineScheduler, WarmupScheduler (composable), PlateauScheduler.
 - Mixed precision: Float16/BFloat16 dtype casting, GradScaler for loss scaling.
 - Gradient clipping: clip_grad_norm, clip_grad_value.
-- Checkpointing: save_checkpoint/load_checkpoint (named binary format with LoadReport, persists parameters + buffers, file or io::Write).
+- Checkpointing: save_checkpoint/load_checkpoint (named binary format with LoadReport, persists parameters + buffers, structural hash validation, file or io::Write).
 - Weight initialization: kaiming_uniform/normal, xavier_uniform/normal.
 
 ### Training Monitor
 - Human-readable ETA with adaptive formatting (hours/minutes/seconds/milliseconds).
 - System resource tracking: CPU, RAM, GPU utilization (NVML), VRAM usage.
 - Live web dashboard via embedded HTTP server with Server-Sent Events.
-- Dashboard features: real-time training curves, resource usage charts, epoch log, graph SVG.
+- Dashboard features: real-time training curves, resource usage charts, epoch log, graph SVG, label/hash header, metadata card.
 - CSV and log file export.
 
 ### Observation & Visualization
@@ -64,7 +58,7 @@ Initial release. Rust port of [goDl](https://github.com/fab2s/goDl).
 - **Build**: Makefile with cpu/cuda targets (build, test, clippy, shell).
 
 ### Testing
-- 243 library tests + 15 showcase tests.
+- 290 library tests + 15 showcase tests.
 - Zero clippy warnings.
 - Autograd numerical gradient checks.
 - Module-level gradient checks.
@@ -73,7 +67,7 @@ Initial release. Rust port of [goDl](https://github.com/fab2s/goDl).
 - **Deterministic VRAM**: Rust's Drop trait replaces goDl's entire 5-phase memory management.
 - **No GC overhead**: No runtime.KeepAlive, no pending-free queues, no VRAM budget heuristics.
 - **Variable**: `Rc<RefCell<VariableInner>>` for cheap Clone with interior mutability.
-- **Module trait**: single-input forward + optional NamedInputModule for multi-input.
+- **Module trait**: single-input forward + optional NamedInputModule for multi-input. `structural_hash()` for architecture identity.
 - **Graph-as-Module**: Graph implements Module for hierarchical composition.
 - **NamedInputModule on routers**: SoftmaxRouter and SigmoidRouter sum refs into input before projection.
 - **Native FFI ops**: flodl_max, flodl_norm, flodl_cuda_mem_info, flodl_cuda_utilization.

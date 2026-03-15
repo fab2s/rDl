@@ -18,6 +18,8 @@ pub(crate) enum ServerMsg {
     Epoch(String),
     /// Updated SVG graph.
     SetSvg(String),
+    /// Graph label and structural hash for dashboard header.
+    SetLabelHash(Option<String>, Option<String>),
     /// Clean shutdown.
     Shutdown,
 }
@@ -37,6 +39,10 @@ struct SharedState {
     svg: Mutex<Option<String>>,
     /// SSE client senders — each connected SSE client has a channel.
     sse_senders: Mutex<Vec<Sender<String>>>,
+    /// Graph label for dashboard header.
+    label: Mutex<Option<String>>,
+    /// Structural hash for dashboard header.
+    hash: Mutex<Option<String>>,
 }
 
 impl DashboardServer {
@@ -49,6 +55,8 @@ impl DashboardServer {
             epochs: Mutex::new(Vec::new()),
             svg: Mutex::new(None),
             sse_senders: Mutex::new(Vec::new()),
+            label: Mutex::new(None),
+            hash: Mutex::new(None),
         });
 
         // Message handler thread: receives from Monitor, broadcasts to SSE clients
@@ -86,6 +94,11 @@ impl DashboardServer {
         let _ = self.tx.send(ServerMsg::SetSvg(svg));
     }
 
+    /// Set graph label and structural hash for the dashboard header.
+    pub fn set_label_hash(&self, label: Option<String>, hash: Option<String>) {
+        let _ = self.tx.send(ServerMsg::SetLabelHash(label, hash));
+    }
+
     /// Signal shutdown and wait for the message handler to finish.
     pub fn shutdown(&mut self) {
         let _ = self.tx.send(ServerMsg::Shutdown);
@@ -107,6 +120,10 @@ fn handle_messages(rx: Receiver<ServerMsg>, state: Arc<SharedState>) {
             }
             ServerMsg::SetSvg(svg) => {
                 *state.svg.lock().unwrap() = Some(svg);
+            }
+            ServerMsg::SetLabelHash(label, hash) => {
+                *state.label.lock().unwrap() = label;
+                *state.hash.lock().unwrap() = hash;
             }
             ServerMsg::Shutdown => {
                 let event = "event: complete\ndata: {}\n\n".to_string();
@@ -132,7 +149,7 @@ fn handle_connection(mut stream: TcpStream, state: &SharedState) {
     let path = parse_path(&request);
 
     match path {
-        "/" => serve_html(&mut stream),
+        "/" => serve_html(&mut stream, state),
         "/events" => serve_sse(stream, state),
         "/graph.svg" => serve_svg(&mut stream, state),
         "/api/history" => serve_history(&mut stream, state),
@@ -151,12 +168,33 @@ fn parse_path(request: &str) -> &str {
         .unwrap_or("/")
 }
 
-/// Serve the dashboard HTML.
-fn serve_html(stream: &mut TcpStream) {
+/// Serve the dashboard HTML, injecting label/hash constants if set.
+fn serve_html(stream: &mut TcpStream, state: &SharedState) {
+    let label = state.label.lock().unwrap();
+    let hash = state.hash.lock().unwrap();
+
+    let body = if label.is_some() || hash.is_some() {
+        let label_js = match &*label {
+            Some(l) => format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")),
+            None => "null".to_string(),
+        };
+        let hash_js = match &*hash {
+            Some(h) => format!("\"{}\"", h),
+            None => "null".to_string(),
+        };
+        let inject = format!(
+            "<script>const LIVE_LABEL={};const LIVE_HASH={};</script>\n",
+            label_js, hash_js,
+        );
+        DASHBOARD_HTML.replace("<script>", &format!("{}<script>", inject))
+    } else {
+        DASHBOARD_HTML.to_string()
+    };
+
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
-        DASHBOARD_HTML.len(),
-        DASHBOARD_HTML,
+        body.len(),
+        body,
     );
     let _ = stream.write_all(response.as_bytes());
 }

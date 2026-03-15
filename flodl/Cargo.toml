@@ -18,6 +18,8 @@ cuda = ["flodl-sys/cuda"]
 flodl-sys = { path = "../flodl-sys" }
 indexmap = "2"
 flate2 = "1"
+sha2 = "0.10"
+serde_json = "1"
 
 [package.metadata.docs.rs]
 # docs.rs has no libtorch — build with this cfg so the -sys build.rs can skip compilation.

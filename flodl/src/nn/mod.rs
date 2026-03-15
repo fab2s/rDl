@@ -143,6 +143,11 @@ pub trait Module {
     /// Override in types that implement NamedInputModule.
     fn as_named_input(&self) -> Option<&dyn NamedInputModule> { None }
 
+    /// Return a structural hash identifying this module's architecture.
+    /// Override in composite modules (Graph) that compute a deterministic
+    /// hash from their topology and parameter shapes.
+    fn structural_hash(&self) -> Option<String> { None }
+
     /// Reset per-forward state. Called by loops before iterating to clear
     /// stale tensors whose grad_fns may reference freed saved tensors.
     /// Override in stateful modules (e.g., attention with location state).
@@ -1076,7 +1081,7 @@ mod tests {
             .map(|p| (format!("linear/{}", p.name), p))
             .collect();
         let mut buf = Vec::new();
-        checkpoint::save_checkpoint(&mut buf, &named, &[]).unwrap();
+        checkpoint::save_checkpoint(&mut buf, &named, &[], None).unwrap();
 
         // Create new model, load by name
         let model2 = Linear::new(3, 2).unwrap();
@@ -1084,7 +1089,7 @@ mod tests {
             .map(|p| (format!("linear/{}", p.name), p))
             .collect();
         let mut cursor = std::io::Cursor::new(&buf);
-        let report = checkpoint::load_checkpoint(&mut cursor, &named2, &[]).unwrap();
+        let report = checkpoint::load_checkpoint(&mut cursor, &named2, &[], None).unwrap();
 
         assert_eq!(report.loaded.len(), 2);
         assert!(report.missing.is_empty());

@@ -814,8 +814,8 @@ fn main() {
     let path = "/tmp/flodl_showcase_checkpoint.fdl";
     let named = g.named_parameters();
     let named_bufs = g.named_buffers();
-    save_checkpoint_file(path, &named, &named_bufs).expect("save failed");
-    let report = load_checkpoint_file(path, &named, &named_bufs).expect("load failed");
+    save_checkpoint_file(path, &named, &named_bufs, Some(g.structural_hash())).expect("save failed");
+    let report = load_checkpoint_file(path, &named, &named_bufs, Some(g.structural_hash())).expect("load failed");
     println!("\nCheckpoint save/load: OK ({} loaded)", report.loaded.len());
 
     // -- no_grad inference (eval mode works now — BatchNorm has running stats from training) --
@@ -1032,7 +1032,7 @@ mod tests {
         // Save checkpoint and capture baseline output
         let path = "/tmp/flodl_showcase_test_ckpt.fdl";
         let named_bufs = g.named_buffers();
-        save_checkpoint_file(path, &named, &named_bufs).unwrap();
+        save_checkpoint_file(path, &named, &named_bufs, Some(g.structural_hash())).unwrap();
 
         let before = g.forward_multi(&[make_input(false), make_context()]).unwrap();
         let v_before = before.data().to_f32_vec().unwrap();
@@ -1055,7 +1055,7 @@ mod tests {
         assert_ne!(p0_before, p0_after, "training should change parameters");
 
         // Restore checkpoint and verify parameters match original
-        let report = load_checkpoint_file(path, &named, &named_bufs).unwrap();
+        let report = load_checkpoint_file(path, &named, &named_bufs, Some(g.structural_hash())).unwrap();
         assert_eq!(report.loaded.len(), named.len());
         let p0_restored = params[0].variable.data().to_f32_vec().unwrap();
         assert_eq!(p0_before, p0_restored, "checkpoint restore should match original params");

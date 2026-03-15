@@ -7,7 +7,10 @@ use super::parameter::Parameter;
 
 /// Magic bytes for `.fdl` checkpoint files.
 const MAGIC: [u8; 4] = *b"FDLC";
-const VERSION: u32 = 2;
+/// Checkpoint format v1: `MAGIC | VERSION(u32=1) | hash(32 bytes) | num_entries(u32) | entries...`
+const VERSION: u32 = 1;
+/// Size of the structural hash field in the checkpoint header.
+const HASH_LEN: usize = 32;
 
 /// Report from a checkpoint load: what was loaded, skipped, or missing.
 #[derive(Debug, Clone)]
@@ -23,14 +26,25 @@ pub struct LoadReport {
 /// Save parameters and buffers to a binary checkpoint.
 ///
 /// Both params and buffers are stored as named tensors in the same flat list.
-/// The format is unchanged — the loader matches entries by name.
+/// The format is: `MAGIC(4) | VERSION(u32=1) | hash(32 bytes) | num_entries(u32) | entries...`
+///
+/// Pass `structural_hash` from `Graph::structural_hash()` to embed architecture
+/// identity. Pass `None` to write 32 zero bytes (hash validation skipped on load).
 pub fn save_checkpoint<W: Write>(
     w: &mut W,
     params: &[(String, Parameter)],
     buffers: &[(String, Buffer)],
+    structural_hash: Option<&str>,
 ) -> Result<()> {
     w.write_all(&MAGIC).map_err(io_err)?;
     w.write_all(&VERSION.to_le_bytes()).map_err(io_err)?;
+
+    // Write 32-byte hash (or zeros)
+    let hash_bytes = match structural_hash {
+        Some(hex) => hex_to_bytes(hex)?,
+        None => [0u8; HASH_LEN],
+    };
+    w.write_all(&hash_bytes).map_err(io_err)?;
 
     let total = (params.len() + buffers.len()) as u32;
     w.write_all(&total.to_le_bytes()).map_err(io_err)?;
@@ -57,10 +71,15 @@ pub fn save_checkpoint<W: Write>(
 ///
 /// Returns a `LoadReport` describing what was matched, skipped, and missing.
 /// Shape mismatches on a matched name are errors (not silent skips).
+///
+/// Pass `structural_hash` from `Graph::structural_hash()` to validate that the
+/// checkpoint was saved from the same architecture. Pass `None` to skip validation.
+/// If both the file hash and expected hash are non-zero and they differ, returns an error.
 pub fn load_checkpoint<R: Read>(
     r: &mut R,
     params: &[(String, Parameter)],
     buffers: &[(String, Buffer)],
+    structural_hash: Option<&str>,
 ) -> Result<LoadReport> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic).map_err(io_err)?;
@@ -71,10 +90,27 @@ pub fn load_checkpoint<R: Read>(
     }
 
     let version = read_u32(r)?;
-    if version != 2 {
+    if version != 1 {
         return Err(TensorError::new(&format!(
-            "unsupported checkpoint version {} (want 2)", version
+            "unsupported checkpoint version {} (want 1)", version
         )));
+    }
+
+    // Read and validate structural hash
+    let mut file_hash = [0u8; HASH_LEN];
+    r.read_exact(&mut file_hash).map_err(io_err)?;
+
+    let file_nonzero = file_hash.iter().any(|&b| b != 0);
+    if let Some(expected_hex) = structural_hash {
+        let expected = hex_to_bytes(expected_hex)?;
+        let expected_nonzero = expected.iter().any(|&b| b != 0);
+        if file_nonzero && expected_nonzero && file_hash != expected {
+            return Err(TensorError::new(&format!(
+                "checkpoint architecture mismatch: file={} model={}",
+                bytes_to_hex(&file_hash),
+                expected_hex,
+            )));
+        }
     }
 
     let count = read_u32(r)? as usize;
@@ -164,16 +200,17 @@ pub fn save_checkpoint_file(
     path: &str,
     params: &[(String, Parameter)],
     buffers: &[(String, Buffer)],
+    structural_hash: Option<&str>,
 ) -> Result<()> {
     let f = std::fs::File::create(path).map_err(io_err)?;
     if path.ends_with(".gz") {
         let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        save_checkpoint(&mut w, params, buffers)?;
+        save_checkpoint(&mut w, params, buffers, structural_hash)?;
         w.finish().map_err(io_err)?;
         Ok(())
     } else {
         let mut w = std::io::BufWriter::new(f);
-        save_checkpoint(&mut w, params, buffers)
+        save_checkpoint(&mut w, params, buffers, structural_hash)
     }
 }
 
@@ -182,14 +219,15 @@ pub fn load_checkpoint_file(
     path: &str,
     params: &[(String, Parameter)],
     buffers: &[(String, Buffer)],
+    structural_hash: Option<&str>,
 ) -> Result<LoadReport> {
     let f = std::fs::File::open(path).map_err(io_err)?;
     if path.ends_with(".gz") {
         let mut r = flate2::read::GzDecoder::new(f);
-        load_checkpoint(&mut r, params, buffers)
+        load_checkpoint(&mut r, params, buffers, structural_hash)
     } else {
         let mut r = std::io::BufReader::new(f);
-        load_checkpoint(&mut r, params, buffers)
+        load_checkpoint(&mut r, params, buffers, structural_hash)
     }
 }
 
@@ -413,6 +451,43 @@ pub(crate) fn read_i64_le<R: Read>(r: &mut R) -> Result<i64> {
     read_i64(r)
 }
 
+/// Decode a hex string to a 32-byte array.
+fn hex_to_bytes(hex: &str) -> Result<[u8; HASH_LEN]> {
+    if hex.len() != HASH_LEN * 2 {
+        return Err(TensorError::new(&format!(
+            "expected {} hex chars, got {}",
+            HASH_LEN * 2,
+            hex.len()
+        )));
+    }
+    let mut out = [0u8; HASH_LEN];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(TensorError::new(&format!("invalid hex byte: {}", b))),
+    }
+}
+
+/// Encode a byte slice as a lowercase hex string.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,11 +520,11 @@ mod tests {
         let params = make_named_params(&[(4, 8), (8, 2)]);
 
         let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[]).unwrap();
+        save_checkpoint(&mut buf, &params, &[], None).unwrap();
 
         let load_params = make_named_params(&[(4, 8), (8, 2)]);
         let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &load_params, &[]).unwrap();
+        let report = load_checkpoint(&mut cursor, &load_params, &[], None).unwrap();
 
         assert_eq!(report.loaded.len(), 2);
         assert!(report.skipped.is_empty());
@@ -468,13 +543,13 @@ mod tests {
         let buffers = make_named_buffers(&[8]);
 
         let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &buffers).unwrap();
+        save_checkpoint(&mut buf, &params, &buffers, None).unwrap();
 
         // Fresh model with same structure
         let load_params = make_named_params(&[(4, 8)]);
         let load_buffers = make_named_buffers(&[8]);
         let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &load_params, &load_buffers).unwrap();
+        let report = load_checkpoint(&mut cursor, &load_params, &load_buffers, None).unwrap();
 
         assert_eq!(report.loaded.len(), 2); // 1 param + 1 buffer
         assert!(report.skipped.is_empty());
@@ -491,7 +566,7 @@ mod tests {
         let params_3 = make_named_params(&[(4, 8), (8, 4), (4, 2)]);
 
         let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params_3, &[]).unwrap();
+        save_checkpoint(&mut buf, &params_3, &[], None).unwrap();
 
         let mut params_4 = make_named_params(&[(4, 8), (8, 4), (4, 2), (2, 1)]);
         params_4[3].0 = "extra/weight".to_string();
@@ -499,7 +574,7 @@ mod tests {
         let before_extra = params_4[3].1.variable.data().to_f32_vec().unwrap();
 
         let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &params_4, &[]).unwrap();
+        let report = load_checkpoint(&mut cursor, &params_4, &[], None).unwrap();
 
         assert_eq!(report.loaded.len(), 3);
         assert_eq!(report.missing.len(), 1);
@@ -515,11 +590,11 @@ mod tests {
         let params = make_named_params(&[(4, 8), (8, 2)]);
 
         let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[]).unwrap();
+        save_checkpoint(&mut buf, &params, &[], None).unwrap();
 
         let model = vec![params[0].clone()];
         let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &model, &[]).unwrap();
+        let report = load_checkpoint(&mut cursor, &model, &[], None).unwrap();
 
         assert_eq!(report.loaded.len(), 1);
         assert_eq!(report.skipped.len(), 1);
@@ -531,7 +606,7 @@ mod tests {
         let params = make_named_params(&[(4, 8)]);
 
         let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[]).unwrap();
+        save_checkpoint(&mut buf, &params, &[], None).unwrap();
 
         let wrong_shape = vec![(
             "layer_0/weight".to_string(),
@@ -544,7 +619,7 @@ mod tests {
             ),
         )];
         let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &wrong_shape, &[]);
+        let result = load_checkpoint(&mut cursor, &wrong_shape, &[], None);
         assert!(result.is_err(), "shape mismatch should be an error");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("shape mismatch"), "error should mention shape: {}", err_msg);
@@ -555,7 +630,7 @@ mod tests {
         let buffers = make_named_buffers(&[8]);
 
         let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &[], &buffers).unwrap();
+        save_checkpoint(&mut buf, &[], &buffers, None).unwrap();
 
         let wrong_buffers = vec![(
             "bn_0/running_mean".to_string(),
@@ -565,7 +640,7 @@ mod tests {
             ),
         )];
         let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &[], &wrong_buffers);
+        let result = load_checkpoint(&mut cursor, &[], &wrong_buffers, None);
         assert!(result.is_err());
         assert!(format!("{}", result.unwrap_err()).contains("shape mismatch"));
     }
@@ -581,8 +656,8 @@ mod tests {
         let gz = gz_path.to_str().unwrap();
         let plain = plain_path.to_str().unwrap();
 
-        save_checkpoint_file(gz, &params, &buffers).unwrap();
-        save_checkpoint_file(plain, &params, &buffers).unwrap();
+        save_checkpoint_file(gz, &params, &buffers, None).unwrap();
+        save_checkpoint_file(plain, &params, &buffers, None).unwrap();
 
         // Compressed should be smaller
         let gz_size = std::fs::metadata(gz).unwrap().len();
@@ -592,7 +667,7 @@ mod tests {
         // Load from compressed and verify
         let load_params = make_named_params(&[(16, 32), (32, 8)]);
         let load_buffers = make_named_buffers(&[32]);
-        let report = load_checkpoint_file(gz, &load_params, &load_buffers).unwrap();
+        let report = load_checkpoint_file(gz, &load_params, &load_buffers, None).unwrap();
         assert_eq!(report.loaded.len(), 3); // 2 params + 1 buffer
 
         for ((_, src), (_, dst)) in params.iter().zip(load_params.iter()) {
@@ -606,5 +681,62 @@ mod tests {
 
         std::fs::remove_file(gz).ok();
         std::fs::remove_file(plain).ok();
+    }
+
+    #[test]
+    fn test_hash_roundtrip() {
+        let params = make_named_params(&[(4, 8)]);
+        // Use a known 64-char hex hash
+        let hash = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2";
+
+        let mut buf = Vec::new();
+        save_checkpoint(&mut buf, &params, &[], Some(hash)).unwrap();
+
+        let load_params = make_named_params(&[(4, 8)]);
+        let mut cursor = std::io::Cursor::new(&buf);
+        // Same hash: should succeed
+        let report = load_checkpoint(&mut cursor, &load_params, &[], Some(hash)).unwrap();
+        assert_eq!(report.loaded.len(), 1);
+    }
+
+    #[test]
+    fn test_hash_mismatch_error() {
+        let params = make_named_params(&[(4, 8)]);
+        let hash_a = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2";
+        let hash_b = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        let mut buf = Vec::new();
+        save_checkpoint(&mut buf, &params, &[], Some(hash_a)).unwrap();
+
+        let load_params = make_named_params(&[(4, 8)]);
+        let mut cursor = std::io::Cursor::new(&buf);
+        let result = load_checkpoint(&mut cursor, &load_params, &[], Some(hash_b));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("architecture mismatch"), "error: {}", msg);
+    }
+
+    #[test]
+    fn test_zero_hash_skips_validation() {
+        let params = make_named_params(&[(4, 8)]);
+
+        // Save with no hash (zero bytes)
+        let mut buf = Vec::new();
+        save_checkpoint(&mut buf, &params, &[], None).unwrap();
+
+        // Load with a hash expectation — should still succeed (file has zeros)
+        let hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let load_params = make_named_params(&[(4, 8)]);
+        let mut cursor = std::io::Cursor::new(&buf);
+        let report = load_checkpoint(&mut cursor, &load_params, &[], Some(hash)).unwrap();
+        assert_eq!(report.loaded.len(), 1);
+
+        // Save with hash, load with None — should succeed (no expected hash)
+        let mut buf2 = Vec::new();
+        save_checkpoint(&mut buf2, &params, &[], Some(hash)).unwrap();
+        let load_params2 = make_named_params(&[(4, 8)]);
+        let mut cursor2 = std::io::Cursor::new(&buf2);
+        let report2 = load_checkpoint(&mut cursor2, &load_params2, &[], None).unwrap();
+        assert_eq!(report2.loaded.len(), 1);
     }
 }

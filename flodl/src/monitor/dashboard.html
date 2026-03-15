@@ -138,6 +138,13 @@ animation:pulse 2s ease-in-out infinite}
     </div>
   </div>
 
+  <div class="card full-width" id="metaCard" style="display:none">
+    <details>
+      <summary style="cursor:pointer;color:var(--dim);font-size:13px;text-transform:uppercase;letter-spacing:0.5px">Training Configuration</summary>
+      <pre id="metaPre" style="margin-top:12px;color:var(--text);font-size:12px;white-space:pre-wrap;word-break:break-word"></pre>
+    </details>
+  </div>
+
   <div class="card full-width" id="svgCard" style="display:none">
     <div class="svg-toggle" id="svgToggle" onclick="toggleSvg()">
       <span class="arrow">&#9654;</span>
@@ -226,6 +233,37 @@ if(typeof ARCHIVE_DATA!=='undefined'){
   es.addEventListener('complete',()=>markComplete());
   if(!elapsedTimer)elapsedTimer=setInterval(updateElapsed,1000);
   fetch('/graph.svg').then(r=>{if(r.ok)return r.text();throw 0}).then(showSvg).catch(()=>{});
+}
+
+// --- Label/Hash/Metadata ---
+function applyLabelHash(label,hash){
+  const h1=document.querySelector('.header h1');
+  if(!h1)return;
+  const short=hash?hash.substring(0,8):null;
+  if(label&&short)h1.innerHTML='floDl <span>'+label+' ['+short+']</span>';
+  else if(short)h1.innerHTML='floDl <span>['+short+']</span>';
+  if(label||short){
+    const t=label?(short?label+' ['+short+']':'['+short+']'):'floDl';
+    document.title='floDl'+(label?' \u2014 '+label:'')+(short?' ['+short+']':'');
+  }
+}
+function showMeta(meta){
+  if(!meta)return;
+  const card=document.getElementById('metaCard');
+  const pre=document.getElementById('metaPre');
+  if(!card||!pre)return;
+  try{pre.textContent=typeof meta==='string'?meta:JSON.stringify(meta,null,2)}
+  catch(e){pre.textContent=String(meta)}
+  card.style.display='block';
+}
+// Apply from archive constants
+if(typeof ARCHIVE_LABEL!=='undefined'||typeof ARCHIVE_HASH!=='undefined'){
+  applyLabelHash(typeof ARCHIVE_LABEL!=='undefined'?ARCHIVE_LABEL:null,typeof ARCHIVE_HASH!=='undefined'?ARCHIVE_HASH:null);
+}
+if(typeof ARCHIVE_META!=='undefined'&&ARCHIVE_META!==null){showMeta(ARCHIVE_META)}
+// Apply from live server injection
+if(typeof LIVE_LABEL!=='undefined'||typeof LIVE_HASH!=='undefined'){
+  applyLabelHash(typeof LIVE_LABEL!=='undefined'?LIVE_LABEL:null,typeof LIVE_HASH!=='undefined'?LIVE_HASH:null);
 }
 
 // --- Header ---

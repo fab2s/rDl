@@ -262,7 +262,7 @@ for (input_t, target_t) in &batches {
 |------|-------------|
 | `clip_grad_norm` | L2 norm gradient clipping |
 | `clip_grad_value` | Element-wise gradient clamping |
-| `save_checkpoint` / `load_checkpoint` | Named `.fdl` checkpoint with partial loading, persists parameters + buffers, `LoadReport` (file path or `Write`/`Read`) |
+| `save_checkpoint` / `load_checkpoint` | Named `.fdl` checkpoint with partial loading, persists parameters + buffers, structural hash validation, `LoadReport` (file path or `Write`/`Read`) |
 | `Parameter::freeze` / `unfreeze` | Disable/enable gradient tracking per parameter |
 | `xavier_uniform/normal` | Weight initialization (also `kaiming_*` via `nn::init`) |
 | LR schedulers | `StepDecay`, `CosineScheduler`, `WarmupScheduler`, `PlateauScheduler` (composable) |
