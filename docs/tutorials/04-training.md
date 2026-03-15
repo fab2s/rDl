@@ -91,7 +91,7 @@ By default, all tensors and parameters live on CPU. To train on CUDA, use
 let model = build_model()?;
 
 if flodl::cuda_available() {
-    model.set_device(Device::CUDA);
+    model.set_device(Device::CUDA(0));
 }
 
 // Create optimizer AFTER set_device.
@@ -242,7 +242,7 @@ if param.is_frozen() { /* ... */ }
 ```
 
 Frozen parameters are automatically skipped by optimizers (they produce
-no gradient). Freezing works through `Rc<RefCell>` — a freeze is visible
+no gradient). Freezing works through `Arc<RwLock>` — a freeze is visible
 everywhere the parameter is referenced.
 
 ## Checkpoints

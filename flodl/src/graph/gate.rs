@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::autograd::Variable;
 use crate::nn::Module;
@@ -30,13 +30,13 @@ pub(super) fn wire_gate(
     let cur = fb.current[0].clone();
     let id = fb.next_id("gate");
 
-    let router: Rc<dyn Module> = Rc::from(router);
-    let expert_modules: Vec<Rc<dyn Module>> = experts
+    let router: Arc<dyn Module> = Arc::from(router);
+    let expert_modules: Vec<Arc<dyn Module>> = experts
         .into_iter()
-        .map(|e| Rc::from(e) as Rc<dyn Module>)
+        .map(|e| Arc::from(e) as Arc<dyn Module>)
         .collect();
 
-    let composite: Rc<dyn Module> = Rc::new(GateComposite {
+    let composite: Arc<dyn Module> = Arc::new(GateComposite {
         router: router.clone(),
         experts: expert_modules.clone(),
     });
@@ -81,10 +81,10 @@ pub(super) fn wire_gate(
 }
 
 fn gate_route(
-    router: &Rc<dyn Module>,
+    router: &Arc<dyn Module>,
     stream: &Variable,
     refs: &HashMap<String, Variable>,
-    experts: &[Rc<dyn Module>],
+    experts: &[Arc<dyn Module>],
     n_experts: usize,
 ) -> Result<Variable> {
     // Try NamedInputModule if refs are available
@@ -118,8 +118,8 @@ fn gate_route(
 }
 
 fn make_gate_func(
-    router: Rc<dyn Module>,
-    experts: Vec<Rc<dyn Module>>,
+    router: Arc<dyn Module>,
+    experts: Vec<Arc<dyn Module>>,
 ) -> NodeFn {
     let n_experts = experts.len();
     Box::new(move |inputs: &[Variable]| {
@@ -130,19 +130,19 @@ fn make_gate_func(
 }
 
 fn make_gate_ref_forward(
-    router: Rc<dyn Module>,
-    experts: Vec<Rc<dyn Module>>,
+    router: Arc<dyn Module>,
+    experts: Vec<Arc<dyn Module>>,
 ) -> RefForwardFn {
     let n_experts = experts.len();
-    Rc::new(move |stream: &Variable, refs: &HashMap<String, Variable>| {
+    Arc::new(move |stream: &Variable, refs: &HashMap<String, Variable>| {
         gate_route(&router, stream, refs, &experts, n_experts)
     })
 }
 
 /// Bundles router + experts for parameter collection.
 struct GateComposite {
-    router: Rc<dyn Module>,
-    experts: Vec<Rc<dyn Module>>,
+    router: Arc<dyn Module>,
+    experts: Vec<Arc<dyn Module>>,
 }
 
 impl Module for GateComposite {
@@ -150,7 +150,7 @@ impl Module for GateComposite {
         self.experts[0].forward(input)
     }
 
-    fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
+    fn sub_modules(&self) -> Vec<Arc<dyn Module>> {
         let mut subs = vec![self.router.clone()];
         subs.extend(self.experts.iter().cloned());
         subs

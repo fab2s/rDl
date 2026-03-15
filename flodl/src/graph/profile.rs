@@ -100,29 +100,30 @@ impl fmt::Display for Profile {
 impl Graph {
     /// Turn on per-node and per-level timing for subsequent forward calls.
     pub fn enable_profiling(&self) {
-        self.profiling.set(true);
+        self.profiling.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Turn off timing. Subsequent forward calls have zero profiling overhead.
     pub fn disable_profiling(&self) {
-        self.profiling.set(false);
-        *self.last_profile.borrow_mut() = None;
+        self.profiling.store(false, std::sync::atomic::Ordering::Relaxed);
+        *self.last_profile.lock().unwrap() = None;
     }
 
     /// Whether profiling is currently enabled.
     pub fn profiling(&self) -> bool {
-        self.profiling.get()
+        self.profiling.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Timing data from the most recent forward call, or None.
     pub fn profile(&self) -> Option<Profile> {
-        self.last_profile.borrow().clone()
+        self.last_profile.lock().unwrap().clone()
     }
 
     /// Duration of a tagged node from the most recent forward call.
     pub fn timing(&self, tag: &str) -> Duration {
         self.last_profile
-            .borrow()
+            .lock()
+            .unwrap()
             .as_ref()
             .map(|p| p.timing(tag))
             .unwrap_or(Duration::ZERO)
@@ -131,12 +132,12 @@ impl Graph {
     /// Snapshot tagged node durations into the timing batch buffer.
     /// If tags is empty, all tagged nodes with timing data are collected.
     pub fn collect_timings(&self, tags: &[&str]) {
-        let profile = self.last_profile.borrow();
+        let profile = self.last_profile.lock().unwrap();
         let profile = match profile.as_ref() {
             Some(p) => p,
             None => return,
         };
-        let mut buffer = self.timing_buffer.borrow_mut();
+        let mut buffer = self.timing_buffer.lock().unwrap();
 
         if tags.is_empty() {
             for n in &profile.nodes {
@@ -163,8 +164,8 @@ impl Graph {
     /// Compute batch mean, append to timing epoch history, clear buffer.
     /// If tags is empty, flushes all buffered tags.
     pub fn flush_timings(&self, tags: &[&str]) {
-        let mut buffer = self.timing_buffer.borrow_mut();
-        let mut history = self.timing_history.borrow_mut();
+        let mut buffer = self.timing_buffer.lock().unwrap();
+        let mut history = self.timing_history.lock().unwrap();
 
         let keys: Vec<String> = if tags.is_empty() {
             buffer.keys().cloned().collect()
@@ -185,14 +186,14 @@ impl Graph {
     /// Epoch-level trend over the timing history of a tagged node.
     /// Values are mean execution times in seconds.
     pub fn timing_trend(&self, tag: &str) -> Trend {
-        let history = self.timing_history.borrow();
+        let history = self.timing_history.lock().unwrap();
         Trend::new(history.get(tag).cloned().unwrap_or_default())
     }
 
     /// TrendGroup for timing trends of the given tags (expands groups).
     pub fn timing_trends(&self, tags: &[&str]) -> TrendGroup {
         let expanded = self.expand_groups(tags);
-        let history = self.timing_history.borrow();
+        let history = self.timing_history.lock().unwrap();
         let trends = expanded
             .iter()
             .map(|tag| Trend::new(history.get(tag).cloned().unwrap_or_default()))
@@ -202,7 +203,7 @@ impl Graph {
 
     /// Clear timing epoch history. If tags is empty, clears all.
     pub fn reset_timing_trend(&self, tags: &[&str]) {
-        let mut history = self.timing_history.borrow_mut();
+        let mut history = self.timing_history.lock().unwrap();
         if tags.is_empty() {
             history.clear();
         } else {

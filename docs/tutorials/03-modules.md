@@ -49,7 +49,7 @@ let output = linear.forward(&input)?;  // [batch, 784] -> [batch, 128]
 let linear = Linear::no_bias(784, 128)?;
 
 // On a specific device
-let linear = Linear::on_device(784, 128, Device::CUDA)?;
+let linear = Linear::on_device(784, 128, Device::CUDA(0))?;
 ```
 
 ## Conv2d

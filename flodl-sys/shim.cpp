@@ -55,18 +55,23 @@ static int from_scalar_type(torch::ScalarType st) {
     }
 }
 
-// Helper: convert our device constant to torch::Device.
-static torch::Device to_device(int device) {
-    if (device == FLODL_CUDA) {
-        return torch::Device(torch::kCUDA, 0);
+// Helper: convert our device (type, index) to torch::Device.
+static torch::Device to_device(int device_type, int device_index) {
+    if (device_type == FLODL_CUDA) {
+        return torch::Device(torch::kCUDA, (c10::DeviceIndex)device_index);
     }
     return torch::Device(torch::kCPU);
 }
 
-// Helper: convert torch::Device back to our constant.
-static int from_device(const torch::Device& dev) {
+// Helper: convert torch::Device back to our (type, index) pair.
+static int from_device_type(const torch::Device& dev) {
     if (dev.is_cuda()) return FLODL_CUDA;
     return FLODL_CPU;
+}
+
+static int from_device_index(const torch::Device& dev) {
+    if (dev.is_cuda()) return (int)dev.index();
+    return 0;
 }
 
 // Helper: wrap a new torch::Tensor into a heap-allocated pointer.
@@ -88,12 +93,13 @@ static torch::IntArrayRef make_shape(int64_t* shape, int ndim) {
 
 // --- Tensor creation ---
 
-extern "C" char* flodl_zeros(int64_t* shape, int ndim, int dtype, int device,
+extern "C" char* flodl_zeros(int64_t* shape, int ndim, int dtype,
+                            int device_type, int device_index,
                             FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions()
             .dtype(to_scalar_type(dtype))
-            .device(to_device(device));
+            .device(to_device(device_type, device_index));
         *result = wrap(torch::zeros(make_shape(shape, ndim), options));
         return nullptr;
     } catch (const std::exception& e) {
@@ -101,12 +107,13 @@ extern "C" char* flodl_zeros(int64_t* shape, int ndim, int dtype, int device,
     }
 }
 
-extern "C" char* flodl_ones(int64_t* shape, int ndim, int dtype, int device,
+extern "C" char* flodl_ones(int64_t* shape, int ndim, int dtype,
+                           int device_type, int device_index,
                            FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions()
             .dtype(to_scalar_type(dtype))
-            .device(to_device(device));
+            .device(to_device(device_type, device_index));
         *result = wrap(torch::ones(make_shape(shape, ndim), options));
         return nullptr;
     } catch (const std::exception& e) {
@@ -114,12 +121,13 @@ extern "C" char* flodl_ones(int64_t* shape, int ndim, int dtype, int device,
     }
 }
 
-extern "C" char* flodl_rand(int64_t* shape, int ndim, int dtype, int device,
+extern "C" char* flodl_rand(int64_t* shape, int ndim, int dtype,
+                           int device_type, int device_index,
                            FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions()
             .dtype(to_scalar_type(dtype))
-            .device(to_device(device));
+            .device(to_device(device_type, device_index));
         *result = wrap(torch::rand(make_shape(shape, ndim), options));
         return nullptr;
     } catch (const std::exception& e) {
@@ -127,12 +135,13 @@ extern "C" char* flodl_rand(int64_t* shape, int ndim, int dtype, int device,
     }
 }
 
-extern "C" char* flodl_randn(int64_t* shape, int ndim, int dtype, int device,
+extern "C" char* flodl_randn(int64_t* shape, int ndim, int dtype,
+                             int device_type, int device_index,
                              FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions()
             .dtype(to_scalar_type(dtype))
-            .device(to_device(device));
+            .device(to_device(device_type, device_index));
         *result = wrap(torch::randn(make_shape(shape, ndim), options));
         return nullptr;
     } catch (const std::exception& e) {
@@ -141,13 +150,14 @@ extern "C" char* flodl_randn(int64_t* shape, int ndim, int dtype, int device,
 }
 
 extern "C" char* flodl_from_blob(void* data, int64_t* shape, int ndim,
-                                int dtype, int device, FlodlTensor* result) {
+                                int dtype, int device_type, int device_index,
+                                FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions().dtype(to_scalar_type(dtype));
         // from_blob does not take ownership — clone to get an independent copy.
         auto t = torch::from_blob(data, make_shape(shape, ndim), options).clone();
-        if (device == FLODL_CUDA) {
-            t = t.to(torch::kCUDA);
+        if (device_type == FLODL_CUDA) {
+            t = t.to(to_device(device_type, device_index));
         }
         *result = wrap(std::move(t));
         return nullptr;
@@ -157,12 +167,13 @@ extern "C" char* flodl_from_blob(void* data, int64_t* shape, int ndim,
 }
 
 extern "C" char* flodl_linspace(double start, double end, int64_t steps,
-                               int dtype, int device, FlodlTensor* result) {
+                               int dtype, int device_type, int device_index,
+                               FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions().dtype(to_scalar_type(dtype));
         auto t = torch::linspace(start, end, steps, options);
-        if (device == FLODL_CUDA) {
-            t = t.to(torch::kCUDA);
+        if (device_type == FLODL_CUDA) {
+            t = t.to(to_device(device_type, device_index));
         }
         *result = wrap(std::move(t));
         return nullptr;
@@ -172,11 +183,12 @@ extern "C" char* flodl_linspace(double start, double end, int64_t steps,
 }
 
 extern "C" char* flodl_arange(double start, double end, double step,
-                              int dtype, int device, FlodlTensor* result) {
+                              int dtype, int device_type, int device_index,
+                              FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions()
             .dtype(to_scalar_type(dtype))
-            .device(to_device(device));
+            .device(to_device(device_type, device_index));
         *result = wrap(torch::arange(start, end, step, options));
         return nullptr;
     } catch (const std::exception& e) {
@@ -227,8 +239,12 @@ extern "C" int flodl_dtype(FlodlTensor t) {
     return from_scalar_type(unwrap(t).scalar_type());
 }
 
-extern "C" int flodl_device(FlodlTensor t) {
-    return from_device(unwrap(t).device());
+extern "C" int flodl_device_type(FlodlTensor t) {
+    return from_device_type(unwrap(t).device());
+}
+
+extern "C" int flodl_device_index(FlodlTensor t) {
+    return from_device_index(unwrap(t).device());
 }
 
 extern "C" int64_t flodl_numel(FlodlTensor t) {
@@ -957,10 +973,10 @@ extern "C" char* flodl_all_finite(FlodlTensor t, int* result) {
 
 // --- Device operations ---
 
-extern "C" char* flodl_to_device(FlodlTensor t, int device,
-                                FlodlTensor* result) {
+extern "C" char* flodl_to_device(FlodlTensor t, int device_type,
+                                int device_index, FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).to(to_device(device)));
+        *result = wrap(unwrap(t).to(to_device(device_type, device_index)));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -973,6 +989,33 @@ extern "C" int flodl_cuda_is_available(void) {
 
 extern "C" int flodl_cuda_device_count(void) {
     return (int)torch::cuda::device_count();
+}
+
+extern "C" void flodl_set_current_device(int device_index) {
+#ifdef FLODL_BUILD_CUDA
+    c10::cuda::set_device((c10::DeviceIndex)device_index);
+#else
+    (void)device_index;
+#endif
+}
+
+extern "C" int flodl_get_current_device(void) {
+#ifdef FLODL_BUILD_CUDA
+    return (int)c10::cuda::current_device();
+#else
+    return 0;
+#endif
+}
+
+extern "C" void flodl_cuda_synchronize(int device_index) {
+#ifdef FLODL_BUILD_CUDA
+    if (torch::cuda::is_available()) {
+        c10::cuda::set_device((c10::DeviceIndex)device_index);
+        cudaDeviceSynchronize();
+    }
+#else
+    (void)device_index;
+#endif
 }
 
 // Force real symbol references to BOTH c10_cuda.so and libtorch_cuda.so
@@ -1005,13 +1048,18 @@ extern "C" int flodl_force_cuda_link(void) {
 
 // --- CUDA memory info via cudaMemGetInfo ---
 
-extern "C" char* flodl_cuda_mem_info(uint64_t* used_bytes, uint64_t* total_bytes) {
+extern "C" char* flodl_cuda_mem_info(int device_index,
+                                    uint64_t* used_bytes, uint64_t* total_bytes) {
 #ifdef FLODL_BUILD_CUDA
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
     }
+    // Switch to target device, query, then restore
+    auto prev = c10::cuda::current_device();
+    c10::cuda::set_device((c10::DeviceIndex)device_index);
     size_t free_b = 0, total_b = 0;
     auto err = cudaMemGetInfo(&free_b, &total_b);
+    c10::cuda::set_device(prev);
     if (err != cudaSuccess) {
         return make_error(cudaGetErrorString(err));
     }
@@ -1019,7 +1067,7 @@ extern "C" char* flodl_cuda_mem_info(uint64_t* used_bytes, uint64_t* total_bytes
     *used_bytes  = (uint64_t)(total_b - free_b);
     return nullptr;
 #else
-    (void)used_bytes; (void)total_bytes;
+    (void)device_index; (void)used_bytes; (void)total_bytes;
     return make_error("CUDA not available (built without cuda feature)");
 #endif
 }
@@ -1316,11 +1364,12 @@ extern "C" char* flodl_sort(FlodlTensor t, int dim, int descending,
 
 // --- Tensor creation (additional) ---
 
-extern "C" char* flodl_eye(int64_t n, int dtype, int device, FlodlTensor* result) {
+extern "C" char* flodl_eye(int64_t n, int dtype, int device_type,
+                          int device_index, FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions()
             .dtype(to_scalar_type(dtype))
-            .device(to_device(device));
+            .device(to_device(device_type, device_index));
         *result = wrap(torch::eye(n, options));
         return nullptr;
     } catch (const std::exception& e) {
@@ -1328,12 +1377,13 @@ extern "C" char* flodl_eye(int64_t n, int dtype, int device, FlodlTensor* result
     }
 }
 
-extern "C" char* flodl_full(int64_t* shape, int ndim, double value, int dtype, int device,
+extern "C" char* flodl_full(int64_t* shape, int ndim, double value, int dtype,
+                            int device_type, int device_index,
                             FlodlTensor* result) {
     try {
         auto options = torch::TensorOptions()
             .dtype(to_scalar_type(dtype))
-            .device(to_device(device));
+            .device(to_device(device_type, device_index));
         *result = wrap(torch::full(make_shape(shape, ndim), value, options));
         return nullptr;
     } catch (const std::exception& e) {

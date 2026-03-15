@@ -372,13 +372,14 @@ fn tensor_from_raw_bytes(raw: &[u8], shape: &[i64], dtype: DType) -> Result<Tens
             // For f16/bf16/i32: load raw bytes via from_blob directly.
             let mut shape_v = shape.to_vec();
             let mut handle: flodl_sys::FlodlTensor = std::ptr::null_mut();
+            let (dev_type, dev_idx) = crate::tensor::Device::CPU.to_ffi();
             let err = unsafe {
                 flodl_sys::flodl_from_blob(
                     raw.as_ptr() as *mut std::ffi::c_void,
                     shape_v.as_mut_ptr(),
                     shape_v.len() as i32,
                     dtype as i32,
-                    crate::tensor::Device::CPU as i32,
+                    dev_type, dev_idx,
                     &mut handle,
                 )
             };

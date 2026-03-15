@@ -42,7 +42,7 @@ use flodl::graph::{FlowBuilder, Graph, MergeOp};
 | PyTorch | flodl | Notes |
 |---------|-------|-------|
 | `torch.Tensor` | `Tensor` | Immutable, `Drop`-based VRAM cleanup, `Send`+`Sync` |
-| `torch.autograd` | `Variable` | Wraps Tensor, tracks gradients via `Rc<RefCell>` |
+| `torch.autograd` | `Variable` | Wraps Tensor, tracks gradients via `Arc<RwLock>` |
 | `torch.nn.Module` | `Module` trait | `forward(&self, &Variable) -> Result<Variable>` + `parameters()` |
 | `model.train()` | `module.set_training(true)` | Called on individual modules |
 | `with torch.no_grad():` | `no_grad(\|\| { ... })` | RAII guard disables gradient tracking |
@@ -413,13 +413,13 @@ let cell = GRUCell::new(128, 256)?;
 let cell = LSTMCell::new(128, 256)?;
 
 // On a specific device:
-let layer = Linear::on_device(784, 128, Device::CUDA)?;
-let layer = LayerNorm::on_device(128, Device::CUDA)?;
-let layer = BatchNorm::on_device(128, Device::CUDA)?;
-let layer = BatchNorm2d::on_device(64, Device::CUDA)?;
-let layer = Embedding::on_device(1000, 128, Device::CUDA)?;
-let cell = GRUCell::on_device(128, 256, Device::CUDA)?;
-let cell = LSTMCell::on_device(128, 256, Device::CUDA)?;
+let layer = Linear::on_device(784, 128, Device::CUDA(0))?;
+let layer = LayerNorm::on_device(128, Device::CUDA(0))?;
+let layer = BatchNorm::on_device(128, Device::CUDA(0))?;
+let layer = BatchNorm2d::on_device(64, Device::CUDA(0))?;
+let layer = Embedding::on_device(1000, 128, Device::CUDA(0))?;
+let cell = GRUCell::on_device(128, 256, Device::CUDA(0))?;
+let cell = LSTMCell::on_device(128, 256, Device::CUDA(0))?;
 ```
 
 ## Activations (as Modules)
@@ -496,7 +496,7 @@ Or skip manual structs entirely — use the **graph builder** (see below).
 |--------|---------|-------|
 | Child discovery | Implicit (`self.x = ...`) | Explicit (`sub_modules()`) |
 | Parameter collection | Automatic | `collect_parameters()` walks tree |
-| Device move | `model.to(device)` | `module.move_to_device(Device::CUDA)` |
+| Device move | `model.to(device)` | `module.move_to_device(Device::CUDA(0))` |
 | Training mode | `model.train()` | `module.set_training(true)` |
 
 ## Loss Functions
@@ -674,7 +674,7 @@ x = x.to(device)
 
 ```rust
 // flodl
-let device = if cuda_available() { Device::CUDA } else { Device::CPU };
+let device = if cuda_available() { Device::CUDA(0) } else { Device::CPU };
 
 // Move model parameters
 module.move_to_device(device);
@@ -686,7 +686,7 @@ let x = x.to_device(device)?;
 let x = x.to_device(device)?;
 
 // Create directly on device
-let opts = TensorOptions { dtype: DType::Float32, device: Device::CUDA };
+let opts = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
 let x = Tensor::zeros(&[2, 3], opts)?;
 ```
 

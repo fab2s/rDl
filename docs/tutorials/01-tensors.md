@@ -33,7 +33,7 @@ let idx = Tensor::from_i64(&[0, 3, 7], &[3])?;
 let opts = TensorOptions { dtype: DType::Float64, ..Default::default() };
 let t = Tensor::ones(&[4], opts)?;
 
-let gpu_opts = TensorOptions { device: Device::CUDA, ..Default::default() };
+let gpu_opts = TensorOptions { device: Device::CUDA(0), ..Default::default() };
 let t = Tensor::zeros(&[3, 3], gpu_opts)?;
 ```
 
@@ -171,7 +171,7 @@ println!("RSS: {}MB", rss_kb() / 1024);
 ## Device Transfer
 
 ```rust
-let gpu = t.to_device(Device::CUDA)?;   // move to GPU
+let gpu = t.to_device(Device::CUDA(0))?;   // move to GPU
 let cpu = gpu.to_device(Device::CPU)?;  // move back to CPU
 
 if flodl::cuda_available() {

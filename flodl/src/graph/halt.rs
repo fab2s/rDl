@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::autograd::Variable;
 use crate::nn::{Linear, Module};
@@ -50,7 +50,7 @@ impl Module for ThresholdHalt {
 ///     .loop_body(body).until_cond(LearnedHalt::new(hidden_dim)?, 20)
 /// ```
 pub struct LearnedHalt {
-    proj: Rc<Linear>,
+    proj: Arc<Linear>,
 }
 
 impl LearnedHalt {
@@ -60,7 +60,7 @@ impl LearnedHalt {
 
     pub fn on_device(input_dim: i64, device: Device) -> Result<Self> {
         Ok(LearnedHalt {
-            proj: Rc::new(Linear::on_device(input_dim, 1, device)?),
+            proj: Arc::new(Linear::on_device(input_dim, 1, device)?),
         })
     }
 }
@@ -72,7 +72,7 @@ impl Module for LearnedHalt {
         self.proj.forward(input)
     }
 
-    fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
+    fn sub_modules(&self) -> Vec<Arc<dyn Module>> {
         vec![self.proj.clone()]
     }
 }

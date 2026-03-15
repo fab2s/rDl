@@ -58,18 +58,42 @@ impl DType {
 }
 
 /// Device represents where a tensor's data lives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
+///
+/// `Device::CPU` is the host. `Device::CUDA(n)` is GPU index `n`.
+/// Most single-GPU code uses `Device::CUDA(0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Device {
-    CPU = ffi::FLODL_CPU,
-    CUDA = ffi::FLODL_CUDA,
+    CPU,
+    CUDA(u8),
 }
 
 impl Device {
-    fn from_raw(v: i32) -> Self {
-        match v {
-            ffi::FLODL_CUDA => Device::CUDA,
+    /// Convert to (device_type, device_index) for FFI calls.
+    pub(crate) fn to_ffi(self) -> (i32, i32) {
+        match self {
+            Device::CPU => (ffi::FLODL_CPU, 0),
+            Device::CUDA(idx) => (ffi::FLODL_CUDA, idx as i32),
+        }
+    }
+
+    /// Reconstruct from FFI (device_type, device_index).
+    pub(crate) fn from_ffi(device_type: i32, device_index: i32) -> Self {
+        match device_type {
+            ffi::FLODL_CUDA => Device::CUDA(device_index as u8),
             _ => Device::CPU,
+        }
+    }
+
+    /// Whether this is a CUDA device.
+    pub fn is_cuda(&self) -> bool {
+        matches!(self, Device::CUDA(_))
+    }
+
+    /// Device index (0 for CPU, GPU index for CUDA).
+    pub fn index(&self) -> u8 {
+        match self {
+            Device::CPU => 0,
+            Device::CUDA(idx) => *idx,
         }
     }
 }
@@ -78,7 +102,8 @@ impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Device::CPU => write!(f, "cpu"),
-            Device::CUDA => write!(f, "cuda"),
+            Device::CUDA(0) => write!(f, "cuda"),
+            Device::CUDA(idx) => write!(f, "cuda:{}", idx),
         }
     }
 }
@@ -212,12 +237,13 @@ impl Tensor {
     pub fn zeros(shape: &[i64], opts: TensorOptions) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_zeros(
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 opts.dtype as i32,
-                opts.device as i32,
+                dt, di,
                 &mut handle,
             )
         };
@@ -229,12 +255,13 @@ impl Tensor {
     pub fn ones(shape: &[i64], opts: TensorOptions) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_ones(
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 opts.dtype as i32,
-                opts.device as i32,
+                dt, di,
                 &mut handle,
             )
         };
@@ -251,13 +278,14 @@ impl Tensor {
     pub fn from_f32(data: &[f32], shape: &[i64], device: Device) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = device.to_ffi();
         let err = unsafe {
             ffi::flodl_from_blob(
                 data.as_ptr() as *mut c_void,
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 DType::Float32 as i32,
-                device as i32,
+                dt, di,
                 &mut handle,
             )
         };
@@ -269,13 +297,14 @@ impl Tensor {
     pub fn from_f64(data: &[f64], shape: &[i64], device: Device) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = device.to_ffi();
         let err = unsafe {
             ffi::flodl_from_blob(
                 data.as_ptr() as *mut c_void,
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 DType::Float64 as i32,
-                device as i32,
+                dt, di,
                 &mut handle,
             )
         };
@@ -287,13 +316,14 @@ impl Tensor {
     pub fn from_i64(data: &[i64], shape: &[i64], device: Device) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = device.to_ffi();
         let err = unsafe {
             ffi::flodl_from_blob(
                 data.as_ptr() as *mut c_void,
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 DType::Int64 as i32,
-                device as i32,
+                dt, di,
                 &mut handle,
             )
         };
@@ -326,9 +356,11 @@ impl Tensor {
         DType::from_raw(unsafe { ffi::flodl_dtype(self.handle) })
     }
 
-    /// Device (CPU or CUDA).
+    /// Device (CPU or CUDA with index).
     pub fn device(&self) -> Device {
-        Device::from_raw(unsafe { ffi::flodl_device(self.handle) })
+        let dt = unsafe { ffi::flodl_device_type(self.handle) };
+        let di = unsafe { ffi::flodl_device_index(self.handle) };
+        Device::from_ffi(dt, di)
     }
 
     // --- Data access ---
@@ -857,10 +889,11 @@ impl Tensor {
     pub fn rand(shape: &[i64], opts: TensorOptions) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_rand(
                 shape.as_mut_ptr(), shape.len() as i32,
-                opts.dtype as i32, opts.device as i32,
+                opts.dtype as i32, dt, di,
                 &mut handle,
             )
         };
@@ -872,10 +905,11 @@ impl Tensor {
     pub fn randn(shape: &[i64], opts: TensorOptions) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_randn(
                 shape.as_mut_ptr(), shape.len() as i32,
-                opts.dtype as i32, opts.device as i32,
+                opts.dtype as i32, dt, di,
                 &mut handle,
             )
         };
@@ -993,8 +1027,9 @@ impl Tensor {
     /// Create evenly spaced values.
     pub fn linspace(start: f64, end: f64, steps: i64, opts: TensorOptions) -> Result<Self> {
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
-            ffi::flodl_linspace(start, end, steps, opts.dtype as i32, opts.device as i32, &mut handle)
+            ffi::flodl_linspace(start, end, steps, opts.dtype as i32, dt, di, &mut handle)
         };
         check_err(err)?;
         Ok(Self::from_raw(handle))
@@ -1003,8 +1038,9 @@ impl Tensor {
     /// Create a range of values [start, end) with given step.
     pub fn arange(start: f64, end: f64, step: f64, opts: TensorOptions) -> Result<Self> {
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
-            ffi::flodl_arange(start, end, step, opts.dtype as i32, opts.device as i32, &mut handle)
+            ffi::flodl_arange(start, end, step, opts.dtype as i32, dt, di, &mut handle)
         };
         check_err(err)?;
         Ok(Self::from_raw(handle))
@@ -1367,8 +1403,9 @@ impl Tensor {
     /// Create an identity matrix of size n x n.
     pub fn eye(n: i64, opts: TensorOptions) -> Result<Self> {
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
-            ffi::flodl_eye(n, opts.dtype as i32, opts.device as i32, &mut handle)
+            ffi::flodl_eye(n, opts.dtype as i32, dt, di, &mut handle)
         };
         check_err(err)?;
         Ok(Self::from_raw(handle))
@@ -1378,10 +1415,11 @@ impl Tensor {
     pub fn full(shape: &[i64], value: f64, opts: TensorOptions) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_full(
                 shape.as_mut_ptr(), shape.len() as i32, value,
-                opts.dtype as i32, opts.device as i32, &mut handle,
+                opts.dtype as i32, dt, di, &mut handle,
             )
         };
         check_err(err)?;
@@ -1491,11 +1529,12 @@ impl Tensor {
     /// Returns a new tensor; the original is unchanged.
     ///
     /// ```ignore
-    /// let gpu = t.to_device(Device::CUDA)?;
+    /// let gpu = t.to_device(Device::CUDA(0))?;
     /// ```
     pub fn to_device(&self, device: Device) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_to_device(self.handle, device as i32, &mut handle) };
+        let (dt, di) = device.to_ffi();
+        let err = unsafe { ffi::flodl_to_device(self.handle, dt, di, &mut handle) };
         check_err(err)?;
         Ok(Tensor::from_raw(handle))
     }
@@ -1686,20 +1725,46 @@ pub fn cuda_device_count() -> i32 {
     unsafe { ffi::flodl_cuda_device_count() }
 }
 
-/// Query CUDA memory usage for the current device.
+/// Query CUDA memory usage for a specific device.
 /// Returns `(used_bytes, total_bytes)` or an error if CUDA is not available.
-pub fn cuda_memory_info() -> Result<(u64, u64)> {
+pub fn cuda_memory_info_idx(device_index: i32) -> Result<(u64, u64)> {
     let mut used: u64 = 0;
     let mut total: u64 = 0;
-    check_err(unsafe { ffi::flodl_cuda_mem_info(&mut used, &mut total) })?;
+    check_err(unsafe { ffi::flodl_cuda_mem_info(device_index, &mut used, &mut total) })?;
     Ok((used, total))
+}
+
+/// Query CUDA memory usage for device 0.
+/// Returns `(used_bytes, total_bytes)` or an error if CUDA is not available.
+pub fn cuda_memory_info() -> Result<(u64, u64)> {
+    cuda_memory_info_idx(0)
 }
 
 /// Query GPU utilization percentage (0-100) via NVML.
 /// Returns `None` if NVML is not available or the query fails.
 pub fn cuda_utilization() -> Option<u32> {
-    let val = unsafe { ffi::flodl_cuda_utilization(0) };
+    cuda_utilization_idx(0)
+}
+
+/// Query GPU utilization percentage for a specific device (0-100) via NVML.
+pub fn cuda_utilization_idx(device_index: i32) -> Option<u32> {
+    let val = unsafe { ffi::flodl_cuda_utilization(device_index) };
     if val >= 0 { Some(val as u32) } else { None }
+}
+
+/// Set the current CUDA device.
+pub fn set_current_cuda_device(device_index: u8) {
+    unsafe { ffi::flodl_set_current_device(device_index as i32) };
+}
+
+/// Get the current CUDA device index.
+pub fn current_cuda_device() -> u8 {
+    unsafe { ffi::flodl_get_current_device() as u8 }
+}
+
+/// Synchronize a CUDA device (wait for all pending work to complete).
+pub fn cuda_synchronize(device_index: u8) {
+    unsafe { ffi::flodl_cuda_synchronize(device_index as i32) };
 }
 
 /// Returns the GPU device name for the given index (e.g. "NVIDIA GeForce GTX 1060 6GB").
@@ -1722,6 +1787,27 @@ pub fn cuda_device_name() -> Option<String> {
     cuda_device_name_idx(0)
 }
 
+/// Information about a CUDA device.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    /// Device index (0-based).
+    pub index: u8,
+    /// Device name (e.g. "NVIDIA GeForce GTX 1060 6GB").
+    pub name: String,
+    /// Total device memory in bytes.
+    pub total_memory: u64,
+}
+
+/// Enumerate all available CUDA devices.
+pub fn cuda_devices() -> Vec<DeviceInfo> {
+    let n = cuda_device_count();
+    (0..n).filter_map(|i| {
+        let name = cuda_device_name_idx(i)?;
+        let total_memory = cuda_memory_info_idx(i).map(|(_, t)| t).unwrap_or(0);
+        Some(DeviceInfo { index: i as u8, name, total_memory })
+    }).collect()
+}
+
 /// One-line hardware summary for dashboard headers.
 ///
 /// Returns something like:
@@ -1736,14 +1822,9 @@ pub fn hardware_summary() -> String {
         let n = cuda_device_count();
         for i in 0..n {
             if let Some(gpu) = cuda_device_name_idx(i) {
-                // VRAM: only available for device 0 via cudaMemGetInfo for now
-                let vram_str = if i == 0 {
-                    cuda_memory_info()
-                        .map(|(_, total)| format!(" ({}GB)", total / (1024 * 1024 * 1024)))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
+                let vram_str = cuda_memory_info_idx(i)
+                    .map(|(_, total)| format!(" ({}GB)", total / (1024 * 1024 * 1024)))
+                    .unwrap_or_default();
                 let _ = std::fmt::Write::write_fmt(&mut s, format_args!(
                     " | {}{}", gpu, vram_str
                 ));
@@ -1830,7 +1911,7 @@ pub fn rss_kb() -> usize {
 pub fn test_device() -> Device {
     use std::sync::Once;
     static PRINT: Once = Once::new();
-    let dev = if cfg!(feature = "cuda") && cuda_available() { Device::CUDA } else { Device::CPU };
+    let dev = if cfg!(feature = "cuda") && cuda_available() { Device::CUDA(0) } else { Device::CPU };
     PRINT.call_once(|| eprintln!("\n*** flodl test device: {} ***\n", dev));
     dev
 }
@@ -2392,5 +2473,61 @@ mod tests {
         let v_data = v.to_f32_vec().unwrap();
         assert!(m_data[0] > 0.0, "m should be updated");
         assert!(v_data[0] > 0.0, "v should be updated");
+    }
+
+    // --- Device model tests ---
+
+    #[test]
+    fn test_device_enum_basics() {
+        assert_eq!(Device::CPU, Device::CPU);
+        assert_eq!(Device::CUDA(0), Device::CUDA(0));
+        assert_ne!(Device::CUDA(0), Device::CUDA(1));
+        assert_ne!(Device::CPU, Device::CUDA(0));
+
+        assert!(!Device::CPU.is_cuda());
+        assert!(Device::CUDA(0).is_cuda());
+        assert!(Device::CUDA(1).is_cuda());
+
+        assert_eq!(Device::CPU.index(), 0);
+        assert_eq!(Device::CUDA(0).index(), 0);
+        assert_eq!(Device::CUDA(1).index(), 1);
+    }
+
+    #[test]
+    fn test_device_display() {
+        assert_eq!(format!("{}", Device::CPU), "cpu");
+        assert_eq!(format!("{}", Device::CUDA(0)), "cuda");
+        assert_eq!(format!("{}", Device::CUDA(1)), "cuda:1");
+    }
+
+    #[test]
+    fn test_device_ffi_roundtrip() {
+        let devices = [Device::CPU, Device::CUDA(0), Device::CUDA(1), Device::CUDA(7)];
+        for dev in &devices {
+            let (dt, di) = dev.to_ffi();
+            let back = Device::from_ffi(dt, di);
+            assert_eq!(*dev, back, "FFI roundtrip failed for {:?}", dev);
+        }
+    }
+
+    #[test]
+    fn test_device_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(Device::CPU);
+        set.insert(Device::CUDA(0));
+        set.insert(Device::CUDA(1));
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&Device::CPU));
+        assert!(set.contains(&Device::CUDA(0)));
+        assert!(set.contains(&Device::CUDA(1)));
+    }
+
+    // --- Send + Sync compile-time checks ---
+
+    #[test]
+    fn test_tensor_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Tensor>();
     }
 }

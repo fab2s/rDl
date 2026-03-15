@@ -395,12 +395,12 @@ impl Module for RepeatNarrow {
 /// Resettable module: exercises Module::reset() auto-detection by loops.
 /// Accumulates a call counter, reset clears it.
 struct CounterModule {
-    count: std::cell::Cell<u32>,
+    count: std::sync::atomic::AtomicU32,
 }
 
 impl CounterModule {
     fn new() -> Self {
-        CounterModule { count: std::cell::Cell::new(0) }
+        CounterModule { count: std::sync::atomic::AtomicU32::new(0) }
     }
 }
 
@@ -408,12 +408,12 @@ impl Module for CounterModule {
     fn name(&self) -> &str { "counter" }
 
     fn forward(&self, input: &Variable) -> flodl::Result<Variable> {
-        self.count.set(self.count.get() + 1);
+        self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(input.clone())
     }
 
     fn reset(&self) {
-        self.count.set(0);
+        self.count.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

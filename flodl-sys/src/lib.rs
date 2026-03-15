@@ -27,38 +27,45 @@ unsafe extern "C" {
     // --- Tensor creation ---
 
     pub fn flodl_zeros(
-        shape: *mut i64, ndim: i32, dtype: i32, device: i32,
+        shape: *mut i64, ndim: i32, dtype: i32,
+        device_type: i32, device_index: i32,
         result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_ones(
-        shape: *mut i64, ndim: i32, dtype: i32, device: i32,
+        shape: *mut i64, ndim: i32, dtype: i32,
+        device_type: i32, device_index: i32,
         result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_rand(
-        shape: *mut i64, ndim: i32, dtype: i32, device: i32,
+        shape: *mut i64, ndim: i32, dtype: i32,
+        device_type: i32, device_index: i32,
         result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_randn(
-        shape: *mut i64, ndim: i32, dtype: i32, device: i32,
+        shape: *mut i64, ndim: i32, dtype: i32,
+        device_type: i32, device_index: i32,
         result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_from_blob(
         data: *mut c_void, shape: *mut i64, ndim: i32,
-        dtype: i32, device: i32, result: *mut FlodlTensor,
+        dtype: i32, device_type: i32, device_index: i32,
+        result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_linspace(
         start: f64, end: f64, steps: i64,
-        dtype: i32, device: i32, result: *mut FlodlTensor,
+        dtype: i32, device_type: i32, device_index: i32,
+        result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_arange(
         start: f64, end: f64, step: f64,
-        dtype: i32, device: i32, result: *mut FlodlTensor,
+        dtype: i32, device_type: i32, device_index: i32,
+        result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_expand(
@@ -76,7 +83,8 @@ unsafe extern "C" {
     pub fn flodl_ndim(t: FlodlTensor) -> i32;
     pub fn flodl_shape(t: FlodlTensor, dim: i32) -> i64;
     pub fn flodl_dtype(t: FlodlTensor) -> i32;
-    pub fn flodl_device(t: FlodlTensor) -> i32;
+    pub fn flodl_device_type(t: FlodlTensor) -> i32;
+    pub fn flodl_device_index(t: FlodlTensor) -> i32;
     pub fn flodl_numel(t: FlodlTensor) -> i64;
 
     // --- Data access ---
@@ -308,17 +316,21 @@ unsafe extern "C" {
     // --- Device ---
 
     pub fn flodl_to_device(
-        t: FlodlTensor, device: i32, result: *mut FlodlTensor,
+        t: FlodlTensor, device_type: i32, device_index: i32,
+        result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_cuda_is_available() -> i32;
     pub fn flodl_cuda_device_count() -> i32;
     pub fn flodl_force_cuda_link() -> i32;
+    pub fn flodl_set_current_device(device_index: i32);
+    pub fn flodl_get_current_device() -> i32;
+    pub fn flodl_cuda_synchronize(device_index: i32);
 
     // --- CUDA memory/utilization (monitor support) ---
 
     pub fn flodl_cuda_mem_info(
-        used_bytes: *mut u64, total_bytes: *mut u64,
+        device_index: i32, used_bytes: *mut u64, total_bytes: *mut u64,
     ) -> *mut i8;
 
     pub fn flodl_cuda_utilization(device_index: i32) -> i32;
@@ -415,11 +427,13 @@ unsafe extern "C" {
     // --- Tensor creation (additional) ---
 
     pub fn flodl_eye(
-        n: i64, dtype: i32, device: i32, result: *mut FlodlTensor,
+        n: i64, dtype: i32, device_type: i32, device_index: i32,
+        result: *mut FlodlTensor,
     ) -> *mut i8;
 
     pub fn flodl_full(
-        shape: *mut i64, ndim: i32, value: f64, dtype: i32, device: i32,
+        shape: *mut i64, ndim: i32, value: f64, dtype: i32,
+        device_type: i32, device_index: i32,
         result: *mut FlodlTensor,
     ) -> *mut i8;
 

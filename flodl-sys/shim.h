@@ -20,20 +20,20 @@ typedef void* FlodlTensor;
 
 // --- Tensor creation ---
 
-char* flodl_zeros(int64_t* shape, int ndim, int dtype, int device,
-                FlodlTensor* result);
-char* flodl_ones(int64_t* shape, int ndim, int dtype, int device,
-               FlodlTensor* result);
-char* flodl_rand(int64_t* shape, int ndim, int dtype, int device,
-               FlodlTensor* result);
-char* flodl_randn(int64_t* shape, int ndim, int dtype, int device,
-                FlodlTensor* result);
+char* flodl_zeros(int64_t* shape, int ndim, int dtype, int device_type,
+                int device_index, FlodlTensor* result);
+char* flodl_ones(int64_t* shape, int ndim, int dtype, int device_type,
+               int device_index, FlodlTensor* result);
+char* flodl_rand(int64_t* shape, int ndim, int dtype, int device_type,
+               int device_index, FlodlTensor* result);
+char* flodl_randn(int64_t* shape, int ndim, int dtype, int device_type,
+                int device_index, FlodlTensor* result);
 char* flodl_from_blob(void* data, int64_t* shape, int ndim, int dtype,
-                    int device, FlodlTensor* result);
+                    int device_type, int device_index, FlodlTensor* result);
 char* flodl_linspace(double start, double end, int64_t steps, int dtype,
-                   int device, FlodlTensor* result);
+                   int device_type, int device_index, FlodlTensor* result);
 char* flodl_arange(double start, double end, double step, int dtype,
-                 int device, FlodlTensor* result);
+                 int device_type, int device_index, FlodlTensor* result);
 char* flodl_expand(FlodlTensor t, int64_t* new_shape, int ndim,
                  FlodlTensor* result);
 
@@ -47,7 +47,8 @@ char* flodl_shallow_clone(FlodlTensor t, FlodlTensor* result);
 int flodl_ndim(FlodlTensor t);
 int64_t flodl_shape(FlodlTensor t, int dim);
 int flodl_dtype(FlodlTensor t);
-int flodl_device(FlodlTensor t);
+int flodl_device_type(FlodlTensor t);
+int flodl_device_index(FlodlTensor t);
 int64_t flodl_numel(FlodlTensor t);
 
 // --- Data access ---
@@ -155,9 +156,10 @@ char* flodl_sort(FlodlTensor t, int dim, int descending,
 
 // --- Tensor creation ---
 
-char* flodl_eye(int64_t n, int dtype, int device, FlodlTensor* result);
-char* flodl_full(int64_t* shape, int ndim, double value, int dtype, int device,
-                FlodlTensor* result);
+char* flodl_eye(int64_t n, int dtype, int device_type, int device_index,
+               FlodlTensor* result);
+char* flodl_full(int64_t* shape, int ndim, double value, int dtype,
+                int device_type, int device_index, FlodlTensor* result);
 
 // --- Shape operations (additional) ---
 
@@ -245,17 +247,21 @@ char* flodl_lstm_cell(FlodlTensor input, FlodlTensor hx, FlodlTensor cx,
 
 // --- Device ---
 
-char* flodl_to_device(FlodlTensor t, int device, FlodlTensor* result);
+char* flodl_to_device(FlodlTensor t, int device_type, int device_index,
+                    FlodlTensor* result);
 int flodl_cuda_is_available(void);
 int flodl_cuda_device_count(void);
 int flodl_force_cuda_link(void);
 void flodl_set_cudnn_benchmark(int enable);
+void flodl_set_current_device(int device_index);
+int flodl_get_current_device(void);
+void flodl_cuda_synchronize(int device_index);
 
 // --- CUDA memory/utilization (monitor support) ---
 
-// Query CUDA memory: writes used and total bytes for the current device.
+// Query CUDA memory: writes used and total bytes for a specific device.
 // Returns error string on failure (caller must free), NULL on success.
-char* flodl_cuda_mem_info(uint64_t* used_bytes, uint64_t* total_bytes);
+char* flodl_cuda_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
 
 // Query GPU utilization percentage (0-100) via NVML.
 // Returns -1 if NVML is not available or query fails.

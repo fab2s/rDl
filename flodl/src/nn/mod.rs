@@ -50,7 +50,7 @@ pub use init::{xavier_uniform, xavier_normal};
 pub use functional::gaussian_blur_2d;
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::autograd::Variable;
 use crate::tensor::Result;
@@ -59,13 +59,14 @@ use crate::tensor::Result;
 ///
 /// All neural network layers implement Module. Composite modules (Graph, loops,
 /// gates) implement Module too, so they compose like any other layer.
+/// Module requires Send + Sync for multi-GPU support.
 ///
 /// ```ignore
 /// let model = Linear::new(4, 2)?;
 /// let x = Variable::new(Tensor::randn(&[1, 4], opts)?, false);
 /// let y = model.forward(&x)?; // [1, 4] → [1, 2]
 /// ```
-pub trait Module {
+pub trait Module: Send + Sync {
     /// Run the forward pass on `input` and return the result.
     fn forward(&self, input: &Variable) -> Result<Variable>;
     /// Return this module's learnable parameters.
@@ -82,7 +83,7 @@ pub trait Module {
         for child in &subs {
             walk_modules_visited(child.as_ref(), &mut visited, &mut |m| {
                 for p in m.parameters() {
-                    let ptr = Rc::as_ptr(&p.variable.inner) as usize;
+                    let ptr = Arc::as_ptr(&p.variable.inner) as usize;
                     if seen.insert(ptr) {
                         params.push(p);
                     }
@@ -106,7 +107,7 @@ pub trait Module {
         for child in &subs {
             walk_modules_visited(child.as_ref(), &mut visited, &mut |m| {
                 for b in m.buffers() {
-                    let ptr = Rc::as_ptr(&b.inner) as usize;
+                    let ptr = Arc::as_ptr(&b.inner) as usize;
                     if seen.insert(ptr) {
                         bufs.push(b);
                     }
@@ -122,7 +123,7 @@ pub trait Module {
 
     /// Return direct child modules for recursive tree walks.
     /// Override in composite modules (loops, switches, gates).
-    fn sub_modules(&self) -> Vec<Rc<dyn Module>> { vec![] }
+    fn sub_modules(&self) -> Vec<Arc<dyn Module>> { vec![] }
 
     /// Move non-parameter tensors (running stats, buffers) to a device.
     /// Override in modules like BatchNorm that hold non-parameter state.

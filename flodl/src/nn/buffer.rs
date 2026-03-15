@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 use crate::tensor::{Device, Result, Tensor};
 
@@ -7,11 +6,11 @@ use crate::tensor::{Device, Result, Tensor};
 ///
 /// Unlike Parameters, buffers are not tracked by optimizers but are
 /// persisted in checkpoints alongside parameters. `Clone` shares the
-/// underlying `Rc`, so the checkpoint system can write through to the
+/// underlying `Arc`, so the checkpoint system can write through to the
 /// same cell the owning module holds.
 #[derive(Clone)]
 pub struct Buffer {
-    pub(crate) inner: Rc<RefCell<Tensor>>,
+    pub(crate) inner: Arc<RwLock<Tensor>>,
     pub name: String,
 }
 
@@ -19,36 +18,36 @@ impl Buffer {
     /// Create a named buffer from a tensor.
     pub fn new(tensor: Tensor, name: &str) -> Self {
         Buffer {
-            inner: Rc::new(RefCell::new(tensor)),
+            inner: Arc::new(RwLock::new(tensor)),
             name: name.to_string(),
         }
     }
 
     /// Get a shallow clone of the underlying tensor.
     pub fn get(&self) -> Tensor {
-        self.inner.borrow().clone()
+        self.inner.read().unwrap().clone()
     }
 
     /// Replace the underlying tensor.
     pub fn set(&self, tensor: Tensor) {
-        *self.inner.borrow_mut() = tensor;
+        *self.inner.write().unwrap() = tensor;
     }
 
     /// Shape of the underlying tensor.
     pub fn shape(&self) -> Vec<i64> {
-        self.inner.borrow().shape()
+        self.inner.read().unwrap().shape()
     }
 
     /// Device of the underlying tensor.
     pub fn device(&self) -> Device {
-        self.inner.borrow().device()
+        self.inner.read().unwrap().device()
     }
 
-    /// Move buffer to a device (writes through the Rc).
+    /// Move buffer to a device (writes through the Arc).
     pub fn to_device(&self, device: Device) -> Result<()> {
         if self.device() != device {
-            let moved = self.inner.borrow().to_device(device)?;
-            *self.inner.borrow_mut() = moved;
+            let moved = self.inner.read().unwrap().to_device(device)?;
+            *self.inner.write().unwrap() = moved;
         }
         Ok(())
     }
@@ -56,7 +55,7 @@ impl Buffer {
 
 impl std::fmt::Debug for Buffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Buffer({}, {:?})", self.name, self.inner.borrow().shape())
+        write!(f, "Buffer({}, {:?})", self.name, self.inner.read().unwrap().shape())
     }
 }
 

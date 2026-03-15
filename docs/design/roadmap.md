@@ -89,7 +89,7 @@ C++ handle cleanup.
 
 `autograd/` — Reverse-mode automatic differentiation backed by libtorch.
 
-- `Variable`: `Rc<RefCell<VariableInner>>` — cheap Clone, interior mutability
+- `Variable`: `Arc<RwLock<VariableInner>>` — cheap Clone, interior mutability, Send+Sync
 - 50+ differentiable operations delegating to libtorch's native autograd
 - `no_grad` closure and `NoGradGuard` for inference
 - `backward()` delegates to libtorch's C++ backward engine
