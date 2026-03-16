@@ -22,7 +22,7 @@ title: Deep learning in Rust
         <button id="copyBtn" onclick="copyCommands()">Copy</button>
       </div>
     </div>
-    <pre id="terminalPre"><span class="prompt">$ </span><span class="cm">curl</span> <span class="flag">-sL</span> <span class="url">https://raw.githubusercontent.com/fab2s/floDl/main/init.sh</span> | <span class="cm">sh</span> <span class="flag">-s</span> <span id="name1">my-project</span>
+    <pre id="terminalPre"><span class="prompt">$ </span><span class="cm">curl</span> <span class="flag">-sL</span> <span class="url">https://flodl.dev/init.sh</span> | <span class="cm">sh</span> <span class="flag">-s</span> <span id="name1">my-project</span>
 <span class="prompt">$ </span><span class="cm">cd</span> <span id="name2">my-project</span>
 <span class="prompt">$ </span><span class="cm">make</span> run         <span class="comment"># first build downloads libtorch (~5 min)</span></pre>
   </div>
@@ -51,7 +51,7 @@ title: Deep learning in Rust
   function copyCommands() {
     var btn = document.getElementById('copyBtn');
     var n = document.getElementById('projName').value.replace(/[^a-zA-Z0-9_-]/g, '') || 'my-project';
-    var text = 'curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/init.sh | sh -s ' + n + '\ncd ' + n + '\nmake run';
+    var text = 'curl -sL https://flodl.dev/init.sh | sh -s ' + n + '\ncd ' + n + '\nmake run';
     navigator.clipboard.writeText(text).then(function() {
       btn.textContent = 'Copied!';
       btn.classList.add('copied');

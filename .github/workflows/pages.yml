@@ -75,6 +75,10 @@ jobs:
       - name: Build guide pages
         run: python3 site/build_guide.py
 
+      # ── Copy init.sh so flodl.dev/init.sh works ──
+      - name: Copy init.sh into site
+        run: cp init.sh site/init.sh
+
       # ── Jekyll site ─────────────────────────────
       - name: Setup Pages
         uses: actions/configure-pages@v5

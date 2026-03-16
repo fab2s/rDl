@@ -77,7 +77,7 @@ every op, module, and pattern.
 Create a new project with one command:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/init.sh | sh -s my-project
+curl -sL https://flodl.dev/init.sh | sh -s my-project
 cd my-project
 make build    # first build (~5 min, downloads libtorch)
 make run      # train the template model
@@ -217,7 +217,7 @@ Requirements: Docker (with NVIDIA Container Toolkit for GPU support).
 
 **New project** (see [Getting Started](#getting-started) above):
 ```bash
-curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/init.sh | sh -s my-project
+curl -sL https://flodl.dev/init.sh | sh -s my-project
 cd my-project && make run
 ```
 
