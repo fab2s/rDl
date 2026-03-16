@@ -17,8 +17,8 @@ pub trait Optimizer {
     fn zero_grad(&self);
     /// Update the learning rate (all groups if grouped).
     fn set_lr(&mut self, lr: f64);
-    /// Set learning rate for a specific parameter group.
-    /// Default: falls back to `set_lr` (single-group optimizers).
+    /// Set learning rate for a specific parameter group (0-indexed).
+    /// Falls back to `set_lr` for single-group optimizers.
     fn set_group_lr(&mut self, _group: usize, lr: f64) {
         self.set_lr(lr);
     }
@@ -30,7 +30,8 @@ struct GroupMeta {
     range: std::ops::Range<usize>,
 }
 
-/// Stateful trait for components that can save/load training state.
+/// Save/load training state (learning rates, momentum buffers, step counters).
+/// Implement for optimizers and other stateful training components.
 pub trait Stateful {
     /// Serialize optimizer state (lr, momentum buffers, etc.) to a writer.
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()>;
@@ -486,7 +487,8 @@ pub struct AdamW {
 }
 
 impl AdamW {
-    /// Create a new AdamW optimizer with decoupled weight decay.
+    /// Create a new AdamW optimizer. `weight_decay` is applied directly to
+    /// parameters (decoupled), not to gradients. Typical values: 0.01--0.1.
     pub fn new(params: &[Parameter], lr: f64, weight_decay: f64) -> Self {
         AdamW {
             adam: Adam::new(params, lr),

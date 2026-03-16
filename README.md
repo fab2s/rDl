@@ -29,6 +29,49 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 
 ---
 
+## If You Know PyTorch, You Know floDl
+
+<table>
+<tr><th>PyTorch</th><th>floDl</th></tr>
+<tr><td>
+
+```python
+model = nn.Sequential(
+    nn.Linear(2, 16),
+    nn.GELU(),
+    nn.LayerNorm(16),
+    nn.Linear(16, 2),
+)
+
+pred = model(x)
+loss = F.mse_loss(pred, target)
+loss.backward()
+optimizer.step()
+```
+
+</td><td>
+
+```rust
+let model = FlowBuilder::from(Linear::new(2, 16)?)
+    .through(GELU)
+    .through(LayerNorm::new(16)?)
+    .through(Linear::new(16, 2)?)
+    .build()?;
+
+let pred = model.forward(&x)?;
+let loss = mse_loss(&pred, &target)?;
+loss.backward()?;
+optimizer.step()?;
+```
+
+</td></tr>
+</table>
+
+Same concepts, same names, same GPU kernels underneath. The `?` operator
+replaces silent failures with compile-time error handling. `Drop` replaces the
+garbage collector. The [full migration guide](docs/pytorch_migration.md) covers
+every op, module, and pattern.
+
 ## Getting Started
 
 Create a new project with one command:
@@ -80,7 +123,9 @@ let g = FlowBuilder::from(encoder).tag("encoded")
 Every construct — `split/merge`, `also`, `loop_body`, `gate`, `switch`, `map`,
 `tag/using` — composes cleanly. Sub-graphs nest like any module. Forward
 references (`using` before `tag`) carry state across calls, enabling recurrent
-architectures without special-casing.
+architectures without special-casing. Enough to express transformers,
+mixture-of-experts, iterative refinement, attention with memory, or any
+architecture you can draw as a data flow graph.
 
 See the **[Graph Builder Tutorial](docs/tutorials/05-graph-builder.md)** and
 the [full showcase](flodl/examples/showcase/) that exercises every builder
@@ -188,7 +233,7 @@ make clippy     # lint
 make shell      # interactive shell in container
 ```
 
-### Train a model in 30 lines
+### Train a model
 
 ```rust
 use flodl::*;
@@ -229,7 +274,7 @@ for (input_t, target_t) in &batches {
 |-------|-------------|
 | **Tensor** | Owned RAII tensors with `Drop`, `Clone`. CPU and CUDA. |
 | **Autograd** | Reverse-mode automatic differentiation. Full backward for every op. |
-| **NN Modules** | `Linear`, `Conv2d`, `ConvTranspose2d`, `LayerNorm`, `BatchNorm`/`BatchNorm2d`, `Dropout`, `Embedding`, `GRUCell`, `LSTMCell` |
+| **NN Modules** | `Linear`, `Conv2d`, `ConvTranspose2d`, `LayerNorm`, `BatchNorm`/`BatchNorm2d`, `Dropout`, `Dropout2d`, `Embedding`, `GRUCell`, `LSTMCell` |
 | **Activations** | `Identity`, `ReLU`, `Sigmoid`, `Tanh`, `GELU`, `SiLU` |
 | **Losses** | `mse_loss`, `cross_entropy_loss`, `bce_with_logits_loss`, `l1_loss`, `smooth_l1_loss`, `kl_div_loss` |
 | **Optimizers** | `SGD` (with momentum), `Adam`, `AdamW` — all support parameter groups for per-group LR |
@@ -270,6 +315,7 @@ for (input_t, target_t) in &batches {
 | LR schedulers | `StepDecay`, `CosineScheduler`, `WarmupScheduler`, `PlateauScheduler` (composable) |
 | `GradScaler` | Dynamic loss scaling for mixed precision (float16) training |
 | `cast_parameters` | Cast model parameters to any dtype |
+| **Background** | `CpuWorker` (work queue), `ModelSnapshot` / `snapshot_cpu()` — offload checkpoints & eval to a background thread |
 
 ### Module Traits
 
@@ -340,7 +386,7 @@ Every differentiable path is verified against finite-difference gradients:
 - 37 autograd op-level checks (every op + compositions)
 - Module-level checks (every NN module, input + parameter gradients)
 - Exact optimizer step verifications (SGD, Adam, AdamW)
-- 311 library tests, zero clippy warnings — all tests run on both CPU and CUDA
+- 329 library tests, zero clippy warnings — all tests run on both CPU and CUDA
 
 ## Why Rust for Deep Learning?
 
@@ -381,6 +427,15 @@ above: the dispatch path, autograd tracking, module composition, and graph
 execution.
 
 ## Performance
+
+floDl runs the same CUDA kernels as PyTorch — the performance difference comes
+from what happens *between* kernel launches: dispatch overhead, autograd
+bookkeeping, and memory management. Rust eliminates Python's per-op overhead
+and the GC pauses that plague Go. Detailed benchmarks are coming soon.
+
+<!-- TODO: benchmark table after clean apples-to-apples comparison run -->
+
+### Build profiles
 
 Add this to your project's `Cargo.toml` to get optimized floDl with fast
 recompilation of your own code:
@@ -451,6 +506,15 @@ and CPU. Switching hardware is a build flag, not a code change.
 
 ## Documentation
 
+### Choose your path
+
+| Background | Start here |
+|-----------|-----------|
+| **New to Rust** | [Rust for PyTorch Users](docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes |
+| **Know Rust, new to DL** | [Tensors](docs/tutorials/01-tensors.md) then [Training](docs/tutorials/04-training.md) |
+| **Know PyTorch** | [PyTorch Migration Guide](docs/pytorch_migration.md) then [Graph Builder](docs/tutorials/05-graph-builder.md) |
+| **Just show me code** | [`quickstart`](flodl/examples/quickstart/) or [`showcase`](flodl/examples/showcase/) |
+
 ### Tutorials
 
 Step-by-step guides from basics to advanced, each with code examples:
@@ -473,7 +537,7 @@ Step-by-step guides from basics to advanced, each with code examples:
 
 ### Examples
 
-- [`quickstart`](flodl/examples/quickstart/) — train a model in 30 lines
+- [`quickstart`](flodl/examples/quickstart/) — build, train, and monitor a model with residual connections
 - [`sine_wave`](flodl/examples/sine_wave/) — sine regression with monitor, checkpoint round-trip
 - [`showcase`](flodl/examples/showcase/) — every graph builder method in one graph
 

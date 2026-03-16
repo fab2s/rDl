@@ -54,7 +54,11 @@ impl Variable {
         }
     }
 
-    /// Get the underlying tensor data (shallow clone).
+    /// Get the underlying tensor data (shallow clone sharing storage).
+    ///
+    /// The returned `Tensor` shares the same memory as the variable's data.
+    /// In-place mutations on either side will be visible to both. If you need
+    /// an independent copy, call `.data().copy()` instead.
     pub fn data(&self) -> Tensor {
         self.inner.borrow().data.clone()
     }
@@ -65,7 +69,8 @@ impl Variable {
         self.inner.borrow().data.grad()
     }
 
-    /// Replace the gradient tensor (for gradient clipping / unscaling).
+    /// Replace the gradient tensor directly (e.g. for gradient clipping or unscaling).
+    /// Equivalent to `param.grad = grad` in PyTorch.
     pub fn set_grad(&self, grad: Tensor) {
         let _ = self.inner.borrow().data.set_grad(&grad);
     }
@@ -98,27 +103,28 @@ impl Variable {
         self.inner.borrow().data.autograd_node_count()
     }
 
-    /// Shape of the underlying data tensor.
+    /// Shape of the underlying tensor (e.g. `[batch, features]`).
     pub fn shape(&self) -> Vec<i64> {
         self.inner.borrow().data.shape()
     }
 
-    /// Data type of the underlying tensor.
+    /// Data type of the underlying tensor (e.g. `Float`, `Half`).
     pub fn dtype(&self) -> DType {
         self.inner.borrow().data.dtype()
     }
 
-    /// Device where the underlying tensor lives.
+    /// Device where the underlying tensor lives (`CPU` or `CUDA(n)`).
     pub fn device(&self) -> Device {
         self.inner.borrow().data.device()
     }
 
-    /// Extract a scalar value as f64.
+    /// Extract a scalar value as `f64`. The tensor must contain exactly one element.
     pub fn item(&self) -> Result<f64> {
         self.inner.borrow().data.item()
     }
 
-    /// Zero out the accumulated gradient.
+    /// Zero out the accumulated gradient (fills `.grad()` with zeros).
+    /// See also [`zero_grad_set_to_none`](Self::zero_grad_set_to_none) for the faster alternative.
     pub fn zero_grad(&self) {
         let _ = self.inner.borrow().data.zero_grad();
     }
@@ -157,7 +163,7 @@ impl Variable {
         self.inner.borrow_mut().data = data;
     }
 
-    /// Number of elements in the data tensor.
+    /// Total number of elements in the tensor (product of all dimensions).
     pub fn numel(&self) -> i64 {
         self.inner.borrow().data.numel()
     }

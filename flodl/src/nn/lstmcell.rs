@@ -9,7 +9,7 @@ use super::Module;
 /// Uses 4 packed parameters (`w_ih`, `w_hh`, `b_ih`, `b_hh`) instead
 /// of 8 separate Linear modules, reducing ~40 kernel launches to ~2.
 ///
-/// State is packed as `cat(h, c, dim=1)` -> shape `[batch, 2*hidden_size]`.
+/// State is packed as `cat(h, c, dim=1)` with shape `[batch, 2*hidden_size]`.
 /// This allows single-Variable passthrough with graph forward refs.
 ///
 /// Standalone usage: call `forward_step(x, state)` directly.
@@ -58,8 +58,8 @@ impl LSTMCell {
         })
     }
 
-    /// Single LSTM step. `state` is packed `cat(h, c, dim=1)` or None for zeros.
-    /// Returns packed `cat(h', c', dim=1)`.
+    /// Single LSTM step. `state` is packed `cat(h, c, dim=1)` or `None` for zeros.
+    /// Returns packed `cat(h', c', dim=1)` with shape `[batch, 2*hidden_size]`.
     pub fn forward_step(&self, x: &Variable, state: Option<&Variable>) -> Result<Variable> {
         let batch = x.shape()[0];
         let hs = self.hidden_size;
@@ -92,6 +92,8 @@ impl LSTMCell {
 impl Module for LSTMCell {
     fn name(&self) -> &str { "lstmcell" }
 
+    /// Module trait forward: returns only h `[batch, hidden_size]` (no cell state).
+    /// Use [`forward_step`](LSTMCell::forward_step) for full packed state access.
     fn forward(&self, input: &Variable) -> Result<Variable> {
         // Extract just h from the packed state output
         let state = self.forward_step(input, None)?;

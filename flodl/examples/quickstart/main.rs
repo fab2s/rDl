@@ -1,4 +1,4 @@
-//! Quickstart — train a model in 30 lines.
+//! Quickstart — build, train, and monitor a model with residual connections.
 //!
 //! Builds a small graph with a residual connection, trains it on random
 //! data using Adam, and logs progress with the training monitor.

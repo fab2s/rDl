@@ -23,10 +23,12 @@ pub struct SoftmaxRouter {
 }
 
 impl SoftmaxRouter {
+    /// Create a softmax router projecting `input_dim` to `num_experts` on CPU.
     pub fn new(input_dim: i64, num_experts: i64) -> Result<Self> {
         Self::on_device(input_dim, num_experts, Device::CPU)
     }
 
+    /// Create a softmax router on the specified device.
     pub fn on_device(input_dim: i64, num_experts: i64, device: Device) -> Result<Self> {
         Ok(SoftmaxRouter {
             proj: Rc::new(Linear::on_device(input_dim, num_experts, device)?),
@@ -75,10 +77,12 @@ pub struct SigmoidRouter {
 }
 
 impl SigmoidRouter {
+    /// Create a sigmoid router projecting `input_dim` to `num_experts` on CPU.
     pub fn new(input_dim: i64, num_experts: i64) -> Result<Self> {
         Self::on_device(input_dim, num_experts, Device::CPU)
     }
 
+    /// Create a sigmoid router on the specified device.
     pub fn on_device(input_dim: i64, num_experts: i64, device: Device) -> Result<Self> {
         Ok(SigmoidRouter {
             proj: Rc::new(Linear::on_device(input_dim, num_experts, device)?),
@@ -124,6 +128,7 @@ pub struct FixedSelector {
 }
 
 impl FixedSelector {
+    /// Create a selector that always routes to `index` (0-based branch).
     pub fn new(index: usize) -> Self {
         FixedSelector { index: index as f32 }
     }
@@ -151,10 +156,12 @@ pub struct ArgmaxSelector {
 }
 
 impl ArgmaxSelector {
+    /// Create an argmax selector projecting `input_dim` to `num_branches` on CPU.
     pub fn new(input_dim: i64, num_branches: i64) -> Result<Self> {
         Self::on_device(input_dim, num_branches, Device::CPU)
     }
 
+    /// Create an argmax selector on the specified device.
     pub fn on_device(input_dim: i64, num_branches: i64, device: Device) -> Result<Self> {
         Ok(ArgmaxSelector {
             proj: Rc::new(Linear::on_device(input_dim, num_branches, device)?),

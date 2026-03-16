@@ -24,6 +24,7 @@ impl StepDecay {
         }
     }
 
+    /// Learning rate at the given step.
     pub fn lr(&self, step: usize) -> f64 {
         let decays = step / self.step_size;
         self.base_lr * self.gamma.powi(decays as i32)
@@ -53,6 +54,7 @@ impl CosineScheduler {
         }
     }
 
+    /// Learning rate at the given step.
     pub fn lr(&self, step: usize) -> f64 {
         let t = (step.min(self.total_steps) as f64) / (self.total_steps as f64);
         self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1.0 + (t * std::f64::consts::PI).cos())
@@ -74,7 +76,9 @@ pub struct WarmupScheduler<S: Scheduler> {
 }
 
 impl<S: Scheduler> WarmupScheduler<S> {
-    /// Create a warmup scheduler that ramps from 0 to `target_lr` then delegates to `inner`.
+    /// Create a warmup scheduler that linearly ramps from 0 to `target_lr` over
+    /// `warmup_steps`, then delegates to `inner` (whose step counter starts at 0
+    /// after warmup completes).
     pub fn new(inner: S, target_lr: f64, warmup_steps: usize) -> Self {
         WarmupScheduler {
             inner,
@@ -83,6 +87,7 @@ impl<S: Scheduler> WarmupScheduler<S> {
         }
     }
 
+    /// Learning rate at the given step.
     pub fn lr(&self, step: usize) -> f64 {
         if step < self.warmup_steps {
             self.target_lr * (step as f64 + 1.0) / (self.warmup_steps as f64)

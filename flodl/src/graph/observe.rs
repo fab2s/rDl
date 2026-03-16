@@ -6,10 +6,15 @@ use super::Graph;
 
 /// Reduction strategy for non-scalar tagged outputs in collect_with().
 pub enum Reduce {
+    /// Arithmetic mean over all elements.
     Mean,
+    /// Sum of all elements.
     Sum,
+    /// Maximum element value.
     Max,
+    /// Minimum element value.
     Min,
+    /// L2 norm (Frobenius norm for matrices).
     Norm,
 }
 

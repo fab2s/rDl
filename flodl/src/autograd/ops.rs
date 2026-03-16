@@ -11,46 +11,55 @@ use super::variable::Variable;
 impl Variable {
     // --- Arithmetic ---
 
+    /// Element-wise addition.
     pub fn add(&self, other: &Variable) -> Result<Variable> {
         let result = self.data().add(&other.data())?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise subtraction.
     pub fn sub(&self, other: &Variable) -> Result<Variable> {
         let result = self.data().sub(&other.data())?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise multiplication (Hadamard product).
     pub fn mul(&self, other: &Variable) -> Result<Variable> {
         let result = self.data().mul(&other.data())?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise division.
     pub fn div(&self, other: &Variable) -> Result<Variable> {
         let result = self.data().div(&other.data())?;
         Ok(Variable::wrap(result))
     }
 
+    /// Matrix multiplication (`torch.matmul`). Supports batched matmul.
     pub fn matmul(&self, other: &Variable) -> Result<Variable> {
         let result = self.data().matmul(&other.data())?;
         Ok(Variable::wrap(result))
     }
 
+    /// Multiply all elements by a scalar.
     pub fn mul_scalar(&self, scalar: f64) -> Result<Variable> {
         let result = self.data().mul_scalar(scalar)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Divide all elements by a scalar.
     pub fn div_scalar(&self, scalar: f64) -> Result<Variable> {
         let result = self.data().div_scalar(scalar)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Add a scalar to all elements.
     pub fn add_scalar(&self, scalar: f64) -> Result<Variable> {
         let result = self.data().add_scalar(scalar)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise negation.
     pub fn neg(&self) -> Result<Variable> {
         let result = self.data().neg()?;
         Ok(Variable::wrap(result))
@@ -58,26 +67,31 @@ impl Variable {
 
     // --- Activations ---
 
+    /// ReLU activation: `max(0, x)`.
     pub fn relu(&self) -> Result<Variable> {
         let result = self.data().relu()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Sigmoid activation: `1 / (1 + exp(-x))`.
     pub fn sigmoid(&self) -> Result<Variable> {
         let result = self.data().sigmoid()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Tanh activation. Named `tanh_act` to avoid conflict with `f64::tanh`.
     pub fn tanh_act(&self) -> Result<Variable> {
         let result = self.data().tanh_op()?;
         Ok(Variable::wrap(result))
     }
 
+    /// GELU activation (Gaussian Error Linear Unit).
     pub fn gelu(&self) -> Result<Variable> {
         let result = self.data().gelu()?;
         Ok(Variable::wrap(result))
     }
 
+    /// SiLU activation (Sigmoid Linear Unit, aka Swish): `x * sigmoid(x)`.
     pub fn silu(&self) -> Result<Variable> {
         let result = self.data().silu()?;
         Ok(Variable::wrap(result))
@@ -85,61 +99,73 @@ impl Variable {
 
     // --- Reductions ---
 
+    /// Sum of all elements, returning a scalar.
     pub fn sum(&self) -> Result<Variable> {
         let result = self.data().sum()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Mean of all elements, returning a scalar.
     pub fn mean(&self) -> Result<Variable> {
         let result = self.data().mean()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Sum along a dimension. If `keepdim`, the reduced dimension is retained with size 1.
     pub fn sum_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
         let result = self.data().sum_dim(dim, keepdim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Mean along a dimension. If `keepdim`, the reduced dimension is retained with size 1.
     pub fn mean_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
         let result = self.data().mean_dim(dim, keepdim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Minimum of all elements, returning a scalar.
     pub fn min(&self) -> Result<Variable> {
         let result = self.data().min()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Maximum of all elements, returning a scalar.
     pub fn max(&self) -> Result<Variable> {
         let result = self.data().max()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Minimum values along a dimension.
     pub fn min_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
         let result = self.data().min_dim(dim, keepdim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Maximum values along a dimension.
     pub fn max_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
         let result = self.data().max_dim(dim, keepdim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Variance of all elements (Bessel-corrected).
     pub fn var(&self) -> Result<Variable> {
         let result = self.data().var()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Standard deviation of all elements (Bessel-corrected).
     pub fn std(&self) -> Result<Variable> {
         let result = self.data().std()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Variance along a dimension (Bessel-corrected).
     pub fn var_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
         let result = self.data().var_dim(dim, keepdim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Standard deviation along a dimension (Bessel-corrected).
     pub fn std_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
         let result = self.data().std_dim(dim, keepdim)?;
         Ok(Variable::wrap(result))
@@ -147,11 +173,13 @@ impl Variable {
 
     // --- Softmax ---
 
+    /// Softmax along `dim` (output sums to 1).
     pub fn softmax(&self, dim: i32) -> Result<Variable> {
         let result = self.data().softmax(dim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Log-softmax along `dim` (numerically stable `log(softmax(x))`).
     pub fn log_softmax(&self, dim: i32) -> Result<Variable> {
         let result = self.data().log_softmax(dim)?;
         Ok(Variable::wrap(result))
@@ -159,71 +187,85 @@ impl Variable {
 
     // --- Element-wise math ---
 
+    /// Element-wise exponential.
     pub fn exp(&self) -> Result<Variable> {
         let result = self.data().exp()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise natural logarithm.
     pub fn log(&self) -> Result<Variable> {
         let result = self.data().log()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise square root.
     pub fn sqrt(&self) -> Result<Variable> {
         let result = self.data().sqrt()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise absolute value.
     pub fn abs(&self) -> Result<Variable> {
         let result = self.data().abs()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Raise each element to a scalar power.
     pub fn pow_scalar(&self, exponent: f64) -> Result<Variable> {
         let result = self.data().pow_scalar(exponent)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Upper triangular part. `diagonal=0` keeps the main diagonal; positive shifts up.
     pub fn triu(&self, diagonal: i64) -> Result<Variable> {
         let result = self.data().triu(diagonal)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise sine.
     pub fn sin(&self) -> Result<Variable> {
         let result = self.data().sin()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise cosine.
     pub fn cos(&self) -> Result<Variable> {
         let result = self.data().cos()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise sign (-1, 0, or 1).
     pub fn sign(&self) -> Result<Variable> {
         let result = self.data().sign()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise floor (round toward negative infinity).
     pub fn floor(&self) -> Result<Variable> {
         let result = self.data().floor()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise ceil (round toward positive infinity).
     pub fn ceil(&self) -> Result<Variable> {
         let result = self.data().ceil()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise round to nearest integer.
     pub fn round(&self) -> Result<Variable> {
         let result = self.data().round()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Element-wise reciprocal (`1/x`).
     pub fn reciprocal(&self) -> Result<Variable> {
         let result = self.data().reciprocal()?;
         Ok(Variable::wrap(result))
     }
 
+    /// Clamp all elements to `[min, max]`.
     pub fn clamp(&self, min: f64, max: f64) -> Result<Variable> {
         let result = self.data().clamp(min, max)?;
         Ok(Variable::wrap(result))
@@ -231,41 +273,49 @@ impl Variable {
 
     // --- Shape operations ---
 
+    /// Return a view with a different shape. Use `-1` for one inferred dimension.
     pub fn reshape(&self, shape: &[i64]) -> Result<Variable> {
         let result = self.data().reshape(shape)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Swap two dimensions.
     pub fn transpose(&self, dim0: i32, dim1: i32) -> Result<Variable> {
         let result = self.data().transpose(dim0, dim1)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Reorder dimensions according to the given permutation.
     pub fn permute(&self, dims: &[i64]) -> Result<Variable> {
         let result = self.data().permute(dims)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Remove a dimension of size 1.
     pub fn squeeze(&self, dim: i32) -> Result<Variable> {
         let result = self.data().squeeze(dim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Insert a dimension of size 1 at `dim`.
     pub fn unsqueeze(&self, dim: i32) -> Result<Variable> {
         let result = self.data().unsqueeze(dim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Insert size-1 dimensions at multiple positions.
     pub fn unsqueeze_many(&self, dims: &[i32]) -> Result<Variable> {
         let result = self.data().unsqueeze_many(dims)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Flatten dimensions from `start_dim` to `end_dim` (inclusive) into one.
     pub fn flatten(&self, start_dim: i32, end_dim: i32) -> Result<Variable> {
         let result = self.data().flatten(start_dim, end_dim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Broadcast to `shape` without copying data. Use `-1` to keep a dimension.
     pub fn expand(&self, shape: &[i64]) -> Result<Variable> {
         let result = self.data().expand(shape)?;
         Ok(Variable::wrap(result))
@@ -273,31 +323,37 @@ impl Variable {
 
     // --- Indexing & slicing ---
 
+    /// Slice along `dim` from `start` for `length` elements.
     pub fn narrow(&self, dim: i32, start: i64, length: i64) -> Result<Variable> {
         let result = self.data().narrow(dim, start, length)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Select a single index along `dim`, removing that dimension.
     pub fn select(&self, dim: i32, index: i64) -> Result<Variable> {
         let result = self.data().select(dim, index)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Select multiple indices along `dim` using a 1-D index tensor.
     pub fn index_select(&self, dim: i32, index: &Tensor) -> Result<Variable> {
         let result = self.data().index_select(dim, index)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Gather values along `dim` using an index tensor of the same rank.
     pub fn gather(&self, dim: i32, index: &Tensor) -> Result<Variable> {
         let result = self.data().gather(dim, index)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Concatenate two variables along `dim`.
     pub fn cat(&self, other: &Variable, dim: i32) -> Result<Variable> {
         let result = self.data().cat(&other.data(), dim)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Concatenate multiple variables along `dim` (`torch.cat`).
     pub fn cat_many(vars: &[&Variable], dim: i32) -> Result<Variable> {
         let tensors: Vec<Tensor> = vars.iter().map(|v| v.data()).collect();
         let refs: Vec<&Tensor> = tensors.iter().collect();
@@ -305,6 +361,7 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
+    /// Stack variables along a new dimension (`torch.stack`).
     pub fn stack(vars: &[Variable], dim: i32) -> Result<Variable> {
         let tensors: Vec<Tensor> = vars.iter().map(|v| v.data()).collect();
         let refs: Vec<&Tensor> = tensors.iter().collect();
@@ -312,16 +369,19 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
+    /// Split into `chunks` pieces along `dim` (`torch.chunk`).
     pub fn chunk(&self, chunks: i32, dim: i32) -> Result<Vec<Variable>> {
         let tensors = self.data().chunk(chunks, dim)?;
         Ok(tensors.into_iter().map(Variable::wrap).collect())
     }
 
+    /// Repeat the tensor along each dimension by the given counts.
     pub fn repeat(&self, repeats: &[i64]) -> Result<Variable> {
         let result = self.data().repeat(repeats)?;
         Ok(Variable::wrap(result))
     }
 
+    /// Constant-value padding. `padding` is `[left, right, ...]` from the last dim inward.
     pub fn pad(&self, padding: &[i64], value: f64) -> Result<Variable> {
         let result = self.data().pad(padding, value)?;
         Ok(Variable::wrap(result))
@@ -329,11 +389,13 @@ impl Variable {
 
     // --- Sorting ---
 
+    /// Return the `k` largest (or smallest) values and their indices along `dim`.
     pub fn topk(&self, k: i64, dim: i32, largest: bool, sorted: bool) -> Result<(Variable, Tensor)> {
         let (values, indices) = self.data().topk(k, dim, largest, sorted)?;
         Ok((Variable::wrap(values), indices))
     }
 
+    /// Sort along `dim`. Returns `(sorted_values, indices)`.
     pub fn sort(&self, dim: i32, descending: bool) -> Result<(Variable, Tensor)> {
         let (values, indices) = self.data().sort(dim, descending)?;
         Ok((Variable::wrap(values), indices))
@@ -399,6 +461,7 @@ pub fn lstm_cell(
 }
 
 /// Layer normalization with autograd support.
+/// Normalizes over the last `normalized_size` elements using `weight` (gamma) and `bias` (beta).
 pub fn layer_norm(
     input: &Variable,
     weight: &Variable,
@@ -412,7 +475,8 @@ pub fn layer_norm(
     Ok(Variable::wrap(output))
 }
 
-/// 2D convolution with autograd support.
+/// 2D convolution with autograd support (`F.conv2d`).
+/// `input` is `[N, C_in, H, W]`, `weight` is `[C_out, C_in/groups, kH, kW]`.
 pub fn conv2d(
     input: &Variable,
     weight: &Variable,
@@ -431,7 +495,8 @@ pub fn conv2d(
     Ok(Variable::wrap(result))
 }
 
-/// Transposed 2D convolution with autograd support.
+/// Transposed 2D convolution with autograd support (`F.conv_transpose2d`).
+/// `output_padding` resolves the ambiguity in output shape for fractionally-strided convolutions.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose2d(
     input: &Variable,
@@ -452,7 +517,7 @@ pub fn conv_transpose2d(
     Ok(Variable::wrap(result))
 }
 
-/// Adaptive average pooling with autograd support.
+/// Adaptive average pooling that outputs a fixed `[H, W]` regardless of input size.
 pub fn adaptive_avg_pool2d(
     input: &Variable,
     output_size: [i64; 2],
@@ -461,7 +526,8 @@ pub fn adaptive_avg_pool2d(
     Ok(Variable::wrap(result))
 }
 
-/// Grid sampling with autograd support.
+/// Grid sampling with autograd support (`F.grid_sample`).
+/// `mode`: 0=bilinear, 1=nearest, 2=bicubic. `padding_mode`: 0=zeros, 1=border, 2=reflection.
 pub fn grid_sample(
     input: &Variable,
     grid: &Variable,

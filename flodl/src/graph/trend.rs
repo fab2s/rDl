@@ -6,18 +6,22 @@ pub struct Trend {
 }
 
 impl Trend {
+    /// Create a trend from a vector of scalar observations (one per epoch).
     pub fn new(values: Vec<f64>) -> Self {
         Trend { values }
     }
 
+    /// Number of recorded data points.
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
+    /// True if no data points have been recorded.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
 
+    /// All recorded values as a slice.
     pub fn values(&self) -> &[f64] {
         &self.values
     }
@@ -33,6 +37,7 @@ impl Trend {
         self.values.last().copied().unwrap_or(0.0)
     }
 
+    /// Arithmetic mean of all values, or 0.0 if empty.
     pub fn mean(&self) -> f64 {
         if self.values.is_empty() {
             return 0.0;
@@ -40,6 +45,7 @@ impl Trend {
         self.values.iter().sum::<f64>() / self.values.len() as f64
     }
 
+    /// Minimum value, or `+inf` if empty.
     pub fn min(&self) -> f64 {
         self.values
             .iter()
@@ -47,6 +53,7 @@ impl Trend {
             .fold(f64::INFINITY, f64::min)
     }
 
+    /// Maximum value, or `-inf` if empty.
     pub fn max(&self) -> f64 {
         self.values
             .iter()
@@ -114,38 +121,47 @@ fn ols_slope(data: &[f64]) -> f64 {
 pub struct TrendGroup(pub Vec<Trend>);
 
 impl TrendGroup {
+    /// Number of trends in the group.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// True if the group contains no trends.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// True if every trend in the group has a negative slope (decreasing loss).
     pub fn all_improving(&self, window: usize) -> bool {
         !self.0.is_empty() && self.0.iter().all(|t| t.improving(window))
     }
 
+    /// True if at least one trend has a negative slope.
     pub fn any_improving(&self, window: usize) -> bool {
         self.0.iter().any(|t| t.improving(window))
     }
 
+    /// True if every trend is stalled (|slope| < tol).
     pub fn all_stalled(&self, window: usize, tol: f64) -> bool {
         !self.0.is_empty() && self.0.iter().all(|t| t.stalled(window, tol))
     }
 
+    /// True if at least one trend is stalled (|slope| < tol).
     pub fn any_stalled(&self, window: usize, tol: f64) -> bool {
         self.0.iter().any(|t| t.stalled(window, tol))
     }
 
+    /// True if every trend has converged (variance < tol over window).
     pub fn all_converged(&self, window: usize, tol: f64) -> bool {
         !self.0.is_empty() && self.0.iter().all(|t| t.converged(window, tol))
     }
 
+    /// True if at least one trend has converged (variance < tol over window).
     pub fn any_converged(&self, window: usize, tol: f64) -> bool {
         self.0.iter().any(|t| t.converged(window, tol))
     }
 
+    /// Average OLS slope across all trends in the group.
     pub fn mean_slope(&self, window: usize) -> f64 {
         if self.0.is_empty() {
             return 0.0;
@@ -154,6 +170,7 @@ impl TrendGroup {
         sum / self.0.len() as f64
     }
 
+    /// Per-trend OLS slopes, in the same order as the group.
     pub fn slopes(&self, window: usize) -> Vec<f64> {
         self.0.iter().map(|t| t.slope(window)).collect()
     }

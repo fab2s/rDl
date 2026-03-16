@@ -35,21 +35,26 @@ use crate::graph::Graph;
 pub use format::{format_eta, format_bytes, format_metric};
 pub use resources::{ResourceSample, ResourceSampler};
 
-/// Recorded metrics for a single epoch.
+/// Recorded snapshot of a single training epoch: timing, metrics, and resource usage.
 #[derive(Clone)]
 pub struct EpochRecord {
+    /// Zero-based epoch index.
     pub epoch: usize,
+    /// Wall-clock duration of this epoch in seconds.
     pub duration_secs: f64,
+    /// Named metric values recorded during this epoch (e.g., `("loss", 0.42)`).
     pub metrics: Vec<(String, f64)>,
+    /// System resource snapshot taken at the end of this epoch.
     pub resources: ResourceSample,
 }
 
-/// Trait for values accepted by [`Monitor::log()`].
+/// Trait for values accepted by [`Monitor::log()`] as the `metrics` argument.
 ///
-/// Implemented for plain metric slices, graph references, and tuples of
-/// (graph, extras) so that `log` accepts all three forms.
+/// This lets `log` accept plain `&[("loss", val)]` slices, a `&Graph` reference
+/// (which pulls the latest observation epoch), or a `(&Graph, &[...])` tuple
+/// that appends extra metrics to the graph's own.
 pub trait Metrics {
-    /// Collect metrics as owned `(name, value)` pairs.
+    /// Convert into owned `(name, value)` pairs for recording.
     fn into_metrics(self) -> Vec<(String, f64)>;
 }
 
@@ -344,12 +349,15 @@ impl Monitor {
         }
     }
 
-    /// Get all recorded epoch data.
+    /// Return all recorded epoch data, ordered by epoch index.
     pub fn history(&self) -> &[EpochRecord] {
         &self.epochs
     }
 
-    /// Write a training log to a file (all epochs, metrics, and timing).
+    /// Write a human-readable training log to a text file.
+    ///
+    /// Each line has the format: `epoch N/T  metric=value  [duration]`.
+    /// A final `# total: ...` line gives the overall wall-clock time.
     pub fn write_log(&self, path: &str) -> std::io::Result<()> {
         let mut b = String::with_capacity(4096);
         let _ = writeln!(b, "# flodl training log");
@@ -372,7 +380,11 @@ impl Monitor {
         std::fs::write(path, b)
     }
 
-    /// Export epoch metrics to CSV.
+    /// Export epoch data to CSV for analysis in external tools.
+    ///
+    /// Columns: `epoch`, `duration_s`, one column per metric name, then
+    /// `cpu_pct`, `ram_used`, `gpu_pct`, `vram_used`. Metric names are
+    /// taken from the first epoch's metrics.
     pub fn export_csv(&self, path: &str) -> std::io::Result<()> {
         if self.epochs.is_empty() {
             return Ok(());

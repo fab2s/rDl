@@ -58,7 +58,8 @@ impl GRUCell {
         })
     }
 
-    /// Single GRU step: returns new hidden state.
+    /// Single GRU step: returns new hidden state `[batch, hidden_size]`.
+    /// Pass `None` for `h` to zero-initialize the hidden state.
     pub fn forward_step(&self, x: &Variable, h: Option<&Variable>) -> Result<Variable> {
         let batch = x.shape()[0];
 
@@ -84,9 +85,9 @@ impl GRUCell {
 impl Module for GRUCell {
     fn name(&self) -> &str { "grucell" }
 
-    /// Forward with hidden state as input.
-    /// If input shape is `[batch, input_size]`, treats as x with no hidden state.
-    /// Use `forward_step` for explicit hidden state control.
+    /// Module trait forward: runs a single step with zero-initialized hidden state.
+    /// Does not accept or return hidden state -- use [`forward_step`](GRUCell::forward_step)
+    /// for explicit hidden state control in recurrent loops.
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.forward_step(input, None)
     }

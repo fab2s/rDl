@@ -134,6 +134,40 @@ for epoch in 0..num_epochs {
 }
 ```
 
+### Background checkpoints with CpuWorker
+
+During GPU training, saving a checkpoint blocks the GPU. Use `snapshot_cpu()`
+to copy model state to CPU, then save it on a background thread:
+
+```rust
+use flodl::{CpuWorker, ModelSnapshot};
+
+let worker = CpuWorker::new();
+
+for epoch in 0..num_epochs {
+    // ... training loop ...
+
+    if (epoch + 1) % 10 == 0 {
+        let snap = model.snapshot_cpu()?;
+        let path = format!("/tmp/checkpoint_epoch_{}.fdl.gz", epoch + 1);
+
+        // Skip if previous save is still running
+        if worker.is_idle() {
+            worker.submit(move || {
+                snap.save_file(&path).unwrap();
+            });
+        }
+    }
+}
+// worker.finish() is called on Drop — waits for queued saves
+```
+
+`snapshot_cpu()` copies all parameters (detached from autograd) and buffers to
+CPU. The resulting `ModelSnapshot` is `Send`, so it can safely cross thread
+boundaries. The checkpoint format is the same `.fdl` format used by
+`save_checkpoint` — files saved with `save_file` can be loaded by
+`load_checkpoint_file`.
+
 ## Weight initialization
 
 floDl modules use sensible defaults — `Linear` initializes weights with

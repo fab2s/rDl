@@ -356,12 +356,12 @@ fn main() -> Result<()> {
 
     // Set up training.
     let params = model.parameters();
-    let optimizer = Adam::new(&params, 0.01);
+    let mut optimizer = Adam::new(&params, 0.01);
     model.set_training(true);
 
     // Training loop (simplified — no data loader yet).
-    let input_t = Tensor::randn(&[20, 2], &TensorOptions::default())?;
-    let target_t = Tensor::randn(&[20, 2], &TensorOptions::default())?;
+    let input_t = Tensor::randn(&[20, 2], TensorOptions::default())?;
+    let target_t = Tensor::randn(&[20, 2], TensorOptions::default())?;
 
     for epoch in 0..50 {
         let input = Variable::new(input_t.clone(), true);
@@ -382,7 +382,7 @@ fn main() -> Result<()> {
 
     // Eval.
     model.set_training(false);
-    let test_input = Tensor::from_f32(&[0.5, 0.3], &[1, 2])?;
+    let test_input = Tensor::from_f32(&[0.5, 0.3], &[1, 2], Device::CPU)?;
     let pred = no_grad(|| {
         model.forward(&Variable::new(test_input, false))
     })?;

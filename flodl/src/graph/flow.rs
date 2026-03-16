@@ -238,6 +238,9 @@ impl FlowBuilder {
     }
 
     /// Name the current stream position for later reference via [`using`](Self::using).
+    ///
+    /// Tags also serve as keys for observation (`collect`/`trend`), checkpoint
+    /// serialization (`named_parameters`), and profiling (`timing`).
     pub fn tag(mut self, name: &str) -> Self {
         if self.err.is_some() {
             return self;
@@ -502,7 +505,11 @@ impl FlowBuilder {
         super::map::MapBuilder::new(self, Box::new(body))
     }
 
-    /// Finalize the flow into an executable Graph.
+    /// Finalize the flow into an executable [`Graph`](super::Graph).
+    ///
+    /// Validates that all streams are merged, all forward refs are resolved,
+    /// and computes the topological execution order. Returns an error if the
+    /// graph is malformed.
     pub fn build(self) -> crate::tensor::Result<super::Graph> {
         if let Some(err) = self.err {
             return Err(TensorError::new(&err));

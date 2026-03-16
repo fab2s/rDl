@@ -6,11 +6,11 @@ use super::buffer::Buffer;
 use super::parameter::Parameter;
 
 /// Magic bytes for `.fdl` checkpoint files.
-const MAGIC: [u8; 4] = *b"FDLC";
+pub(crate) const MAGIC: [u8; 4] = *b"FDLC";
 /// Checkpoint format v1: `MAGIC | VERSION(u32=1) | hash(32 bytes) | num_entries(u32) | entries...`
-const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 1;
 /// Size of the structural hash field in the checkpoint header.
-const HASH_LEN: usize = 32;
+pub(crate) const HASH_LEN: usize = 32;
 
 /// Report from a checkpoint load: what was loaded, skipped, or missing.
 #[derive(Debug, Clone)]
@@ -291,7 +291,7 @@ fn dtype_from_tag(tag: u8) -> Result<DType> {
 }
 
 /// Write tensor data in native dtype: shape + dtype tag + raw bytes.
-fn write_tensor_data<W: Write>(w: &mut W, t: &Tensor) -> Result<()> {
+pub(crate) fn write_tensor_data<W: Write>(w: &mut W, t: &Tensor) -> Result<()> {
     let shape = t.shape();
     w.write_all(&(shape.len() as u32).to_le_bytes()).map_err(io_err)?;
     for &s in &shape {
@@ -393,7 +393,7 @@ fn tensor_from_raw_bytes(raw: &[u8], shape: &[i64], dtype: DType) -> Result<Tens
 
 // --- Shared helpers ---
 
-fn io_err(e: impl std::fmt::Display) -> TensorError {
+pub(crate) fn io_err(e: impl std::fmt::Display) -> TensorError {
     TensorError::new(&format!("io: {}", e))
 }
 

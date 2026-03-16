@@ -26,6 +26,7 @@ pub mod autograd;
 pub mod nn;
 pub mod graph;
 pub mod monitor;
+pub mod worker;
 
 /// Shorthand for building `Vec<Box<dyn Module>>` from a list of modules.
 /// Use with `split`, `gate`, and `switch` to avoid manual `Box::new()` wrapping.
@@ -63,5 +64,6 @@ pub use graph::{
     Profile, NodeTiming, LevelTiming, format_duration,
     SoftmaxRouter, SigmoidRouter, FixedSelector, ArgmaxSelector,
     ThresholdHalt, LearnedHalt,
-    Reshape, StateAdd, Reduce,
+    Reshape, StateAdd, Reduce, ModelSnapshot,
 };
+pub use worker::CpuWorker;

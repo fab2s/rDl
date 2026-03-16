@@ -12,7 +12,7 @@ through that space. Training shapes the landscape. Inference lets the input
 follow its natural trajectory. Everything else is implementation detail.
 
 This document frames the core concepts of deep learning through the trajectory
-lens and connects them to floDl's architecture decisions.
+lens and connects them to flodl's architecture decisions.
 
 ---
 
@@ -89,7 +89,7 @@ loop iteration, every early-exit check is a Python `if` statement with ~3-5us
 overhead plus a CUDA synchronization point. The framework *discourages*
 trajectory branching through performance pressure.
 
-floDl removes that pressure. Rust's zero-cost abstractions mean branches are
+flodl removes that pressure. Rust's zero-cost abstractions mean branches are
 pattern matches (nanoseconds). Loops are Rust `for` loops. The trajectory
 structure is determined by the math, not by the framework's limitations.
 
@@ -109,7 +109,7 @@ structure:
 - **Parallel paths**: independent trajectories (e.g., multiple attention heads)
   get independent gradients. The heads can specialize without interference.
 
-This is why floDl delegates to libtorch's native autograd — the C++ engine
+This is why flodl delegates to libtorch's native autograd — the C++ engine
 captures the actual trajectory through the computation graph, including branches
 and variable length, without pre-tracing.
 
@@ -143,9 +143,9 @@ but because the tools make them impractical to explore.
 
 ---
 
-## Connection to floDl's architecture
+## Connection to flodl's architecture
 
-floDl's layered design maps directly to the trajectory thesis:
+flodl's layered design maps directly to the trajectory thesis:
 
 1. **Tensor API** — the coordinate system. Points in activation space are
    tensors. Operations move points.
@@ -283,7 +283,7 @@ These are research problems, not engineering problems. But they require a
 framework where multi-strategy composition is a natural primitive — not a
 fragile collection of custom training loops and manual gradient hacks.
 
-### Why this needs floDl
+### Why this needs flodl
 
 In Python/PyTorch, multi-strategy training is possible but painful:
 
@@ -295,7 +295,7 @@ In Python/PyTorch, multi-strategy training is possible but painful:
 - Dynamic routing between strategies hits Python's per-op overhead at every
   branch point
 
-In floDl's graph engine, multi-strategy composition is structural:
+In flodl's graph engine, multi-strategy composition is structural:
 
 - Each sub-graph carries its training context (optimizer, loss, schedule)
 - Gradient flow between sub-graphs is declared in the graph topology
@@ -402,7 +402,7 @@ It's that the tools didn't support it:
   the orchestrator's branching decisions each cost 3-5us of Python overhead,
   complex routing becomes impractical.
 
-floDl's graph engine is designed to make all of this structural: sub-graphs with
+flodl's graph engine is designed to make all of this structural: sub-graphs with
 independent training contexts, selective gradient flow, and zero-overhead routing
 decisions. Not because the graph engine solves the research problems — but
 because it removes the engineering barriers that prevent the research from

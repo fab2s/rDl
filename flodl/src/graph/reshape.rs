@@ -16,6 +16,8 @@ pub struct Reshape {
 }
 
 impl Reshape {
+    /// Create a reshape module targeting the given shape.
+    /// The total number of elements (numel) must match the input tensor.
     pub fn new(shape: &[i64]) -> Self {
         Reshape {
             shape: shape.to_vec(),

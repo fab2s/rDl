@@ -73,12 +73,16 @@ impl Default for ResourceSampler {
 }
 
 impl ResourceSampler {
+    /// Create a new sampler, capturing an initial CPU reading for the first delta.
     pub fn new() -> Self {
         let prev_cpu = read_cpu_times();
         Self { prev_cpu }
     }
 
-    /// Take a snapshot of current system resources.
+    /// Take a snapshot of current system resources (CPU, RAM, GPU, VRAM).
+    ///
+    /// CPU utilization is computed as a delta since the previous call.
+    /// Fields that cannot be read on this platform are `None`.
     pub fn sample(&mut self) -> ResourceSample {
         let mut s = ResourceSample::default();
 

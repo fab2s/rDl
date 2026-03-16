@@ -1,9 +1,9 @@
 # Quickstart
 
-Train a model in 30 lines.
+Build, train, and monitor a model with residual connections.
 
-Builds a small graph with a residual connection, trains it on random data
-using Adam, and logs progress with the training monitor.
+Uses the graph builder with a residual (`also`), Adam optimizer with gradient
+clipping, graph observation, and the training monitor.
 
 ```sh
 cargo run --example quickstart

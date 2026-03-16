@@ -35,7 +35,10 @@ impl Graph {
         fs::write(Path::new(path), html)
     }
 
-    /// Generate an HTML file with timing trend curves.
+    /// Generate a self-contained HTML file with per-node timing trend curves.
+    ///
+    /// Requires prior `collect_timings`/`flush_timings` calls. Tag groups are expanded.
+    /// If tags is empty, all timing history is plotted.
     pub fn plot_timings_html(&self, path: &str, tags: &[&str]) -> std::io::Result<()> {
         let series = self.gather_timing_series(tags);
         if series.is_empty() {
@@ -51,7 +54,9 @@ impl Graph {
         fs::write(Path::new(path), html)
     }
 
-    /// Export epoch history to CSV.
+    /// Export epoch history to CSV (one column per tag, one row per epoch).
+    ///
+    /// Tag groups are expanded. If tags is empty, all epoch history is exported.
     pub fn export_trends(&self, path: &str, tags: &[&str]) -> std::io::Result<()> {
         let series = self.gather_series(tags);
         if series.is_empty() {
@@ -63,7 +68,9 @@ impl Graph {
         write_csv(path, &series)
     }
 
-    /// Export timing epoch history to CSV.
+    /// Export timing epoch history to CSV (one column per tag, one row per epoch).
+    ///
+    /// Tag groups are expanded. If tags is empty, all timing history is exported.
     pub fn export_timing_trends(&self, path: &str, tags: &[&str]) -> std::io::Result<()> {
         let series = self.gather_timing_series(tags);
         if series.is_empty() {

@@ -26,6 +26,7 @@ pub mod router;
 pub mod halt;
 pub mod reshape;
 pub mod state;
+pub mod snapshot;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -51,6 +52,7 @@ pub use halt::{ThresholdHalt, LearnedHalt};
 pub use reshape::Reshape;
 pub use state::StateAdd;
 pub use observe::Reduce;
+pub use snapshot::ModelSnapshot;
 
 /// Merge operation for combining split branches.
 pub enum MergeOp {

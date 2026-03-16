@@ -22,7 +22,7 @@ let uniform = Tensor::rand(&[2, 3], opts)?;   // values in [0, 1)
 let normal = Tensor::randn(&[2, 3], opts)?;   // standard normal
 
 // Integer tensor (for indices, e.g. Embedding lookups)
-let idx = Tensor::from_i64(&[0, 3, 7], &[3])?;
+let idx = Tensor::from_i64(&[0, 3, 7], &[3], Device::CPU)?;
 ```
 
 ### Options
@@ -40,7 +40,7 @@ let t = Tensor::zeros(&[3, 3], gpu_opts)?;
 ## Shape Inspection
 
 ```rust
-let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])?;
+let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], Device::CPU)?;
 
 t.shape();   // [2, 3]
 t.ndim();    // 2
@@ -55,8 +55,8 @@ Operations return new tensors — originals are never modified. Every operation
 returns `Result<Tensor>`, and the `?` operator propagates errors:
 
 ```rust
-let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2])?;
-let b = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0], &[2, 2])?;
+let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], Device::CPU)?;
+let b = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0], &[2, 2], Device::CPU)?;
 
 let result = a.add(&b)?.matmul(&b)?.relu()?;
 ```
@@ -124,7 +124,7 @@ t.index_select(0, &indices)? // gather slices at given indices
 Copy tensor data back to Rust vectors:
 
 ```rust
-let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3])?;
+let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU)?;
 
 let data: Vec<f32> = t.to_f32_vec()?;   // [1.0, 2.0, 3.0]
 let item: f64 = t.select(0, 0)?.item()?; // scalar value as f64

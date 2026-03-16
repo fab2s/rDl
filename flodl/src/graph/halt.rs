@@ -18,6 +18,7 @@ pub struct ThresholdHalt {
 }
 
 impl ThresholdHalt {
+    /// Create a halt condition that triggers when max(state) > `threshold`.
     pub fn new(threshold: f32) -> Self {
         ThresholdHalt { threshold }
     }
@@ -54,10 +55,12 @@ pub struct LearnedHalt {
 }
 
 impl LearnedHalt {
+    /// Create a learned halt probe projecting `input_dim` to a scalar on CPU.
     pub fn new(input_dim: i64) -> Result<Self> {
         Self::on_device(input_dim, Device::CPU)
     }
 
+    /// Create a learned halt probe on the specified device.
     pub fn on_device(input_dim: i64, device: Device) -> Result<Self> {
         Ok(LearnedHalt {
             proj: Rc::new(Linear::on_device(input_dim, 1, device)?),

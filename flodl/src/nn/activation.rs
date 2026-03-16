@@ -32,7 +32,7 @@ impl Module for Identity {
     }
 }
 
-/// ReLU activation module.
+/// ReLU activation: `max(0, x)`. Zeroes negative values.
 pub struct ReLU;
 
 impl Default for ReLU {
@@ -56,7 +56,7 @@ impl Module for ReLU {
     }
 }
 
-/// Sigmoid activation module.
+/// Sigmoid activation: `1 / (1 + exp(-x))`. Maps to (0, 1).
 pub struct Sigmoid;
 
 impl Default for Sigmoid {
@@ -80,7 +80,7 @@ impl Module for Sigmoid {
     }
 }
 
-/// Tanh activation module.
+/// Tanh activation: `(exp(x) - exp(-x)) / (exp(x) + exp(-x))`. Maps to (-1, 1).
 pub struct Tanh;
 
 impl Default for Tanh {
@@ -130,7 +130,8 @@ impl Module for GELU {
     }
 }
 
-/// SiLU activation (Sigmoid Linear Unit / Swish): `x * sigmoid(x)`
+/// Sigmoid Linear Unit (Swish): `x * sigmoid(x)`.
+/// Self-gated activation with smooth gradient flow.
 pub struct SiLU;
 
 impl Default for SiLU {

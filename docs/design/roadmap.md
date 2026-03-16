@@ -217,7 +217,7 @@ Deliverables:
 
 ## Test Coverage
 
-258 library tests + 15 showcase tests. Zero clippy warnings.
+327 library tests + 15 showcase tests. Zero clippy warnings.
 All passing in Docker (CPU, libtorch 2.10.0).
 
 ---

@@ -80,7 +80,7 @@ let x = Tensor::full(&[2, 3], 7.0, opts)?;
 let x = Tensor::eye(4, opts)?;
 let x = Tensor::arange(0.0, 10.0, 2.0, opts)?;
 let x = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU)?;
-let x = Tensor::from_i64(&[0, 1, 2], &[3])?;
+let x = Tensor::from_i64(&[0, 1, 2], &[3], Device::CPU)?;
 let x = Tensor::linspace(0.0, 1.0, 10, opts)?;
 ```
 

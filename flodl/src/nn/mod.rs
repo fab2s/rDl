@@ -124,36 +124,38 @@ pub trait Module {
     /// Override in composite modules (loops, switches, gates).
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> { vec![] }
 
-    /// Move non-parameter tensors (running stats, buffers) to a device.
+    /// Move all parameters and buffers to the given device.
     /// Override in modules like BatchNorm that hold non-parameter state.
     fn move_to_device(&self, _device: crate::tensor::Device) {}
 
-    /// Toggle training/eval mode. Override in modules with mode-dependent
-    /// behavior (BatchNorm, Dropout).
+    /// Set training/eval mode. Affects Dropout, BatchNorm, etc.
+    /// Override in modules with mode-dependent behavior.
     fn set_training(&self, _training: bool) {}
 
-    /// Per-iteration side output for loop body tracing.
+    /// Return per-iteration side output for loop tracing.
     /// Override in loop body modules that capture trajectory data
-    /// (e.g., attention fixation points). Returns None by default.
-    /// When Some, the loop executor collects traces accessible via
+    /// (e.g., attention fixation points). Returns `None` by default.
+    /// When `Some`, the loop executor collects traces accessible via
     /// `Graph::traces()`.
     fn trace(&self) -> Option<Variable> { None }
 
-    /// Downcast to NamedInputModule if this module supports named refs.
-    /// Override in types that implement NamedInputModule.
+    /// Upcast to [`NamedInputModule`] for multi-input graphs.
+    /// Override in types that implement `NamedInputModule` to enable
+    /// receiving additional named inputs via graph `using()`.
     fn as_named_input(&self) -> Option<&dyn NamedInputModule> { None }
 
-    /// Return a structural hash identifying this module's architecture.
+    /// SHA-256 hex hash of module architecture for checkpoint validation.
     /// Override in composite modules (Graph) that compute a deterministic
     /// hash from their topology and parameter shapes.
     fn structural_hash(&self) -> Option<String> { None }
 
-    /// Reset per-forward state. Called by loops before iterating to clear
-    /// stale tensors whose grad_fns may reference freed saved tensors.
-    /// Override in stateful modules (e.g., attention with location state).
+    /// Reset internal state (e.g. recurrent hidden state) between sequences.
+    /// Called by loops before iterating to clear stale tensors whose
+    /// grad_fns may reference freed saved tensors.
+    /// Override in stateful modules.
     fn reset(&self) {}
 
-    /// Detach retained state from the computation graph.
+    /// Detach internal state from the computation graph (for truncated BPTT).
     /// Called between training steps to break gradient chains on state
     /// carried across forward passes (e.g., recurrent hidden state).
     /// Override in stateful modules.
@@ -162,6 +164,8 @@ pub trait Module {
 
 /// Module that can receive additional named inputs via graph `using()`.
 pub trait NamedInputModule: Module {
+    /// Forward pass with additional named inputs from tagged graph nodes.
+    /// `refs` maps tag names to their current values, as wired by `FlowBuilder::using()`.
     fn forward_named(
         &self,
         input: &Variable,
@@ -176,8 +180,9 @@ pub fn walk_modules(module: &dyn Module, f: &mut dyn FnMut(&dyn Module)) {
 }
 
 /// Walk a module tree with an externally-managed visited set.
-/// Useful when walking multiple root modules (e.g., all graph nodes)
-/// while sharing dedup state.
+/// Use instead of [`walk_modules`] when walking multiple root modules
+/// (e.g., all graph nodes) while sharing dedup state to avoid visiting
+/// shared sub-modules more than once.
 pub fn walk_modules_visited(
     module: &dyn Module,
     visited: &mut HashSet<usize>,
@@ -194,6 +199,8 @@ pub fn walk_modules_visited(
 }
 
 /// Collect parameters from multiple modules (convenience function).
+/// Does not deduplicate across modules -- use `parameters()` on a single
+/// composite module (e.g., Graph) for pointer-based dedup.
 ///
 /// ```ignore
 /// let l1 = Linear::new(3, 4)?;

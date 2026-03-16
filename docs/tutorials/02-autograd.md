@@ -15,7 +15,7 @@ A `Variable` wraps a tensor and optionally tracks gradients:
 ```rust
 use flodl::{Tensor, Variable};
 
-let t = Tensor::from_f32(&[2.0], &[1])?;
+let t = Tensor::from_f32(&[2.0], &[1], Device::CPU)?;
 
 // requires_grad=true: operations on this variable build a computation graph
 let x = Variable::new(t, true);
@@ -33,8 +33,8 @@ Operations on variables mirror the tensor API. Each operation records its
 inputs and backward function:
 
 ```rust
-let w_t = Tensor::from_f32(&[3.0], &[1])?;
-let x_t = Tensor::from_f32(&[2.0], &[1])?;
+let w_t = Tensor::from_f32(&[3.0], &[1], Device::CPU)?;
+let x_t = Tensor::from_f32(&[2.0], &[1], Device::CPU)?;
 
 let w = Variable::new(w_t, true);
 let x = Variable::new(x_t, true);
@@ -82,8 +82,8 @@ println!("{:?}", x.grad());  // dy/dx
 // dy/dw = x = 2
 // dy/dx = w = 3
 
-let x_t = Tensor::from_f32(&[2.0], &[1])?;
-let w_t = Tensor::from_f32(&[3.0], &[1])?;
+let x_t = Tensor::from_f32(&[2.0], &[1], Device::CPU)?;
+let w_t = Tensor::from_f32(&[3.0], &[1], Device::CPU)?;
 
 let x = Variable::new(x_t, true);
 let w = Variable::new(w_t, true);

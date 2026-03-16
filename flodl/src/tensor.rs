@@ -22,7 +22,10 @@ use flodl_sys::{self as ffi, FlodlTensor};
 /// is inside libtorch internals (not a handle leak).
 static LIVE_TENSOR_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// DType represents the data type of tensor elements.
+/// Element data type of a tensor. Maps to PyTorch's `torch.dtype`.
+///
+/// Float32 is the default. Use Float16/BFloat16 for mixed precision,
+/// Int64 for indices and labels, Float64 when extra precision is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum DType {
@@ -251,7 +254,11 @@ impl Tensor {
         Ok(Self::from_raw(handle))
     }
 
-    /// Create a tensor filled with ones.
+    /// Create a tensor filled with ones. Like `torch.ones()`.
+    ///
+    /// ```ignore
+    /// let t = Tensor::ones(&[2, 3], TensorOptions::default())?;
+    /// ```
     pub fn ones(shape: &[i64], opts: TensorOptions) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -293,7 +300,8 @@ impl Tensor {
         Ok(Self::from_raw(handle))
     }
 
-    /// Create a tensor from f64 data.
+    /// Create a Float64 tensor from f64 data. Use when full double precision
+    /// is needed (e.g. loss accumulation, high-precision metrics).
     pub fn from_f64(data: &[f64], shape: &[i64], device: Device) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -312,7 +320,8 @@ impl Tensor {
         Ok(Self::from_raw(handle))
     }
 
-    /// Create a tensor from i64 data (for indices).
+    /// Create an Int64 tensor from i64 data. Commonly used for class labels,
+    /// token indices, and any integer indexing (e.g. `cross_entropy_loss` targets).
     pub fn from_i64(data: &[i64], shape: &[i64], device: Device) -> Result<Self> {
         let mut shape = shape.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -333,12 +342,12 @@ impl Tensor {
 
     // --- Metadata ---
 
-    /// Number of dimensions.
+    /// Number of dimensions (rank). Like `tensor.ndim` in PyTorch.
     pub fn ndim(&self) -> usize {
         unsafe { ffi::flodl_ndim(self.handle) as usize }
     }
 
-    /// Shape as a Vec.
+    /// Shape of each dimension as a Vec. Like `tensor.shape` in PyTorch.
     pub fn shape(&self) -> Vec<i64> {
         let n = self.ndim();
         (0..n)
@@ -346,17 +355,17 @@ impl Tensor {
             .collect()
     }
 
-    /// Total number of elements.
+    /// Total number of elements (product of all dimensions). Like `tensor.numel()`.
     pub fn numel(&self) -> i64 {
         unsafe { ffi::flodl_numel(self.handle) }
     }
 
-    /// Data type.
+    /// Element data type of this tensor. Like `tensor.dtype` in PyTorch.
     pub fn dtype(&self) -> DType {
         DType::from_raw(unsafe { ffi::flodl_dtype(self.handle) })
     }
 
-    /// Device (CPU or CUDA with index).
+    /// Device where this tensor's data resides (CPU or CUDA). Like `tensor.device`.
     pub fn device(&self) -> Device {
         let dt = unsafe { ffi::flodl_device_type(self.handle) };
         let di = unsafe { ffi::flodl_device_index(self.handle) };
@@ -365,7 +374,8 @@ impl Tensor {
 
     // --- Data access ---
 
-    /// Copy tensor data to a `Vec<f32>`. Moves to CPU if needed.
+    /// Copy tensor data to a `Vec<f32>`. Transparently moves to CPU first
+    /// if the tensor lives on CUDA. Non-f32 dtypes are cast via libtorch.
     pub fn to_f32_vec(&self) -> Result<Vec<f32>> {
         let n = self.numel() as usize;
         let mut buf = vec![0f32; n];
@@ -377,7 +387,7 @@ impl Tensor {
         Ok(buf)
     }
 
-    /// Copy tensor data to a `Vec<f64>`.
+    /// Copy tensor data to a `Vec<f64>`. Moves to CPU if needed.
     /// Float64 tensors are copied at full precision. All other dtypes
     /// go through f32 (lossless for f16/bf16, and the best f32 can offer).
     pub fn to_f64_vec(&self) -> Result<Vec<f64>> {
@@ -396,7 +406,8 @@ impl Tensor {
         }
     }
 
-    /// Copy tensor data to a `Vec<i64>`. For integer-typed tensors.
+    /// Copy tensor data to a `Vec<i64>`. Moves to CPU if needed.
+    /// Intended for Int64 tensors (indices, labels).
     pub fn to_i64_vec(&self) -> Result<Vec<i64>> {
         let n = self.numel() as usize;
         let mut buf = vec![0i64; n];
@@ -408,10 +419,11 @@ impl Tensor {
         Ok(buf)
     }
 
-    /// Extract a scalar value as f64 (for loss values, metrics, etc.).
+    /// Extract a scalar value as f64. Like PyTorch's `.item()`.
     ///
-    /// Preserves full precision for Float64 tensors. Works on any
-    /// single-element tensor regardless of shape (like PyTorch's `.item()`).
+    /// The tensor must contain exactly one element (any shape is fine,
+    /// e.g. `[1]`, `[1, 1]`, or `[]`). Returns an error otherwise.
+    /// Preserves full precision for Float64 tensors.
     ///
     /// ```ignore
     /// let loss_val = loss_tensor.item()?;
@@ -455,7 +467,7 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Element-wise subtraction.
+    /// Element-wise subtraction. Shapes must be broadcastable.
     pub fn sub(&self, other: &Tensor) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_sub(self.handle, other.handle, &mut handle) };
@@ -463,7 +475,8 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Element-wise multiplication.
+    /// Element-wise (Hadamard) multiplication. Shapes must be broadcastable.
+    /// For matrix multiplication, use [`matmul`](Self::matmul).
     pub fn mul(&self, other: &Tensor) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_mul(self.handle, other.handle, &mut handle) };
@@ -484,7 +497,7 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Multiply every element by a scalar.
+    /// Multiply every element by a scalar. Like `tensor * 0.5` in PyTorch.
     pub fn mul_scalar(&self, scalar: f64) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_mul_scalar(self.handle, scalar, &mut handle) };
