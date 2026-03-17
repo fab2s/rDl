@@ -41,6 +41,10 @@ You do **not** need Rust or libtorch installed on the host machine.
 - New autograd operations (with backward and numerical verification)
 - Performance improvements to the FFI dispatch path
 - Bug fixes with reproducing tests
+- **Backend support**: AMD ROCm, Apple MPS, Intel XPU — the architecture is
+  ready (libtorch supports them), but the `Device` enum, FFI shim, and resource
+  monitoring need extending. If you have hardware we don't, this is a great way
+  to contribute. See the [architecture section](README.md#architecture) for context.
 
 **Also welcome:**
 - Documentation improvements and examples

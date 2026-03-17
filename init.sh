@@ -34,6 +34,19 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
+# --- Make check ---
+
+if ! command -v make >/dev/null 2>&1; then
+    echo "error: make is required but not installed." >&2
+    echo "" >&2
+    echo "Install make:" >&2
+    echo "  Ubuntu/Debian:  sudo apt install make" >&2
+    echo "  Fedora/RHEL:    sudo dnf install make" >&2
+    echo "  macOS:          xcode-select --install" >&2
+    echo "  Windows (WSL):  sudo apt install make" >&2
+    exit 1
+fi
+
 # --- Argument validation ---
 
 PROJECT_NAME="${1:?Usage: sh init.sh <project-name>}"
@@ -63,14 +76,24 @@ cd "$PROJECT_NAME"
 
 # --- Cargo.toml ---
 
-cat > Cargo.toml << 'CARGO_EOF'
+# Resolve latest flodl version from crates.io; fall back to git if unpublished.
+FLODL_VERSION=$(curl -sL https://crates.io/api/v1/crates/flodl 2>/dev/null \
+    | grep -o '"max_stable_version":"[^"]*"' | cut -d'"' -f4)
+
+if [ -n "$FLODL_VERSION" ]; then
+    FLODL_DEP="flodl = \"$FLODL_VERSION\""
+else
+    FLODL_DEP='flodl = { git = "https://github.com/fab2s/floDl.git" }'
+fi
+
+cat > Cargo.toml << CARGO_EOF
 [package]
 name = "CRATE_PLACEHOLDER"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-flodl = { git = "https://github.com/fab2s/floDl.git" }
+$FLODL_DEP
 
 # Optimize floDl in dev builds — your code stays fast to compile.
 # After the first build, only your graph code recompiles (~2s).

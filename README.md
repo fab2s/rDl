@@ -219,13 +219,31 @@ See the full **[Training Monitor Tutorial](docs/tutorials/09-monitor.md)**.
 
 ## Quick Start
 
-Requirements: Docker (with NVIDIA Container Toolkit for GPU support).
+### With Docker (recommended)
 
-**New project** (see [Getting Started](#getting-started) above):
+No Rust or libtorch needed — everything runs in containers:
+
 ```bash
 curl -sL https://flodl.dev/init.sh | sh -s my-project
 cd my-project && make run
 ```
+
+### Without Docker
+
+If you already have Rust and [libtorch](https://pytorch.org/get-started/locally/)
+installed:
+
+```bash
+cargo add flodl
+```
+
+Set `LIBTORCH_PATH` to your libtorch directory and `LD_LIBRARY_PATH` to
+include `$LIBTORCH_PATH/lib`. For CUDA, also set `CUDA_HOME` and enable
+the feature: `cargo add flodl --features cuda`.
+
+See [libtorch downloads](https://pytorch.org/get-started/locally/) (pick the
+C++/libtorch variant) and [CUDA toolkit](https://developer.nvidia.com/cuda-downloads)
+if you need GPU support.
 
 **Develop floDl itself:**
 ```bash
@@ -515,13 +533,14 @@ If your GPU runs `nvidia-smi`, floDl can train on it.
 +-----------------------------------------------------------+
 |  flodl-sys   FFI bindings to libtorch C++ shim            |
 +-----------------------------------------------------------+
-|  libtorch / CUDA / ROCm / MPS / CPU                      |
+|  libtorch / CUDA / CPU                                    |
 +-----------------------------------------------------------+
 ```
 
-Since floDl binds libtorch — not CUDA directly — it inherits libtorch's
-backend support: NVIDIA (CUDA), AMD (ROCm), Intel (XPU), Apple Silicon (MPS),
-and CPU. Switching hardware is a build flag, not a code change.
+floDl is developed and tested on **NVIDIA CUDA** (Pascal and newer) and
+**CPU**. Since floDl binds libtorch — not CUDA directly — additional backends
+(AMD ROCm, Apple MPS, Intel XPU) are architecturally possible but not yet
+exposed or tested. Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation
 
