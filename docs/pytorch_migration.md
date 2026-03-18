@@ -44,7 +44,8 @@ use flodl::graph::{FlowBuilder, Graph, MergeOp};
 | `torch.Tensor` | `Tensor` | Immutable, `Drop`-based VRAM cleanup, `Send`+`Sync` |
 | `torch.autograd` | `Variable` | Wraps Tensor, tracks gradients via `Rc<RefCell>` |
 | `torch.nn.Module` | `Module` trait | `forward(&self, &Variable) -> Result<Variable>` + `parameters()` |
-| `model.train()` | `module.set_training(true)` | Called on individual modules |
+| `model.train()` | `module.train()` | Called on individual modules |
+| `model.eval()` | `module.eval()` | Disables dropout, freezes BatchNorm stats |
 | `with torch.no_grad():` | `no_grad(\|\| { ... })` | RAII guard disables gradient tracking |
 
 **Error handling:** flodl returns `Result<T>` instead of panicking. Use `?` to propagate errors:
@@ -178,7 +179,7 @@ y = F.log_softmax(x, dim=1)
 // flodl
 let y = x.relu()?;
 let y = x.sigmoid()?;
-let y = x.tanh_op()?;
+let y = x.tanh()?;
 let y = x.gelu()?;
 let y = x.silu()?;
 let y = x.softmax(1)?;
@@ -263,6 +264,12 @@ let y = a.cat(&b, 0)?;
 let y = Tensor::stack(&[&a, &b], 0)?;
 let chunks = x.chunk(3, 1)?;
 let y = x.repeat(&[2, 3])?;
+
+// Batch iteration (split along dim 0)
+for batch in data.batches(32)? {
+    let x = Variable::new(batch, false);
+    // ...
+}
 ```
 
 ### Comparisons and Conditionals
@@ -368,7 +375,7 @@ println!("{:?}", x.grad());  // Some(tensor([2.0, 4.0]))
 | Gradient access | `x.grad` (attribute) | `x.grad()` returns `Option<Tensor>` |
 | Clear gradients | `x.grad.zero_()` | `x.zero_grad()` |
 | Detach | `x.detach()` | `x.detach()` — returns new leaf Variable |
-| No-grad block | `with torch.no_grad():` | `no_grad(\|\| { ... })` |
+| No-grad block | `with torch.no_grad():` | `no_grad(\|\| { ... })` or `let _g = NoGradGuard::new();` |
 | Check grad enabled | `torch.is_grad_enabled()` | `is_grad_enabled()` |
 | Leaf check | `x.is_leaf` | `x.is_leaf()` |
 
@@ -402,6 +409,7 @@ cell = nn.LSTMCell(128, 256)
 let layer = Linear::new(784, 128)?;
 let layer = Linear::no_bias(784, 128)?;
 let layer = Conv2d::new(3, 64, 3)?;                                         // defaults: stride=1, padding=0
+let layer = Conv2d::configure(3, 64, 3).with_padding(1).with_stride(2).done()?;   // fluent builder
 let layer = Conv2d::build(3, 64, 3, true, [1,1], [1,1], [1,1], 1, Device::CPU)?;  // full control
 let layer = ConvTranspose2d::new(64, 3, 4)?;                                // defaults: stride=1, padding=0
 let layer = LayerNorm::new(128)?;
@@ -497,7 +505,7 @@ Or skip manual structs entirely — use the **graph builder** (see below).
 | Child discovery | Implicit (`self.x = ...`) | Explicit (`sub_modules()`) |
 | Parameter collection | Automatic | `collect_parameters()` walks tree |
 | Device move | `model.to(device)` | `module.move_to_device(Device::CUDA(0))` |
-| Training mode | `model.train()` | `module.set_training(true)` |
+| Training mode | `model.train()` / `model.eval()` | `module.train()` / `module.eval()` |
 
 ## Loss Functions
 
@@ -681,6 +689,7 @@ module.move_to_device(device);
 
 // Move tensors
 let x = x.to_device(device)?;
+let x = x.to_device_of(&weights)?;  // match another tensor's device
 
 // Move variables
 let x = x.to_device(device)?;
@@ -764,7 +773,7 @@ for epoch in range(num_epochs):
 
 ```rust
 // flodl
-model.set_training(true);
+model.train();
 for epoch in 0..num_epochs {
     // your data loading here
     opt.zero_grad();
@@ -777,11 +786,16 @@ for epoch in 0..num_epochs {
     opt.set_lr(sched.lr(epoch));
     println!("Epoch {}: loss={:.4}", epoch, loss.item()?);
 }
+
+// Inference
+model.eval();
+let pred = no_grad(|| model.forward(&test_input))?;
 ```
 
 ## Error Handling
 
 PyTorch raises Python exceptions. flodl returns `Result<T, TensorError>`.
+Both `Result` and `TensorError` are re-exported from `flodl::*`.
 Use Rust's `?` operator for clean propagation:
 
 ```rust
@@ -803,7 +817,7 @@ fn train_step(model: &Graph, input: &Variable, target: &Variable,
 | Model memory | Python GC + reference counting | Rust `Drop` trait — deterministic deallocation |
 | GPU memory | GC-delayed; `torch.cuda.empty_cache()` | Freed immediately when last reference drops |
 | Gradient graph | Freed after `.backward()` | `backward()` also calls `detach_()` — grad_fn chain freed synchronously |
-| No-grad inference | `with torch.no_grad():` | `no_grad(\|\| { ... })` |
+| No-grad inference | `with torch.no_grad():` | `no_grad(\|\| { ... })` or `NoGradGuard::new()` |
 | Handle diagnostics | N/A | `live_tensor_count()`, `rss_kb()` |
 
 No manual memory management needed. Rust's ownership system handles it.
@@ -1037,9 +1051,10 @@ to query them manually during training.
 | `F.relu(x)` | `x.relu()?` | Method on Variable |
 | `F.mse_loss(a, b)` | `mse_loss(&a, &b)?` | Free function |
 | `model.to(device)` | `module.move_to_device(device)` | |
-| `with torch.no_grad():` | `no_grad(\|\| { })` | Closure-based |
+| `with torch.no_grad():` | `no_grad(\|\| { })` or `NoGradGuard::new()` | Closure or RAII guard |
 | `nn.Sequential(...)` | `FlowBuilder::from(...).through(...).build()?` | Fluent builder |
-| `model.train()` | `module.set_training(true)` | |
+| `model.train()` | `module.train()` | |
+| `model.eval()` | `module.eval()` | |
 | `torch.save(...)` / `torch.load(...)` | `model.save_checkpoint("m.fdl")?` / `model.load_checkpoint("m.fdl")?` | Named `.fdl` format with `LoadReport` + structural hash validation |
 | `param.requires_grad = False` | `param.freeze()?` | Also: `unfreeze()`, `is_frozen()` |
 | `Adam([{"params":..., "lr":...}])` | `Adam::with_groups().group(&p, lr).build()` | Per-group LR |

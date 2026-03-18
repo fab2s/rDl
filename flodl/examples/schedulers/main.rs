@@ -21,7 +21,7 @@ fn main() -> Result<()> {
 
     let params = model.parameters();
     let mut optimizer = Adam::new(&params, 0.001);
-    model.set_training(true);
+    model.train();
 
     let num_epochs = 100usize;
 

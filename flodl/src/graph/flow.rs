@@ -47,6 +47,14 @@ use super::MergeOp;
 ///     .loop_body(refine_block).for_n(3)
 ///     .build()?;
 /// ```
+///
+/// ## Error handling
+///
+/// Builder methods accumulate errors internally — invalid operations
+/// (e.g., `through` after an unmerged `split`) do not panic. The error
+/// surfaces when you call [`build()`](Self::build), which validates the
+/// entire graph and returns `Err` with a descriptive message.
+/// This lets you chain the full graph description without interruption.
 pub struct FlowBuilder {
     pub(super) nodes: IndexMap<String, Node>,
     pub(super) edges: Vec<Edge>,

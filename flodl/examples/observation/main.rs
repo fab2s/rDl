@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     let params = model.parameters();
     let mut optimizer = Adam::new(&params, 0.01);
     let scheduler = CosineScheduler::new(0.01, 1e-4, 200);
-    model.set_training(true);
+    model.train();
 
     let num_epochs = 200usize;
     let mut monitor = Monitor::new(num_epochs);
@@ -35,16 +35,9 @@ fn main() -> Result<()> {
     let y_data = Tensor::randn(&[128, 4], opts)?;
 
     // Split into batches.
-    let batch_size = 32i64;
-    let n_batches = 128 / batch_size;
-    let batches: Vec<(Tensor, Tensor)> = (0..n_batches)
-        .map(|i| {
-            let start = i * batch_size;
-            let xb = x_data.narrow(0, start, batch_size).unwrap();
-            let yb = y_data.narrow(0, start, batch_size).unwrap();
-            (xb, yb)
-        })
-        .collect();
+    let x_batches = x_data.batches(32)?;
+    let y_batches = y_data.batches(32)?;
+    let batches: Vec<_> = x_batches.into_iter().zip(y_batches).collect();
 
     println!("{:>5}  {:>10}  {:>10}  {:>8}  {:>10}", "epoch", "loss", "slope", "stalled", "status");
     println!("{}", "-".repeat(50));

@@ -346,7 +346,7 @@ let g = FlowBuilder::from(Linear::new(4, 64)?).tag("encoder")
 let params = g.parameters();
 let optimizer = Adam::new(&params, 0.001);
 let scheduler = CosineScheduler::new(0.001, 1e-6, 100);
-g.set_training(true);
+g.train();
 
 for epoch in 0..100 {
     for (input, target) in &batches {
@@ -375,7 +375,7 @@ for epoch in 0..100 {
 }
 
 // Save.
-g.set_training(false);
+g.eval();
 g.save_checkpoint("/tmp/model.fdl")?;
 ```
 

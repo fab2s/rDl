@@ -79,7 +79,7 @@ a.add_scalar(1.0)?  // add a scalar to every element
 ```rust
 t.relu()?           // max(0, x)
 t.sigmoid()?        // 1 / (1 + exp(-x))
-t.tanh_op()?        // hyperbolic tangent
+t.tanh()?           // hyperbolic tangent
 t.exp()?            // element-wise e^x
 t.log()?            // element-wise ln(x)
 t.sqrt()?           // element-wise square root

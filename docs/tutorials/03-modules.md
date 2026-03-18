@@ -173,15 +173,18 @@ All activations have no learnable parameters and are zero-sized types.
 ## Train/Eval Mode
 
 Some modules (Dropout, BatchNorm) behave differently during training vs.
-inference. The `set_training` method on Module controls this:
+inference. The `set_training` method on Module controls this, and
+convenience aliases `train()` / `eval()` make it concise:
 
 ```rust
-model.set_training(false);   // eval mode
-model.set_training(true);    // training mode
+model.eval();    // eval mode  — same as set_training(false)
+model.train();   // training mode — same as set_training(true)
 ```
 
-When using the graph builder, `Graph::set_training(bool)` propagates to
-all nodes recursively.
+`train()` and `eval()` are convenience methods for `set_training(true)`
+and `set_training(false)`. When using the graph builder,
+`Graph::set_training(bool)` (and its aliases) propagates to all nodes
+recursively.
 
 ## Optional Module Traits
 

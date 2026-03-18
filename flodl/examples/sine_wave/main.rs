@@ -22,15 +22,9 @@ fn main() -> Result<()> {
     let y_data = y_all.reshape(&[n_samples, 1])?;
 
     // Split into batches of 50.
-    let batch_size = 50i64;
-    let n_batches = n_samples / batch_size;
-    let mut batches = Vec::new();
-    for i in 0..n_batches {
-        let start = i * batch_size;
-        let xb = x_data.narrow(0, start, batch_size)?;
-        let yb = y_data.narrow(0, start, batch_size)?;
-        batches.push((xb, yb));
-    }
+    let x_batches = x_data.batches(50)?;
+    let y_batches = y_data.batches(50)?;
+    let batches: Vec<_> = x_batches.into_iter().zip(y_batches).collect();
 
     // --- Model: Linear(1,32) -> GELU -> LayerNorm -> residual -> Linear(32,1) ---
     let model = FlowBuilder::from(Linear::new(1, 32)?)
@@ -43,7 +37,7 @@ fn main() -> Result<()> {
     let params = model.parameters();
     let mut optimizer = Adam::new(&params, 0.005);
     let scheduler = CosineScheduler::new(0.005, 1e-5, 200);
-    model.set_training(true);
+    model.train();
 
     // --- Training ---
     let num_epochs = 200usize;
@@ -78,7 +72,7 @@ fn main() -> Result<()> {
     monitor.finish();
 
     // --- Evaluation ---
-    model.set_training(false);
+    model.eval();
     println!("\n{:>8}  {:>10}  {:>10}  {:>8}", "x", "actual", "predicted", "error");
     println!("{}", "-".repeat(42));
 
@@ -127,7 +121,7 @@ fn main() -> Result<()> {
     let named2 = model2.named_parameters();
     let named_bufs2 = model2.named_buffers();
     load_checkpoint_file(path, &named2, &named_bufs2, Some(model2.structural_hash()))?;
-    model2.set_training(false);
+    model2.eval();
 
     // Verify loaded model produces the same output.
     let pred2 = no_grad(|| {
@@ -179,7 +173,7 @@ mod tests {
 
         let params = model.parameters();
         let mut opt = Adam::new(&params, 0.005);
-        model.set_training(true);
+        model.train();
 
         let mut last_loss = f64::MAX;
         for _ in 0..150 {

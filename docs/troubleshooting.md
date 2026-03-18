@@ -296,14 +296,35 @@ clip_grad_norm(&params, 0.5)?;
 
 ### Out of VRAM
 
-**Fix:**
-- Reduce batch size
-- Use smaller model dimensions
-- Use mixed precision (`Float16`/`BFloat16`)
-- Use `no_grad` for inference:
+The CUDA allocator ran out of GPU memory. Common when batch sizes are too large
+or inference runs without disabling gradients.
+
+**Diagnose first** — check how much VRAM you actually have:
 ```rust
-let pred = no_grad(|| model.forward(&input))?;
+if let Some((used, total)) = cuda_memory_info() {
+    println!("VRAM: {:.0}/{:.0} MB", used as f64 / 1e6, total as f64 / 1e6);
+}
 ```
+
+**Fix:**
+- **Reduce batch size** — the single biggest lever for VRAM usage
+- **Use `no_grad` for inference** — backward graphs consume significant memory:
+  ```rust
+  let pred = no_grad(|| model.forward(&input))?;
+  ```
+- **Use mixed precision** — `Float16`/`BFloat16` halves parameter memory:
+  ```rust
+  cast_parameters(&params, DType::Float16);
+  let scaler = GradScaler::new();
+  ```
+- **Use smaller model dimensions** — reduce hidden sizes, fewer layers
+- **Detach state between steps** — for recurrent models, call `model.detach_state()`
+  to break gradient chains across time steps
+- **Check for tensor leaks** — if VRAM grows linearly across epochs, tensors
+  are being retained. Use `live_tensor_count()` to track:
+  ```rust
+  println!("live tensors: {}", live_tensor_count());
+  ```
 
 ---
 

@@ -191,12 +191,12 @@ let model = FlowBuilder::from(Linear::new(4, 16)?)
 // Train it.
 let params = model.parameters();
 let optimizer = Adam::new(&params, 0.001);
-model.set_training(true);
+model.train();
 
 // ... training loop (see Tutorial 04) ...
 
 // Evaluate.
-model.set_training(false);
+model.eval();
 let output = model.forward(&input)?;
 ```
 

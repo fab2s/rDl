@@ -104,7 +104,7 @@ let optimizer = Adam::new(&params, 0.001);
 The standard pattern is: **forward -> loss -> zero_grad -> backward -> clip -> step**.
 
 ```rust
-model.set_training(true);
+model.train();
 
 for (input_t, target_t) in &batches {
     let input = Variable::new(input_t.clone(), true);
@@ -178,7 +178,7 @@ held by the graph. It detaches:
 - **Module internal state** (e.g., recurrent hidden state in custom modules)
 
 ```rust
-model.set_training(true);
+model.train();
 
 for (input_t, target_t) in &batches {
     let input = Variable::new(input_t.clone(), true);
@@ -323,7 +323,7 @@ let scheduler = WarmupScheduler::new(inner, 0.001, 10);  // inner, target_lr, wa
 Switch to eval mode for inference:
 
 ```rust
-model.set_training(false);
+model.eval();
 no_grad(|| {
     let output = model.forward(&input)?;
     // No graph built, no gradient tracking overhead.
@@ -357,7 +357,7 @@ fn main() -> Result<()> {
     // Set up training.
     let params = model.parameters();
     let mut optimizer = Adam::new(&params, 0.01);
-    model.set_training(true);
+    model.train();
 
     // Training loop (simplified — no data loader yet).
     let input_t = Tensor::randn(&[20, 2], TensorOptions::default())?;
@@ -381,7 +381,7 @@ fn main() -> Result<()> {
     }
 
     // Eval.
-    model.set_training(false);
+    model.eval();
     let test_input = Tensor::from_f32(&[0.5, 0.3], &[1, 2], Device::CPU)?;
     let pred = no_grad(|| {
         model.forward(&Variable::new(test_input, false))

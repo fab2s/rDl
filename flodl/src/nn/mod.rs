@@ -43,7 +43,7 @@ pub use layernorm::LayerNorm;
 pub use embedding::Embedding;
 pub use grucell::GRUCell;
 pub use lstmcell::LSTMCell;
-pub use conv2d::Conv2d;
+pub use conv2d::{Conv2d, Conv2dBuilder};
 pub use conv_transpose2d::ConvTranspose2d;
 pub use batchnorm::{BatchNorm, BatchNorm2d};
 pub use init::{xavier_uniform, xavier_normal};
@@ -131,6 +131,12 @@ pub trait Module {
     /// Set training/eval mode. Affects Dropout, BatchNorm, etc.
     /// Override in modules with mode-dependent behavior.
     fn set_training(&self, _training: bool) {}
+
+    /// Set training mode. Shorthand for `set_training(true)`.
+    fn train(&self) { self.set_training(true); }
+
+    /// Set eval mode. Shorthand for `set_training(false)`.
+    fn eval(&self) { self.set_training(false); }
 
     /// Return per-iteration side output for loop tracing.
     /// Override in loop body modules that capture trajectory data

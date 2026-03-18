@@ -296,7 +296,7 @@ let model = FlowBuilder::from(Linear::new(4, h)?).tag("input")
 // Train.
 let params = model.parameters();
 let optimizer = Adam::new(&params, 0.001);
-model.set_training(true);
+model.train();
 
 for step in 0..num_steps {
     let output = model.forward(&input)?;
@@ -308,7 +308,7 @@ for step in 0..num_steps {
 }
 
 // Evaluate on a new sequence.
-model.set_training(false);
+model.eval();
 model.reset_state();
 let output = model.forward(&test_input)?;
 ```

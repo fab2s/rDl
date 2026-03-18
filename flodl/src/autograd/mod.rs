@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn test_tanh_gradient() {
         let x = Variable::new(from_f32(&[0.0], &[1]), true);
-        let y = x.tanh_act().unwrap().sum().unwrap();
+        let y = x.tanh().unwrap().sum().unwrap();
         y.backward().unwrap();
         assert!((x.grad().unwrap().item().unwrap() - 1.0).abs() < 1e-5);
     }

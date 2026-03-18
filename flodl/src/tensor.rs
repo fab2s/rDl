@@ -585,8 +585,8 @@ impl Tensor {
 
     // --- Activations ---
 
-    /// Tanh activation.
-    pub fn tanh_op(&self) -> Result<Tensor> {
+    /// Tanh activation: element-wise hyperbolic tangent.
+    pub fn tanh(&self) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_tanh_op(self.handle, &mut handle) };
         check_err(err)?;
@@ -1573,6 +1573,28 @@ impl Tensor {
 
     // --- Shape operations (additional) ---
 
+    /// Split tensor into batches of `batch_size` along dimension 0.
+    /// The last batch may be smaller if the tensor size isn't evenly divisible.
+    ///
+    /// ```ignore
+    /// let data = Tensor::randn(&[100, 4], opts)?;
+    /// for batch in data.batches(32)? {
+    ///     let x = Variable::new(batch, false);
+    ///     // ...
+    /// }
+    /// ```
+    pub fn batches(&self, batch_size: i64) -> Result<Vec<Tensor>> {
+        let n = self.shape()[0];
+        let mut result = Vec::new();
+        let mut start = 0i64;
+        while start < n {
+            let len = (batch_size).min(n - start);
+            result.push(self.narrow(0, start, len)?);
+            start += len;
+        }
+        Ok(result)
+    }
+
     /// Split tensor into chunks along a dimension.
     pub fn chunk(&self, chunks: i32, dim: i32) -> Result<Vec<Tensor>> {
         let mut results_ptr: *mut FlodlTensor = ptr::null_mut();
@@ -1682,6 +1704,20 @@ impl Tensor {
         let err = unsafe { ffi::flodl_to_device(self.handle, dt, di, &mut handle) };
         check_err(err)?;
         Ok(Tensor::from_raw(handle))
+    }
+
+    /// Move this tensor to the same device as `other`.
+    /// No-op (returns a clone) if both are already on the same device.
+    ///
+    /// ```ignore
+    /// let x = x.to_device_of(&weights)?;  // ensure same device
+    /// ```
+    pub fn to_device_of(&self, other: &Tensor) -> Result<Tensor> {
+        let target = other.device();
+        if self.device() == target {
+            return Ok(self.clone());
+        }
+        self.to_device(target)
     }
 
     // --- Autograd ---
@@ -2419,7 +2455,7 @@ mod tests {
         let sig = t.sigmoid().unwrap().to_f32_vec().unwrap();
         assert!((sig[2] - 0.7310586).abs() < 1e-5);
 
-        let th = t.tanh_op().unwrap().to_f32_vec().unwrap();
+        let th = t.tanh().unwrap().to_f32_vec().unwrap();
         assert!((th[2] - 1.0_f32.tanh()).abs() < 1e-5);
 
         // gelu/silu just check they don't crash and return right shape

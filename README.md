@@ -230,8 +230,8 @@ cd my-project && make run
 
 ### Without Docker
 
-If you already have Rust and [libtorch](https://pytorch.org/get-started/locally/)
-installed:
+**Requirements:** Rust 1.85+ and [libtorch](https://pytorch.org/get-started/locally/)
+(C++/libtorch variant).
 
 ```bash
 cargo add flodl
@@ -273,7 +273,7 @@ let model = FlowBuilder::from(Linear::new(2, 16)?)
 // Set up training.
 let params = model.parameters();
 let mut optimizer = Adam::new(&params, 0.01);
-model.set_training(true);
+model.train();
 
 // Training loop.
 for (input_t, target_t) in &batches {

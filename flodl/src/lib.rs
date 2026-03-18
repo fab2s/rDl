@@ -6,17 +6,21 @@
 //! use flodl::*;
 //!
 //! // Build a model as a computation graph
-//! let g = FlowBuilder::from(Linear::new(4, 8)?)
+//! let model = FlowBuilder::from(Linear::new(4, 8)?)
 //!     .through(GELU)
 //!     .through(Linear::new(8, 2)?)
 //!     .build()?;
 //!
 //! // Forward pass
 //! let x = Variable::new(Tensor::randn(&[1, 4], Default::default())?, false);
-//! let y = g.forward(&x)?;
+//! let target = Variable::new(Tensor::randn(&[1, 2], Default::default())?, false);
+//! let pred = model.forward(&x)?;
 //!
 //! // Backward + optimize
-//! let loss = mse_loss(&y, &target)?;
+//! let params = model.parameters();
+//! let mut optimizer = Adam::new(&params, 1e-3);
+//! let loss = mse_loss(&pred, &target)?;
+//! optimizer.zero_grad();
 //! loss.backward()?;
 //! optimizer.step()?;
 //! ```
@@ -42,7 +46,7 @@ macro_rules! modules {
     };
 }
 
-pub use tensor::{cuda_available, cuda_device_count, cuda_memory_info, cuda_memory_info_idx, cuda_utilization, cuda_utilization_idx, cuda_device_name, cuda_device_name_idx, cuda_devices, DeviceInfo, set_current_cuda_device, current_cuda_device, cuda_synchronize, hardware_summary, set_cudnn_benchmark, malloc_trim, live_tensor_count, rss_kb, Device, DType, Result, Tensor, TensorOptions};
+pub use tensor::{cuda_available, cuda_device_count, cuda_memory_info, cuda_memory_info_idx, cuda_utilization, cuda_utilization_idx, cuda_device_name, cuda_device_name_idx, cuda_devices, DeviceInfo, set_current_cuda_device, current_cuda_device, cuda_synchronize, hardware_summary, set_cudnn_benchmark, malloc_trim, live_tensor_count, rss_kb, Device, DType, Result, Tensor, TensorError, TensorOptions};
 pub use autograd::{Variable, no_grad, is_grad_enabled, NoGradGuard, adaptive_avg_pool2d, grid_sample};
 pub use nn::{
     Module, NamedInputModule,
@@ -52,7 +56,7 @@ pub use nn::{
     GradScaler, cast_parameters,
     Identity, ReLU, Sigmoid, Tanh, GELU, SiLU,
     Dropout, Dropout2d, LayerNorm, Embedding, GRUCell, LSTMCell,
-    Conv2d, ConvTranspose2d, BatchNorm, BatchNorm2d,
+    Conv2d, Conv2dBuilder, ConvTranspose2d, BatchNorm, BatchNorm2d,
     mse_loss, cross_entropy_loss, bce_with_logits_loss, l1_loss, smooth_l1_loss, kl_div_loss,
     clip_grad_norm, clip_grad_value,
     Scheduler, StepDecay, CosineScheduler, WarmupScheduler, PlateauScheduler,

@@ -100,7 +100,7 @@ impl Module for Tanh {
     fn name(&self) -> &str { "tanh" }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        input.tanh_act()
+        input.tanh()
     }
 }
 

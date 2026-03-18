@@ -15,7 +15,7 @@ cargo run --example showcase
 
 ## Graph methods exercised
 
-`forward`, `forward_multi`, `parameters`, `set_training`, `reset_state`,
+`forward`, `forward_multi`, `parameters`, `train`, `eval`, `set_training`, `reset_state`,
 `detach_state`, `dot`, `tagged`, `flush`, `trend`, `enable_profiling`,
 `flush_timings`, `timing_trend`
 

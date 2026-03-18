@@ -45,7 +45,7 @@ let y = x.mul(&w)?.sum()?;
 ```
 
 The full set of differentiable operations includes: `add`, `sub`, `mul`,
-`div`, `matmul`, `relu`, `sigmoid`, `tanh_act`, `gelu`, `silu`, `exp`,
+`div`, `matmul`, `relu`, `sigmoid`, `tanh`, `gelu`, `silu`, `exp`,
 `log`, `neg`, `sqrt`, `abs`, `pow_scalar`, `sin`, `cos`, `sign`, `floor`,
 `ceil`, `round`, `reciprocal`, `clamp`, `sum`, `sum_dim`, `mean`, `mean_dim`,
 `min`, `max`, `min_dim`, `max_dim`, `var`, `std`, `var_dim`, `std_dim`, `mul_scalar`, `add_scalar`, `div_scalar`,

@@ -323,7 +323,7 @@ fn main() -> Result<()> {
     let params = model.parameters();
     let mut optimizer = Adam::new(&params, 0.001);
     let scheduler = CosineScheduler::new(0.001, 1e-6, 100);
-    model.set_training(true);                              // model.train()
+    model.train();                                           // model.train()
 
     // --- Data ---
     // Replace this with your data loading.

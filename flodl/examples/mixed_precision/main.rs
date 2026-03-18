@@ -37,7 +37,7 @@ fn main() -> Result<()> {
 
     let mut optimizer = Adam::new(&params, 0.001);
     let mut scaler = GradScaler::new();
-    model.set_training(true);
+    model.train();
 
     let num_epochs = 100usize;
     let mut monitor = Monitor::new(num_epochs);

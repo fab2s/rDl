@@ -28,6 +28,74 @@ pub struct Conv2d {
     pub groups: i64,
 }
 
+/// Builder for configuring Conv2d layers with a fluent API.
+///
+/// ```ignore
+/// let conv = Conv2d::configure(3, 16, 3)
+///     .with_stride(2)
+///     .with_padding(1)
+///     .on_device(Device::CUDA(0))
+///     .done()?;
+/// ```
+pub struct Conv2dBuilder {
+    in_channels: i64,
+    out_channels: i64,
+    kernel_size: i64,
+    with_bias: bool,
+    stride: [i64; 2],
+    padding: [i64; 2],
+    dilation: [i64; 2],
+    groups: i64,
+    device: Device,
+}
+
+impl Conv2dBuilder {
+    /// Set stride (applied to both dimensions).
+    pub fn with_stride(mut self, stride: i64) -> Self {
+        self.stride = [stride, stride];
+        self
+    }
+
+    /// Set padding (applied to both dimensions).
+    pub fn with_padding(mut self, padding: i64) -> Self {
+        self.padding = [padding, padding];
+        self
+    }
+
+    /// Set dilation (applied to both dimensions).
+    pub fn with_dilation(mut self, dilation: i64) -> Self {
+        self.dilation = [dilation, dilation];
+        self
+    }
+
+    /// Set the number of groups for grouped convolution.
+    pub fn with_groups(mut self, groups: i64) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    /// Disable bias.
+    pub fn without_bias(mut self) -> Self {
+        self.with_bias = false;
+        self
+    }
+
+    /// Set the device for parameter allocation.
+    pub fn on_device(mut self, device: Device) -> Self {
+        self.device = device;
+        self
+    }
+
+    /// Finalize and create the Conv2d layer.
+    pub fn done(self) -> Result<Conv2d> {
+        Conv2d::build(
+            self.in_channels, self.out_channels, self.kernel_size,
+            self.with_bias, self.stride, self.padding, self.dilation,
+            self.groups, self.device,
+        )
+    }
+}
+
 impl Conv2d {
     /// Create a Conv2d layer with default stride=1, padding=0, dilation=1, groups=1, with bias.
     pub fn new(
@@ -41,6 +109,35 @@ impl Conv2d {
         in_channels: i64, out_channels: i64, kernel_size: i64,
     ) -> Result<Self> {
         Self::build(in_channels, out_channels, kernel_size, false, [1, 1], [0, 0], [1, 1], 1, Device::CPU)
+    }
+
+    /// Create a Conv2d layer on a specific device.
+    pub fn on_device(
+        in_channels: i64, out_channels: i64, kernel_size: i64, device: Device,
+    ) -> Result<Self> {
+        Self::build(in_channels, out_channels, kernel_size, true, [1, 1], [0, 0], [1, 1], 1, device)
+    }
+
+    /// Start a fluent builder for full configuration.
+    ///
+    /// ```ignore
+    /// let conv = Conv2d::configure(3, 16, 3)
+    ///     .with_stride(2)
+    ///     .with_padding(1)
+    ///     .done()?;
+    /// ```
+    pub fn configure(in_channels: i64, out_channels: i64, kernel_size: i64) -> Conv2dBuilder {
+        Conv2dBuilder {
+            in_channels,
+            out_channels,
+            kernel_size,
+            with_bias: true,
+            stride: [1, 1],
+            padding: [0, 0],
+            dilation: [1, 1],
+            groups: 1,
+            device: Device::CPU,
+        }
     }
 
     /// Fully configurable Conv2d constructor.

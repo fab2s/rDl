@@ -274,7 +274,7 @@ fn main() -> Result<()> {
 
     let params = model.parameters();
     let mut optimizer = Adam::new(&params, 0.01);
-    model.set_training(true);
+    model.train();
 
     for epoch in 0..200 {
         let mut last_loss = 0.0;

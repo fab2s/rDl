@@ -79,9 +79,9 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
-    /// Tanh activation. Named `tanh_act` to avoid conflict with `f64::tanh`.
-    pub fn tanh_act(&self) -> Result<Variable> {
-        let result = self.data().tanh_op()?;
+    /// Tanh activation: element-wise hyperbolic tangent.
+    pub fn tanh(&self) -> Result<Variable> {
+        let result = self.data().tanh()?;
         Ok(Variable::wrap(result))
     }
 

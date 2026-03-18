@@ -77,6 +77,22 @@ test code runs on whichever device is available. When writing new tests:
 - Tests that are inherently CPU-only (e.g. RSS-based leak checks) should guard
   with `if test_device() != Device::CPU { return; }` at the top
 
+**Test template:**
+```rust
+#[test]
+fn test_my_feature() {
+    let dev = test_device();
+    let opts = test_opts();
+
+    let input = Tensor::randn(&[2, 4], opts).unwrap();
+    let layer = Linear::on_device(4, 2, dev).unwrap();
+    let x = Variable::new(input, true);
+    let y = layer.forward(&x).unwrap();
+
+    assert_eq!(y.data().shape(), vec![2, 2]);
+}
+```
+
 If you add new functionality:
 
 - **Tensor ops**: add tests in `tensor.rs`

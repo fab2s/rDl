@@ -23,7 +23,7 @@ fn main() -> Result<()> {
 
     let params = encoder.parameters();
     let mut opt = Adam::new(&params, 0.01);
-    encoder.set_training(true);
+    encoder.train();
 
     for epoch in 0..50 {
         let x = Tensor::randn(&[32, 4], opts)?;
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
         .collect();
 
     let mut opt2 = Adam::new(&trainable, 0.005);
-    model.set_training(true);
+    model.train();
 
     // --- Phase 3: Fine-tune the new head ---
     println!("\n=== Phase 3: Fine-tune new head ===");

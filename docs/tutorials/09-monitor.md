@@ -23,7 +23,7 @@ let model = FlowBuilder::from(Linear::new(2, 16)?)
 
 let params = model.parameters();
 let mut optimizer = Adam::new(&params, 0.01);
-model.set_training(true);
+model.train();
 
 let num_epochs = 100;
 let mut monitor = Monitor::new(num_epochs);

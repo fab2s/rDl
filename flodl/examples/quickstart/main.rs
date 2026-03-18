@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     // Set up training.
     let params = model.parameters();
     let mut optimizer = Adam::new(&params, 0.01);
-    model.set_training(true);
+    model.train();
 
     // Generate some random data (XOR-ish pattern).
     let opts = TensorOptions::default();

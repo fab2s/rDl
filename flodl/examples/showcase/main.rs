@@ -11,14 +11,14 @@
 //!
 //! Graph methods exercised:
 //!
-//!     forward, forward_multi, parameters, set_training, reset_state,
+//!     forward, forward_multi, parameters, train, eval, set_training, reset_state,
 //!     detach_state, dot, tagged, flush, trend, enable_profiling,
 //!     flush_timings, timing_trend
 //!
 //! Variable ops exercised (via custom modules):
 //!
 //!     add, sub, mul, div, matmul, mul_scalar, add_scalar, div_scalar,
-//!     relu, sigmoid, tanh_act, gelu, silu,
+//!     relu, sigmoid, tanh, gelu, silu,
 //!     sum, mean, sum_dim, mean_dim,
 //!     exp, log, neg, abs, sqrt, pow_scalar, clamp,
 //!     softmax, log_softmax,
@@ -241,7 +241,7 @@ impl NamedInputModule for ContextBlend {
 
 /// Spectral basis: sin/cos/reciprocal projections.
 /// Used as a fork side-branch (output captured, stream continues unchanged).
-/// Exercises: sin, cos, reciprocal, tanh_act.
+/// Exercises: sin, cos, reciprocal, tanh.
 struct SpectralBasis;
 
 impl Module for SpectralBasis {
@@ -252,7 +252,7 @@ impl Module for SpectralBasis {
         let c = input.cos()?;                                      // cos
         let sc = s.add(&c)?;
         let r = sc.reciprocal()?;                                  // reciprocal
-        r.tanh_act()                                               // tanh_act
+        r.tanh()                                                   // tanh
     }
 }
 
@@ -480,7 +480,7 @@ fn spectral_monitor(dim: i64) -> flodl::Result<Graph> {
 /// Through(GELU) -> Through(LayerNorm)
 /// Through(RmsNorm)                                 pow_scalar, mean_dim, add_scalar, sqrt, div
 /// Through(ContextBlend).Using("ctx")               div_scalar, sigmoid, mul, add (NamedInputModule)
-/// Fork(spectral_monitor).Tag("spectral")           sin, cos, reciprocal, tanh_act (side branch)
+/// Fork(spectral_monitor).Tag("spectral")           sin, cos, reciprocal, tanh (side branch)
 /// Split(read_head, read_head) -> Mean()            multi-head read
 /// Also(Linear 8->8)                                residual
 /// Through(Dropout(0.1))
@@ -735,7 +735,7 @@ fn main() {
 
     // -- Training loop with observation + profiling + monitor --
     println!("\n--- Training (5 epochs x 4 steps) ---");
-    g.set_training(true);
+    g.train();
     g.reset_state();
     g.enable_profiling();
 
@@ -819,7 +819,7 @@ fn main() {
     println!("\nCheckpoint save/load: OK ({} loaded)", report.loaded.len());
 
     // -- no_grad inference (eval mode works now — BatchNorm has running stats from training) --
-    g.set_training(false);
+    g.eval();
     g.reset_state();
     let final_out = no_grad(|| g.forward_multi(&[make_input(false), make_context()])).unwrap();
     let final_vals = final_out.data().to_f32_vec().unwrap();
@@ -865,7 +865,7 @@ mod tests {
         // Populate BatchNorm running stats, then switch to eval mode
         // so forward passes don't update running stats (deterministic).
         g.forward_multi(&[make_input(false), make_context()]).unwrap();
-        g.set_training(false);
+        g.eval();
         g.reset_state();
 
         let r1 = g.forward_multi(&[make_input(false), make_context()]).unwrap();
@@ -946,7 +946,7 @@ mod tests {
     #[test]
     fn test_training_loop() {
         let g = build_showcase().unwrap();
-        g.set_training(true);
+        g.train();
 
         let params = g.parameters();
         let mut optimizer = Adam::new(&params, 0.01);
@@ -1026,7 +1026,7 @@ mod tests {
 
         // Populate BatchNorm running stats, then use eval mode for deterministic output
         g.forward_multi(&[make_input(false), make_context()]).unwrap();
-        g.set_training(false);
+        g.eval();
         g.reset_state();
 
         // Save checkpoint and capture baseline output
@@ -1043,7 +1043,7 @@ mod tests {
 
         // Mutate parameters via optimizer step
         g.reset_state();
-        g.set_training(true);
+        g.train();
         let pred = g.forward_multi(&[make_input(true), make_context()]).unwrap();
         let loss = pred.sum().unwrap();
         loss.backward().unwrap();
@@ -1107,7 +1107,7 @@ mod tests {
         assert!(profile_svg.len() > 100, "profile SVG should have content");
 
         // Training with observation for HTML + log
-        g.set_training(true);
+        g.train();
         g.reset_state();
         let params = g.parameters();
         let mut optimizer = Adam::new(&params, 0.01);
