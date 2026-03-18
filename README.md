@@ -10,6 +10,7 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 </p>
 
 <p align="center">
+  <a href="https://flodl.dev"><img src="https://img.shields.io/badge/web-flodl.dev-6c8cff" alt="Website"></a>
   <a href="https://github.com/fab2s/floDl/actions"><img src="https://github.com/fab2s/floDl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://crates.io/crates/flodl"><img src="https://img.shields.io/crates/v/flodl.svg" alt="crates.io"></a>
   <a href="https://docs.rs/flodl"><img src="https://docs.rs/flodl/badge.svg" alt="docs.rs"></a>
