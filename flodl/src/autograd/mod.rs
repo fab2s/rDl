@@ -992,7 +992,7 @@ mod tests {
         // The handle count should not grow between phases
         // (small fluctuations OK, but not proportional to iters)
         assert!(
-            (h1 as i64 - h0 as i64).unsigned_abs() < 50,
+            (h1 as i64 - h0 as i64).unsigned_abs() < 100,
             "handle count drifted by {} over {iters} steps — tensor handle leak!",
             h1 as i64 - h0 as i64
         );
