@@ -460,17 +460,17 @@ and the GC pauses that plague Go.
 Measured on a real training workload (FBRL letter recognition — recurrent
 attention with a 9-component loss stack), same model, same data, same GPU:
 
-| Metric | PyTorch 2.5.1 | flodl | Delta |
+| Metric | PyTorch 2.5.1 | flodl 0.1.1 | Delta |
 |--------|--------------|-------|-------|
-| Avg epoch | 50.1s | 42.1s | **-16%** |
+| Avg epoch | 49.7s | 40.3s | **-19%** |
 | GPU utilization | ~80% (spiky) | 88-92% (flat) | more stable |
 | VRAM | 2,805 MB | 2,977 MB | +6%* |
 
-\* Static libtorch linkage + monitor thread + gzip checkpoint compression.
+\* Fixed overhead (CUDA 12.6 vs 12.4 context size + allocator rounding) — does not grow with model size.
 
 Full methodology, raw data, and reproduction commands:
 **[Benchmark Report](docs/benchmark.md)** |
-[Raw artifacts](https://github.com/fab2s/fbrl/tree/102225b) (both sides, committed)
+[Raw artifacts](https://github.com/fab2s/fbrl/tree/5c58d71) (both sides, committed)
 
 ### Build profiles
 
