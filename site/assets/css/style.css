@@ -917,3 +917,104 @@ a:hover { color: var(--cyan); }
   border: none;
   display: block;
 }
+
+/* ── Blog ──────────────────────────────────────── */
+
+.blog-content {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 48px 24px 80px;
+}
+
+.blog-intro {
+  color: var(--dim);
+  font-size: 16px;
+  margin-bottom: 40px;
+}
+
+.blog-empty {
+  color: var(--dim);
+  font-style: italic;
+}
+
+/* Post list (index page) */
+
+.post-list {
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+.post-card {
+  padding-bottom: 32px;
+  border-bottom: 1px solid var(--border);
+}
+
+.post-card:last-child {
+  border-bottom: none;
+}
+
+.post-card h2 {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 4px 0 8px;
+  border: none;
+  padding: 0;
+}
+
+.post-card h2 a { color: var(--text); }
+.post-card h2 a:hover { color: var(--accent); }
+
+.post-date {
+  font-size: 13px;
+  color: var(--dim);
+  font-family: var(--mono);
+}
+
+.post-subtitle {
+  font-size: 16px;
+  color: var(--dim);
+  margin-top: 4px;
+  margin-bottom: 0;
+}
+
+.post-excerpt {
+  font-size: 15px;
+  color: var(--dim);
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
+/* Single post page */
+
+.post-header {
+  margin-bottom: 40px;
+}
+
+.post-header h1 {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  margin-top: 8px;
+  margin-bottom: 8px;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.post-header .post-subtitle {
+  font-size: 18px;
+  margin-top: 8px;
+}
+
+.post-nav {
+  margin-top: 48px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+}
+
+.post-nav a {
+  font-size: 14px;
+  color: var(--dim);
+}
+
+.post-nav a:hover { color: var(--accent); }

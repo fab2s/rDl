@@ -18,9 +18,15 @@ exclude:
   - Gemfile.lock
   - README.md
 
+permalink: /blog/:slug
+
 defaults:
   - scope:
       path: "guide"
       type: "pages"
     values:
       layout: guide
+  - scope:
+      type: "posts"
+    values:
+      layout: post

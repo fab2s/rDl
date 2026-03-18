@@ -1,0 +1,19 @@
+---
+layout: default
+---
+
+<main class="content blog-content">
+  <article class="post">
+    <header class="post-header">
+      <time class="post-date" datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%B %d, %Y" }}</time>
+      <h1>{{ page.title }}</h1>
+      {% if page.subtitle %}<p class="post-subtitle">{{ page.subtitle }}</p>{% endif %}
+    </header>
+
+    {{ content }}
+  </article>
+
+  <nav class="post-nav">
+    <a href="{{ '/blog/' | relative_url }}">&larr; All posts</a>
+  </nav>
+</main>
