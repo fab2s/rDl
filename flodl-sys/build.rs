@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 fn main() {
     // docs.rs builds without libtorch — skip C++ compilation entirely.
+    // cargo doc does not link, so unresolved extern symbols are fine.
     if env::var("DOCS_RS").is_ok() {
         return;
     }

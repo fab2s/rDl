@@ -34,7 +34,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use indexmap::IndexMap;
-use sha2::{Sha256, Digest};
+use hmac_sha256::Hash as Sha256;
 
 use node::*;
 use crate::autograd::Variable;
@@ -818,7 +818,7 @@ impl Graph {
             hasher.update(b"\0");
         }
 
-        format!("{:064x}", hasher.finalize())
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 

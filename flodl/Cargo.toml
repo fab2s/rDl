@@ -22,10 +22,10 @@ default = []
 cuda = ["flodl-sys/cuda"]
 
 [dependencies]
-flodl-sys = { version = "0.1.0", path = "../flodl-sys" }
+flodl-sys = { version = "0.1.1", path = "../flodl-sys" }
 indexmap = "2"
 flate2 = "1"
-sha2 = "0.10"
+hmac-sha256 = "1"
 serde_json = "1"
 
 [package.metadata.docs.rs]

@@ -18,6 +18,9 @@ cuda = []
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]
 rustdoc-args = ["--cfg", "docsrs"]
+# Prevent docs.rs from trying to link (no libtorch in sandbox).
+# The extern block is gated behind #[cfg(not(docsrs))].
+no-default-features = true
 
 [build-dependencies]
 cc = "1"
