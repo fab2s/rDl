@@ -9,6 +9,7 @@ services:
       - .:/workspace
       - ./.cargo-cache:/usr/local/cargo/registry
       - ./.cargo-git:/usr/local/cargo/git
+      - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -23,6 +24,7 @@ services:
       - .:/workspace
       - ./.cargo-cache-cuda:/usr/local/cargo/registry
       - ./.cargo-git-cuda:/usr/local/cargo/git
+      - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
     working_dir: /workspace
     stdin_open: true
     tty: true

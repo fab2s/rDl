@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 description = "Raw FFI bindings to libtorch via a thin C++ shim"
 keywords = ["deep-learning", "libtorch", "ffi"]
-categories = ["external-ffi-bindings", "science::machine-learning"]
+categories = ["external-ffi-bindings", "science"]
 readme = "README.md"
 
 [features]

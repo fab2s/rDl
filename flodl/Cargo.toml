@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "floDl — a flow-graph deep learning framework built on libtorch"
 readme = "../README.md"
 keywords = ["deep-learning", "machine-learning", "neural-network", "libtorch", "graph"]
-categories = ["science::machine-learning"]
+categories = ["science", "artificial-intelligence"]
 include = [
     "src/**/*",
     "examples/**/*.rs",

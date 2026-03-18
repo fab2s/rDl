@@ -4,6 +4,7 @@ Cargo.lock
 .cargo-git/
 .cargo-cache-cuda/
 .cargo-git-cuda/
+.cargo-credentials.toml
 .idea/
 .*/
 !.github/
