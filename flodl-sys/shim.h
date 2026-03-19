@@ -263,6 +263,11 @@ void flodl_cuda_synchronize(int device_index);
 // Returns error string on failure (caller must free), NULL on success.
 char* flodl_cuda_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
 
+// Query bytes currently handed out by libtorch's CUDA caching allocator.
+// This can exceed physical VRAM when unified memory spills to host RAM.
+// spill = max(0, allocated - vram_total).
+char* flodl_cuda_alloc_bytes(int device_index, uint64_t* allocated_bytes);
+
 // Query GPU utilization percentage (0-100) via NVML.
 // Returns -1 if NVML is not available or query fails.
 int flodl_cuda_utilization(int device_index);

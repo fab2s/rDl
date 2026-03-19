@@ -20,6 +20,9 @@ pub struct ResourceSample {
     pub vram_used_bytes: Option<u64>,
     /// Total VRAM in bytes.
     pub vram_total_bytes: Option<u64>,
+    /// Bytes handed out by the CUDA caching allocator.
+    /// When this exceeds `vram_total_bytes`, the excess has spilled to host RAM.
+    pub vram_allocated_bytes: Option<u64>,
 }
 
 impl ResourceSample {
@@ -43,11 +46,21 @@ impl ResourceSample {
             parts.push(format!("GPU: {:.0}%", gpu));
         }
         if let (Some(used), Some(total)) = (self.vram_used_bytes, self.vram_total_bytes) {
-            parts.push(format!(
+            let mut vram = format!(
                 "VRAM: {}/{}",
                 super::format::format_bytes(used),
                 super::format::format_bytes(total),
-            ));
+            );
+            if let Some(alloc) = self.vram_allocated_bytes {
+                if alloc > total {
+                    let spill = alloc - total;
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut vram,
+                        format_args!(" spill: {}", super::format::format_bytes(spill)),
+                    );
+                }
+            }
+            parts.push(vram);
         }
 
         parts.join(" | ")
@@ -110,6 +123,11 @@ impl ResourceSampler {
         if let Ok((used, total)) = crate::tensor::cuda_memory_info() {
             s.vram_used_bytes = Some(used);
             s.vram_total_bytes = Some(total);
+        }
+
+        // Allocator stats (for spill detection)
+        if let Ok(alloc) = crate::tensor::cuda_allocated_bytes() {
+            s.vram_allocated_bytes = Some(alloc);
         }
 
         // GPU utilization via FFI (NVML)

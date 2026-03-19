@@ -21,6 +21,7 @@
 
 #ifdef FLODL_BUILD_CUDA
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #endif
 
 // Helper: convert a C++ exception to a malloc'd C string.
@@ -1071,6 +1072,28 @@ extern "C" char* flodl_cuda_mem_info(int device_index,
     return nullptr;
 #else
     (void)device_index; (void)used_bytes; (void)total_bytes;
+    return make_error("CUDA not available (built without cuda feature)");
+#endif
+}
+
+// --- CUDA caching allocator stats ---
+
+extern "C" char* flodl_cuda_alloc_bytes(int device_index,
+                                         uint64_t* allocated_bytes) {
+#ifdef FLODL_BUILD_CUDA
+    if (!torch::cuda::is_available()) {
+        return make_error("CUDA not available");
+    }
+    try {
+        auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
+            (c10::DeviceIndex)device_index);
+        *allocated_bytes = (uint64_t)stats.allocated_bytes[0].current;
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+#else
+    (void)device_index; (void)allocated_bytes;
     return make_error("CUDA not available (built without cuda feature)");
 #endif
 }

@@ -274,6 +274,11 @@ impl Monitor {
                 format_bytes(used),
                 format_bytes(total),
             );
+            if let Some(alloc) = res.vram_allocated_bytes {
+                if alloc > total {
+                    let _ = write!(line, " spill: {}", format_bytes(alloc - total));
+                }
+            }
         }
         if let Some(gpu) = res.gpu_util_percent {
             let _ = write!(line, " ({:.0}%)", gpu);
@@ -402,20 +407,25 @@ impl Monitor {
             b.push(',');
             b.push_str(name);
         }
-        b.push_str(",cpu_pct,ram_used,gpu_pct,vram_used\n");
+        b.push_str(",cpu_pct,ram_used,gpu_pct,vram_used,vram_spill\n");
 
         for record in &self.epochs {
             let _ = write!(b, "{},{:.3}", record.epoch + 1, record.duration_secs);
             for (_, val) in &record.metrics {
                 let _ = write!(b, ",{:.8}", val);
             }
+            let spill = match (record.resources.vram_allocated_bytes, record.resources.vram_total_bytes) {
+                (Some(alloc), Some(total)) if alloc > total => (alloc - total).to_string(),
+                _ => String::new(),
+            };
             let _ = write!(
                 b,
-                ",{},{},{},{}",
+                ",{},{},{},{},{}",
                 record.resources.cpu_percent.map_or("".to_string(), |v| format!("{:.1}", v)),
                 record.resources.ram_used_bytes.map_or("".to_string(), |v| v.to_string()),
                 record.resources.gpu_util_percent.map_or("".to_string(), |v| format!("{:.1}", v)),
                 record.resources.vram_used_bytes.map_or("".to_string(), |v| v.to_string()),
+                spill,
             );
             b.push('\n');
         }
@@ -522,6 +532,9 @@ impl Monitor {
         if let (Some(used), Some(total)) = (res.vram_used_bytes, res.vram_total_bytes) {
             if !first { b.push(','); }
             let _ = write!(b, "\"vram_used\":{},\"vram_total\":{}", used, total);
+            if let Some(alloc) = res.vram_allocated_bytes {
+                let _ = write!(b, ",\"vram_alloc\":{}", alloc);
+            }
         }
         b.push('}');
     }

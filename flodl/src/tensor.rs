@@ -1982,6 +1982,21 @@ pub fn cuda_memory_info() -> Result<(u64, u64)> {
     cuda_memory_info_idx(0)
 }
 
+/// Query bytes currently handed out by the CUDA caching allocator on a specific device.
+///
+/// This is the Rust equivalent of `torch.cuda.memory_allocated()`. It can exceed
+/// physical VRAM when unified memory spills to host RAM.
+pub fn cuda_allocated_bytes_idx(device_index: i32) -> Result<u64> {
+    let mut allocated: u64 = 0;
+    check_err(unsafe { ffi::flodl_cuda_alloc_bytes(device_index, &mut allocated) })?;
+    Ok(allocated)
+}
+
+/// Query bytes currently handed out by the CUDA caching allocator on device 0.
+pub fn cuda_allocated_bytes() -> Result<u64> {
+    cuda_allocated_bytes_idx(0)
+}
+
 /// Query GPU utilization percentage (0-100) via NVML.
 /// Returns `None` if NVML is not available or the query fails.
 pub fn cuda_utilization() -> Option<u32> {

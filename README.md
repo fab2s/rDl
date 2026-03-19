@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/floDl.png" alt="floDl" width="640">
+  <img src="https://raw.githubusercontent.com/fab2s/floDl/main/docs/floDl.png" alt="floDl" width="640">
 </p>
 
 <h1 align="center">floDl</h1>
@@ -14,7 +14,7 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
   <a href="https://github.com/fab2s/floDl/actions"><img src="https://github.com/fab2s/floDl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://crates.io/crates/flodl"><img src="https://img.shields.io/crates/v/flodl.svg" alt="crates.io"></a>
   <a href="https://docs.rs/flodl"><img src="https://docs.rs/flodl/badge.svg" alt="docs.rs"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="https://github.com/fab2s/floDl/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
 <p align="center">
@@ -22,9 +22,9 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
   <a href="#the-graph-builder">Graph Builder</a> &bull;
   <a href="#training-monitor">Training Monitor</a> &bull;
   <a href="#features">Features</a> &bull;
-  <a href="docs/tutorials/01-tensors.md">Tutorials</a> &bull;
-  <a href="docs/pytorch_migration.md">PyTorch Migration</a> &bull;
-  <a href="docs/troubleshooting.md">Troubleshooting</a> &bull;
+  <a href="https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md">Tutorials</a> &bull;
+  <a href="https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md">PyTorch Migration</a> &bull;
+  <a href="https://github.com/fab2s/floDl/blob/main/docs/troubleshooting.md">Troubleshooting</a> &bull;
   <a href="#architecture">Architecture</a>
 </p>
 
@@ -70,7 +70,7 @@ optimizer.step()?;
 
 Same concepts, same names, same GPU kernels underneath. The `?` operator
 replaces silent failures with compile-time error handling. `Drop` replaces the
-garbage collector. The [full migration guide](docs/pytorch_migration.md) covers
+garbage collector. The [full migration guide](https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md) covers
 every op, module, and pattern.
 
 ## Getting Started
@@ -90,7 +90,7 @@ make run      # train the template model
 This generates a complete project with Dockerfiles, Makefile, and an annotated
 training template. Edit `src/main.rs` to build your model.
 
-> **New to Rust?** Read [Rust for PyTorch Users](docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes.
+> **New to Rust?** Read [Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes.
 
 ## The Graph Builder
 
@@ -131,8 +131,8 @@ architectures without special-casing. Enough to express transformers,
 mixture-of-experts, iterative refinement, attention with memory, or any
 architecture you can draw as a data flow graph.
 
-See the **[Graph Builder Tutorial](docs/tutorials/05-graph-builder.md)** and
-the [full showcase](flodl/examples/showcase/) that exercises every builder
+See the **[Graph Builder Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md)** and
+the [full showcase](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) that exercises every builder
 method.
 
 ## Training Monitor
@@ -173,7 +173,7 @@ in real time via Server-Sent Events — no polling, no WebSocket, no npm.
 
 <p align="center">
   <a href="https://flodl.dev/benchmark">
-    <img src="docs/dashboard.gif" alt="floDl live training dashboard — click for interactive version" width="800">
+    <img src="https://raw.githubusercontent.com/fab2s/floDl/main/docs/dashboard.gif" alt="floDl live training dashboard — click for interactive version" width="800">
   </a>
 </p>
 <p align="center"><em><a href="https://flodl.dev/benchmark">Interactive benchmark dashboard</a> — real data from a 100-epoch training run</em></p>
@@ -216,7 +216,7 @@ monitor.export_csv("training.csv")?;         // metrics + resources as CSV
 charts, and graph SVG baked into a single HTML file. Open it in any browser,
 no server needed. Set it once before training and forget about it.
 
-See the full **[Training Monitor Tutorial](docs/tutorials/09-monitor.md)**.
+See the full **[Training Monitor Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/09-monitor.md)**.
 
 ## Quick Start
 
@@ -470,7 +470,7 @@ attention with a 9-component loss stack), same model, same data, same GPU:
 \* Fixed overhead (CUDA 12.6 vs 12.4 context size + allocator rounding) — does not grow with model size.
 
 Full methodology, raw data, and reproduction commands:
-**[Benchmark Report](docs/benchmark.md)** |
+**[Benchmark Report](https://github.com/fab2s/floDl/blob/main/docs/benchmark.md)** |
 [Raw artifacts](https://github.com/fab2s/fbrl/tree/5c58d71) (both sides, committed)
 
 ### Build profiles
@@ -541,7 +541,7 @@ If your GPU runs `nvidia-smi`, floDl can train on it.
 floDl is developed and tested on **NVIDIA CUDA** (Pascal and newer) and
 **CPU**. Since floDl binds libtorch — not CUDA directly — additional backends
 (AMD ROCm, Apple MPS, Intel XPU) are architecturally possible but not yet
-exposed or tested. Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+exposed or tested. Contributions welcome — see [CONTRIBUTING.md](https://github.com/fab2s/floDl/blob/main/CONTRIBUTING.md).
 
 ## Documentation
 
@@ -549,41 +549,41 @@ exposed or tested. Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.
 
 | Background | Start here |
 |-----------|-----------|
-| **New to Rust** | [Rust for PyTorch Users](docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes |
-| **Know Rust, new to DL** | [Tensors](docs/tutorials/01-tensors.md) then [Training](docs/tutorials/04-training.md) |
-| **Know PyTorch** | [PyTorch Migration Guide](docs/pytorch_migration.md) then [Graph Builder](docs/tutorials/05-graph-builder.md) |
-| **Just show me code** | [`quickstart`](flodl/examples/quickstart/) or [`showcase`](flodl/examples/showcase/) |
+| **New to Rust** | [Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes |
+| **Know Rust, new to DL** | [Tensors](https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md) then [Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/04-training.md) |
+| **Know PyTorch** | [PyTorch Migration Guide](https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md) then [Graph Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md) |
+| **Just show me code** | [`quickstart`](https://github.com/fab2s/floDl/tree/main/flodl/examples/quickstart/) or [`showcase`](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) |
 
 ### Tutorials
 
 Step-by-step guides from basics to advanced, each with code examples:
 
-0. **[Rust for PyTorch Users](docs/tutorials/00-rust-primer.md)** — 10 Rust patterns in 15 minutes (new to Rust? start here)
-1. **[Tensors](docs/tutorials/01-tensors.md)** — creation, ops, error handling, memory
-2. **[Autograd](docs/tutorials/02-autograd.md)** — variables, gradients, backward pass
-3. **[Modules](docs/tutorials/03-modules.md)** — Linear, Conv2d, normalization, RNN cells
-4. **[Training](docs/tutorials/04-training.md)** — losses, optimizers, full training loop
-5. **[Graph Builder](docs/tutorials/05-graph-builder.md)** — the fluent API from simple to complex
-6. **[Advanced Graphs](docs/tutorials/06-advanced-graphs.md)** — forward refs, loops, gates, switches
-7. **[Visualization](docs/tutorials/07-visualization.md)** — DOT/SVG output, reading diagrams
-8. **[Utilities](docs/tutorials/08-utilities.md)** — checkpoints, clipping, freezing, initialization
-9. **[Training Monitor](docs/tutorials/09-monitor.md)** — ETA, resource tracking, live web dashboard
+0. **[Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md)** — 10 Rust patterns in 15 minutes (new to Rust? start here)
+1. **[Tensors](https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md)** — creation, ops, error handling, memory
+2. **[Autograd](https://github.com/fab2s/floDl/blob/main/docs/tutorials/02-autograd.md)** — variables, gradients, backward pass
+3. **[Modules](https://github.com/fab2s/floDl/blob/main/docs/tutorials/03-modules.md)** — Linear, Conv2d, normalization, RNN cells
+4. **[Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/04-training.md)** — losses, optimizers, full training loop
+5. **[Graph Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md)** — the fluent API from simple to complex
+6. **[Advanced Graphs](https://github.com/fab2s/floDl/blob/main/docs/tutorials/06-advanced-graphs.md)** — forward refs, loops, gates, switches
+7. **[Visualization](https://github.com/fab2s/floDl/blob/main/docs/tutorials/07-visualization.md)** — DOT/SVG output, reading diagrams
+8. **[Utilities](https://github.com/fab2s/floDl/blob/main/docs/tutorials/08-utilities.md)** — checkpoints, clipping, freezing, initialization
+9. **[Training Monitor](https://github.com/fab2s/floDl/blob/main/docs/tutorials/09-monitor.md)** — ETA, resource tracking, live web dashboard
 
 ### Design
 
-- [Benchmark](docs/benchmark.md) — flodl vs PyTorch head-to-head with raw data
-- [Roadmap](docs/design/roadmap.md) — development plan and port status
-- [Trajectory Thesis](docs/design/trajectory-thesis.md) — geometric intuition behind the project
+- [Benchmark](https://github.com/fab2s/floDl/blob/main/docs/benchmark.md) — flodl vs PyTorch head-to-head with raw data
+- [Roadmap](https://github.com/fab2s/floDl/blob/main/docs/design/roadmap.md) — development plan and port status
+- [Trajectory Thesis](https://github.com/fab2s/floDl/blob/main/docs/design/trajectory-thesis.md) — geometric intuition behind the project
 
 ### Examples
 
-- [`quickstart`](flodl/examples/quickstart/) — build, train, and monitor a model with residual connections
-- [`sine_wave`](flodl/examples/sine_wave/) — sine regression with monitor, checkpoint round-trip
-- [`mixed_precision`](flodl/examples/mixed_precision/) — float16 training with `GradScaler`
-- [`transfer_learning`](flodl/examples/transfer_learning/) — checkpoint, partial load, freeze, fine-tune
-- [`schedulers`](flodl/examples/schedulers/) — warmup + cosine + plateau composition
-- [`observation`](flodl/examples/observation/) — collect, flush, trend queries, early stopping
-- [`showcase`](flodl/examples/showcase/) — every graph builder method in one graph
+- [`quickstart`](https://github.com/fab2s/floDl/tree/main/flodl/examples/quickstart/) — build, train, and monitor a model with residual connections
+- [`sine_wave`](https://github.com/fab2s/floDl/tree/main/flodl/examples/sine_wave/) — sine regression with monitor, checkpoint round-trip
+- [`mixed_precision`](https://github.com/fab2s/floDl/tree/main/flodl/examples/mixed_precision/) — float16 training with `GradScaler`
+- [`transfer_learning`](https://github.com/fab2s/floDl/tree/main/flodl/examples/transfer_learning/) — checkpoint, partial load, freeze, fine-tune
+- [`schedulers`](https://github.com/fab2s/floDl/tree/main/flodl/examples/schedulers/) — warmup + cosine + plateau composition
+- [`observation`](https://github.com/fab2s/floDl/tree/main/flodl/examples/observation/) — collect, flush, trend queries, early stopping
+- [`showcase`](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) — every graph builder method in one graph
 
 ## Story
 
@@ -603,4 +603,4 @@ composition, and design philosophy carried forward; the memory fights didn't.
 
 ## License
 
-floDl is open-sourced software licensed under the [MIT license](./LICENSE).
+floDl is open-sourced software licensed under the [MIT license](https://github.com/fab2s/floDl/blob/main/LICENSE).

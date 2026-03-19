@@ -5,6 +5,16 @@ All notable changes to floDl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-03-19
+
+### Added
+- **VRAM spill detection**: New FFI function `flodl_cuda_alloc_bytes` queries libtorch's CUDA caching allocator. `cuda_allocated_bytes()` / `cuda_allocated_bytes_idx()` expose it in Rust. When allocated bytes exceed physical VRAM, the monitor shows spill in terminal output, live dashboard, CSV export, and epoch log.
+- `ResourceSample::vram_allocated_bytes` field for allocator-level memory tracking.
+- `vram_spill` column in CSV export.
+
+### Fixed
+- README links now use absolute GitHub URLs — fixes broken links on crates.io where relative paths don't resolve.
+
 ## [0.1.0] - 2026-03-18
 
 ### Added

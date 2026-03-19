@@ -167,7 +167,7 @@ const epochs=[];
 const metricSeries={};  // name -> [values]
 const resourceSeries={cpu:[],gpu:[],ram:[],vram:[]};
 // Raw byte values for RAM/VRAM (for absolute-scale display when solo'd)
-const resourceRaw={ram_used:[],ram_total:[],vram_used:[],vram_total:[]};
+const resourceRaw={ram_used:[],ram_total:[],vram_used:[],vram_total:[],vram_alloc:[]};
 const COLORS=['#6c8cff','#f87171','#34d399','#fbbf24','#a78bfa','#fb923c','#67e8f9','#f472b6','#86efac','#fcd34d','#c4b5fd','#fdba74'];
 const RES_COLORS={cpu:'#6c8cff',ram:'#a78bfa',gpu:'#34d399',vram:'#fbbf24'};
 let metricNames=[];
@@ -195,6 +195,7 @@ function processEpoch(d){
   resourceRaw.ram_total.push(r.ram_total||null);
   resourceRaw.vram_used.push(r.vram_used||null);
   resourceRaw.vram_total.push(r.vram_total||null);
+  resourceRaw.vram_alloc.push(r.vram_alloc||null);
   updateHeader(d);
   updateResources(r);
   updateLog(d);
@@ -311,7 +312,11 @@ function updateResources(r){
   if(r.vram_used!=null&&r.vram_total){
     const pct=r.vram_used/r.vram_total*100;
     document.getElementById('vramBar').style.width=pct+'%';
-    document.getElementById('vramVal').textContent=fmtBytes(r.vram_used)+'/'+fmtBytes(r.vram_total);
+    let vLabel=fmtBytes(r.vram_used)+'/'+fmtBytes(r.vram_total);
+    if(r.vram_alloc!=null&&r.vram_alloc>r.vram_total){
+      vLabel+=' spill: '+fmtBytes(r.vram_alloc-r.vram_total);
+    }
+    document.getElementById('vramVal').textContent=vLabel;
   }
 }
 function setBar(id,val){
@@ -341,7 +346,11 @@ function updateLog(d){
   let res=[];
   if(r.cpu!=null)res.push('CPU:'+r.cpu.toFixed(0)+'%');
   if(r.gpu!=null)res.push('GPU:'+r.gpu.toFixed(0)+'%');
-  if(r.vram_used!=null&&r.vram_total)res.push('VRAM:'+fmtBytes(r.vram_used)+'/'+fmtBytes(r.vram_total));
+  if(r.vram_used!=null&&r.vram_total){
+    let v='VRAM:'+fmtBytes(r.vram_used)+'/'+fmtBytes(r.vram_total);
+    if(r.vram_alloc!=null&&r.vram_alloc>r.vram_total)v+=' spill:'+fmtBytes(r.vram_alloc-r.vram_total);
+    res.push(v);
+  }
   html+='<td style="color:var(--dim);font-size:11px">'+res.join(' ')+'</td>';
   tr.innerHTML=html;
   body.insertBefore(tr,body.firstChild);
