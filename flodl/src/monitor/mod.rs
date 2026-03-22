@@ -267,18 +267,17 @@ impl Monitor {
 
         // Resource summary (compact)
         let res = &resources;
-        if let (Some(used), Some(total)) = (res.vram_used_bytes, res.vram_total_bytes) {
+        if let Some(alloc) = res.vram_allocated_bytes {
+            let spill = match res.vram_total_bytes {
+                Some(total) if alloc > total => alloc - total,
+                _ => 0,
+            };
             let _ = write!(
                 line,
-                "  VRAM: {}/{}",
-                format_bytes(used),
-                format_bytes(total),
+                "  VRAM: {} / {}",
+                format_bytes(alloc),
+                format_bytes(spill),
             );
-            if let Some(alloc) = res.vram_allocated_bytes {
-                if alloc > total {
-                    let _ = write!(line, " spill: {}", format_bytes(alloc - total));
-                }
-            }
         }
         if let Some(gpu) = res.gpu_util_percent {
             let _ = write!(line, " ({:.0}%)", gpu);
@@ -388,7 +387,7 @@ impl Monitor {
     /// Export epoch data to CSV for analysis in external tools.
     ///
     /// Columns: `epoch`, `duration_s`, one column per metric name, then
-    /// `cpu_pct`, `ram_used`, `gpu_pct`, `vram_used`. Metric names are
+    /// `cpu_pct`, `ram_used`, `gpu_pct`, `vram_alloc`, `vram_spill`. Metric names are
     /// taken from the first epoch's metrics.
     pub fn export_csv(&self, path: &str) -> std::io::Result<()> {
         if self.epochs.is_empty() {
@@ -407,7 +406,7 @@ impl Monitor {
             b.push(',');
             b.push_str(name);
         }
-        b.push_str(",cpu_pct,ram_used,gpu_pct,vram_used,vram_spill\n");
+        b.push_str(",cpu_pct,ram_used,gpu_pct,vram_alloc,vram_spill\n");
 
         for record in &self.epochs {
             let _ = write!(b, "{},{:.3}", record.epoch + 1, record.duration_secs);
@@ -424,7 +423,7 @@ impl Monitor {
                 record.resources.cpu_percent.map_or("".to_string(), |v| format!("{:.1}", v)),
                 record.resources.ram_used_bytes.map_or("".to_string(), |v| v.to_string()),
                 record.resources.gpu_util_percent.map_or("".to_string(), |v| format!("{:.1}", v)),
-                record.resources.vram_used_bytes.map_or("".to_string(), |v| v.to_string()),
+                record.resources.vram_allocated_bytes.map_or("".to_string(), |v| v.to_string()),
                 spill,
             );
             b.push('\n');
@@ -529,11 +528,11 @@ impl Monitor {
             let _ = write!(b, "\"gpu\":{:.1}", gpu);
             first = false;
         }
-        if let (Some(used), Some(total)) = (res.vram_used_bytes, res.vram_total_bytes) {
+        if let Some(alloc) = res.vram_allocated_bytes {
             if !first { b.push(','); }
-            let _ = write!(b, "\"vram_used\":{},\"vram_total\":{}", used, total);
-            if let Some(alloc) = res.vram_allocated_bytes {
-                let _ = write!(b, ",\"vram_alloc\":{}", alloc);
+            let _ = write!(b, "\"vram_alloc\":{}", alloc);
+            if let Some(total) = res.vram_total_bytes {
+                let _ = write!(b, ",\"vram_total\":{}", total);
             }
         }
         b.push('}');

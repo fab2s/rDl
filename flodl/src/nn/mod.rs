@@ -21,6 +21,7 @@ pub mod lstmcell;
 pub mod conv2d;
 pub mod conv_transpose2d;
 pub mod batchnorm;
+pub mod pooling;
 pub mod checkpoint;
 pub mod amp;
 pub mod functional;
@@ -46,6 +47,7 @@ pub use lstmcell::LSTMCell;
 pub use conv2d::{Conv2d, Conv2dBuilder};
 pub use conv_transpose2d::ConvTranspose2d;
 pub use batchnorm::{BatchNorm, BatchNorm2d};
+pub use pooling::MaxPool2d;
 pub use init::{xavier_uniform, xavier_normal};
 pub use functional::gaussian_blur_2d;
 

@@ -929,6 +929,23 @@ extern "C" char* flodl_conv_transpose2d(FlodlTensor input, FlodlTensor weight,
 
 // --- Pooling ---
 
+extern "C" char* flodl_max_pool2d(FlodlTensor input, int64_t* kernel_size,
+                                 int64_t* stride, int64_t* padding, int64_t* dilation,
+                                 int ceil_mode, FlodlTensor* result) {
+    try {
+        *result = wrap(at::max_pool2d(
+            unwrap(input),
+            torch::IntArrayRef(kernel_size, 2),
+            torch::IntArrayRef(stride, 2),
+            torch::IntArrayRef(padding, 2),
+            torch::IntArrayRef(dilation, 2),
+            ceil_mode != 0));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
 extern "C" char* flodl_adaptive_avg_pool2d(FlodlTensor input, int64_t* output_size,
                                           FlodlTensor* result) {
     try {
@@ -1087,7 +1104,10 @@ extern "C" char* flodl_cuda_alloc_bytes(int device_index,
     try {
         auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
             (c10::DeviceIndex)device_index);
-        *allocated_bytes = (uint64_t)stats.allocated_bytes[0].current;
+        // reserved_bytes = total memory grabbed from CUDA driver (including
+        // unified-memory spill to host RAM).  allocated_bytes only counts
+        // actively-used sub-blocks, which never exceeds physical VRAM.
+        *allocated_bytes = (uint64_t)stats.reserved_bytes[0].current;
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());

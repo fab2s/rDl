@@ -162,7 +162,7 @@ The monitor samples system resources on every `log` call:
 | CPU % | `/proc/stat` (delta) | Linux |
 | RAM used/total | `/proc/meminfo` | Linux |
 | GPU utilization % | NVML (dynamic load) | NVIDIA GPU + driver |
-| VRAM used/total | `cudaMemGetInfo` | CUDA feature enabled |
+| VRAM allocated / spill | CUDA caching allocator (`reserved_bytes`) | CUDA feature enabled |
 
 Resources that aren't available are silently omitted from both the terminal
 output and the dashboard.
@@ -171,8 +171,8 @@ output and the dashboard.
 
 ```rust
 for record in monitor.history() {
-    if let Some(vram) = record.resources.vram_used_bytes {
-        println!("epoch {}: VRAM {} bytes", record.epoch, vram);
+    if let Some(alloc) = record.resources.vram_allocated_bytes {
+        println!("epoch {}: VRAM {} bytes", record.epoch, alloc);
     }
 }
 ```
@@ -218,9 +218,9 @@ monitor.export_csv("training.csv")?;
 Produces:
 
 ```csv
-epoch,duration_s,loss,cpu_pct,ram_used,gpu_pct,vram_used
-1,0.049,1.5264,45.2,3221225472,82.0,2254857830
-2,0.028,1.1020,43.8,3221225472,81.5,2254857830
+epoch,duration_s,loss,cpu_pct,ram_used,gpu_pct,vram_alloc,vram_spill
+1,0.049,1.5264,45.2,3221225472,82.0,2254857830,0
+2,0.028,1.1020,43.8,3221225472,81.5,2254857830,0
 ...
 ```
 

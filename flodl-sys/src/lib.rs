@@ -300,6 +300,12 @@ unsafe extern "C" {
 
     // --- Pooling ---
 
+    pub fn flodl_max_pool2d(
+        input: FlodlTensor, kernel_size: *mut i64,
+        stride: *mut i64, padding: *mut i64, dilation: *mut i64,
+        ceil_mode: i32, result: *mut FlodlTensor,
+    ) -> *mut i8;
+
     pub fn flodl_adaptive_avg_pool2d(
         input: FlodlTensor, output_size: *mut i64,
         result: *mut FlodlTensor,

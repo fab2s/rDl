@@ -299,7 +299,7 @@ for (input_t, target_t) in &batches {
 |-------|-------------|
 | **Tensor** | Owned RAII tensors with `Drop`, `Clone`. CPU and CUDA. |
 | **Autograd** | Reverse-mode automatic differentiation. Full backward for every op. |
-| **NN Modules** | `Linear`, `Conv2d`, `ConvTranspose2d`, `LayerNorm`, `BatchNorm`/`BatchNorm2d`, `Dropout`, `Dropout2d`, `Embedding`, `GRUCell`, `LSTMCell` |
+| **NN Modules** | `Linear`, `Conv2d`, `ConvTranspose2d`, `MaxPool2d`, `LayerNorm`, `BatchNorm`/`BatchNorm2d`, `Dropout`, `Dropout2d`, `Embedding`, `GRUCell`, `LSTMCell` |
 | **Activations** | `Identity`, `ReLU`, `Sigmoid`, `Tanh`, `GELU`, `SiLU` |
 | **Losses** | `mse_loss`, `cross_entropy_loss`, `bce_with_logits_loss`, `l1_loss`, `smooth_l1_loss`, `kl_div_loss` |
 | **Optimizers** | `SGD` (with momentum), `Adam`, `AdamW` — all support parameter groups for per-group LR |

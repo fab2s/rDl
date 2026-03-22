@@ -3,12 +3,14 @@
 # All commands run inside the Docker container via docker compose.
 # Use the cuda-* targets for GPU builds (requires NVIDIA Container Toolkit).
 
-COMPOSE = docker compose
-RUN     = $(COMPOSE) run --rm dev
-RUN_GPU = $(COMPOSE) run --rm cuda
+COMPOSE   = docker compose
+RUN       = $(COMPOSE) run --rm dev
+RUN_GPU   = $(COMPOSE) run --rm cuda
+RUN_BENCH = $(COMPOSE) run --rm bench
 
 .PHONY: build test test-release check clippy doc shell clean image \
         cuda-image cuda-build cuda-test cuda-shell test-all \
+        bench-image bench bench-cpu bench-compare \
         site site-stop test-init
 
 # --- CPU targets ---
@@ -81,6 +83,29 @@ test-all: test
 		echo ""; \
 		echo "=== No GPU available — skipping CUDA tests ==="; \
 	fi
+
+# --- Benchmarks ---
+
+# Build the benchmark Docker image (Rust + Python + PyTorch)
+# Skips rebuild if flodl-bench image already exists (use `make clean` to force)
+bench-image:
+	@mkdir -p .cargo-cache-bench .cargo-git-bench
+	@if ! docker image inspect flodl-bench:latest >/dev/null 2>&1; then \
+		$(COMPOSE) build bench; \
+	else \
+		echo "flodl-bench image exists, skipping build (docker compose down -v --rmi local to force)"; \
+	fi
+
+# Run CUDA benchmarks: flodl vs PyTorch comparison
+bench: bench-image
+	$(RUN_BENCH) benchmarks/run.sh
+
+# Run CPU-only benchmarks: flodl vs PyTorch comparison
+bench-cpu: bench-image
+	$(RUN_BENCH) benchmarks/run.sh --cpu
+
+# Run flodl + PyTorch benchmarks and compare (alias)
+bench-compare: bench
 
 # --- Site ---
 

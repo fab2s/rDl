@@ -167,7 +167,7 @@ const epochs=[];
 const metricSeries={};  // name -> [values]
 const resourceSeries={cpu:[],gpu:[],ram:[],vram:[]};
 // Raw byte values for RAM/VRAM (for absolute-scale display when solo'd)
-const resourceRaw={ram_used:[],ram_total:[],vram_used:[],vram_total:[],vram_alloc:[]};
+const resourceRaw={ram_used:[],ram_total:[],vram_alloc:[],vram_total:[]};
 const COLORS=['#6c8cff','#f87171','#34d399','#fbbf24','#a78bfa','#fb923c','#67e8f9','#f472b6','#86efac','#fcd34d','#c4b5fd','#fdba74'];
 const RES_COLORS={cpu:'#6c8cff',ram:'#a78bfa',gpu:'#34d399',vram:'#fbbf24'};
 let metricNames=[];
@@ -190,12 +190,11 @@ function processEpoch(d){
   resourceSeries.cpu.push(r.cpu!=null?r.cpu:null);
   resourceSeries.gpu.push(r.gpu!=null?r.gpu:null);
   resourceSeries.ram.push(r.ram_used!=null&&r.ram_total?r.ram_used/r.ram_total*100:null);
-  resourceSeries.vram.push(r.vram_used!=null&&r.vram_total?r.vram_used/r.vram_total*100:null);
+  resourceSeries.vram.push(r.vram_alloc!=null&&r.vram_total?r.vram_alloc/r.vram_total*100:null);
   resourceRaw.ram_used.push(r.ram_used||null);
   resourceRaw.ram_total.push(r.ram_total||null);
-  resourceRaw.vram_used.push(r.vram_used||null);
-  resourceRaw.vram_total.push(r.vram_total||null);
   resourceRaw.vram_alloc.push(r.vram_alloc||null);
+  resourceRaw.vram_total.push(r.vram_total||null);
   updateHeader(d);
   updateResources(r);
   updateLog(d);
@@ -309,14 +308,14 @@ function updateResources(r){
     document.getElementById('ramBar').style.width=pct+'%';
     document.getElementById('ramVal').textContent=fmtBytes(r.ram_used)+'/'+fmtBytes(r.ram_total);
   }
-  if(r.vram_used!=null&&r.vram_total){
-    const pct=r.vram_used/r.vram_total*100;
-    document.getElementById('vramBar').style.width=pct+'%';
-    let vLabel=fmtBytes(r.vram_used)+'/'+fmtBytes(r.vram_total);
-    if(r.vram_alloc!=null&&r.vram_alloc>r.vram_total){
-      vLabel+=' spill: '+fmtBytes(r.vram_alloc-r.vram_total);
-    }
-    document.getElementById('vramVal').textContent=vLabel;
+  if(r.vram_alloc!=null){
+    const total=r.vram_total||0;
+    const pct=total>0?Math.min(r.vram_alloc/total*100,100):0;
+    const spill=total>0&&r.vram_alloc>total?r.vram_alloc-total:0;
+    const bar=document.getElementById('vramBar');
+    bar.style.width=pct+'%';
+    bar.style.background=spill>0?'var(--red)':'var(--yellow)';
+    document.getElementById('vramVal').textContent=fmtBytes(r.vram_alloc)+' / '+fmtBytes(spill);
   }
 }
 function setBar(id,val){
@@ -346,10 +345,9 @@ function updateLog(d){
   let res=[];
   if(r.cpu!=null)res.push('CPU:'+r.cpu.toFixed(0)+'%');
   if(r.gpu!=null)res.push('GPU:'+r.gpu.toFixed(0)+'%');
-  if(r.vram_used!=null&&r.vram_total){
-    let v='VRAM:'+fmtBytes(r.vram_used)+'/'+fmtBytes(r.vram_total);
-    if(r.vram_alloc!=null&&r.vram_alloc>r.vram_total)v+=' spill:'+fmtBytes(r.vram_alloc-r.vram_total);
-    res.push(v);
+  if(r.vram_alloc!=null){
+    const spill=r.vram_total&&r.vram_alloc>r.vram_total?r.vram_alloc-r.vram_total:0;
+    res.push('VRAM:'+fmtBytes(r.vram_alloc)+'/'+fmtBytes(spill));
   }
   html+='<td style="color:var(--dim);font-size:11px">'+res.join(' ')+'</td>';
   tr.innerHTML=html;
@@ -357,7 +355,7 @@ function updateLog(d){
 }
 
 // --- Charts ---
-function drawChart(canvasId,series,colors,labels,isPercent,yFmt){
+function drawChart(canvasId,series,colors,labels,isPercent,yFmt,refLine){
   const canvas=document.getElementById(canvasId);
   const ctx=canvas.getContext('2d');
   const dpr=window.devicePixelRatio||1;
@@ -385,6 +383,7 @@ function drawChart(canvasId,series,colors,labels,isPercent,yFmt){
   if(!isFinite(minV)){minV=0;maxV=1}
   if(minV===maxV){minV-=1;maxV+=1}
   if(isPercent){minV=Math.min(0,minV);maxV=Math.max(100,maxV)}
+  if(refLine!=null){minV=Math.min(minV,refLine.value);maxV=Math.max(maxV,refLine.value)}
   const pad=(maxV-minV)*0.05;minV-=pad;maxV+=pad;
   const xScale=i=>M.left+(i/Math.max(1,maxEp-1))*pw;
   const yScale=v=>M.top+ph-(v-minV)/(maxV-minV)*ph;
@@ -406,6 +405,26 @@ function drawChart(canvasId,series,colors,labels,isPercent,yFmt){
   for(let i=0;i<maxEp;i+=xStep){
     ctx.fillStyle='#8b8fa3';ctx.font='10px -apple-system,sans-serif';
     ctx.fillText(''+(i+1),xScale(i),H-M.bottom+14);
+  }
+
+  // Reference line (e.g., physical VRAM limit)
+  if(refLine!=null){
+    const ry=yScale(refLine.value);
+    if(ry>=M.top&&ry<=M.top+ph){
+      ctx.save();
+      ctx.strokeStyle=refLine.color||'#8b8fa3';
+      ctx.lineWidth=1.5;
+      if(refLine.dotted)ctx.setLineDash([6,4]);
+      ctx.beginPath();ctx.moveTo(M.left,ry);ctx.lineTo(W-M.right,ry);ctx.stroke();
+      ctx.setLineDash([]);
+      if(refLine.label){
+        ctx.fillStyle=refLine.color||'#8b8fa3';
+        ctx.font='9px -apple-system,sans-serif';
+        ctx.textAlign='right';
+        ctx.fillText(refLine.label,W-M.right,ry-4);
+      }
+      ctx.restore();
+    }
   }
 
   // Lines (filtered by solo state — names already filtered above)
@@ -444,14 +463,17 @@ function drawResources(){
   const resLabels={cpu:'CPU',gpu:'GPU',ram:'RAM',vram:'VRAM'};
   const resColors=[RES_COLORS.cpu,RES_COLORS.gpu,RES_COLORS.ram,RES_COLORS.vram];
   const solo=soloState['resourceChart'];
-  // When solo'd on RAM or VRAM, show raw bytes with proper scale
-  if(solo==='ram'||solo==='vram'){
-    const rawKey=solo+'_used';
+  const lastTotal=resourceRaw.vram_total.length>0?resourceRaw.vram_total[resourceRaw.vram_total.length-1]:null;
+  if(solo==='ram'){
     const byteSeries={};
-    byteSeries[solo]=resourceRaw[rawKey];
-    drawChart('resourceChart',byteSeries,
-      [solo==='ram'?RES_COLORS.ram:RES_COLORS.vram],
-      [solo],false,fmtBytes);
+    byteSeries['ram']=resourceRaw.ram_used;
+    drawChart('resourceChart',byteSeries,[RES_COLORS.ram],['ram'],false,fmtBytes);
+  }else if(solo==='vram'){
+    // Solo VRAM: byte scale with solid physical-limit line
+    const byteSeries={};
+    byteSeries['vram']=resourceRaw.vram_alloc;
+    const vramRef=lastTotal?{value:lastTotal,dotted:false,color:'rgba(248,113,113,0.7)',label:'Physical VRAM'}:null;
+    drawChart('resourceChart',byteSeries,[RES_COLORS.vram],['vram'],false,fmtBytes,vramRef);
   }else if(solo==='cpu'||solo==='gpu'){
     // Solo percentage metric with % suffix on axis
     const pctSeries={};
@@ -460,7 +482,9 @@ function drawResources(){
       [solo==='cpu'?RES_COLORS.cpu:RES_COLORS.gpu],
       [solo],true,v=>v.toFixed(0)+'%');
   }else{
-    drawChart('resourceChart',resourceSeries,resColors,resNames,true);
+    // Combined view: dotted VRAM limit at 100%
+    const vramRef=lastTotal?{value:100,dotted:true,color:'rgba(248,113,113,0.4)',label:'VRAM limit'}:null;
+    drawChart('resourceChart',resourceSeries,resColors,resNames,true,null,vramRef);
   }
   updateLegend('resourceLegend',resNames,resColors,'resourceChart',drawResources,resLabels);
 }

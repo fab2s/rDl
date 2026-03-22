@@ -36,6 +36,27 @@ services:
               count: all
               capabilities: [gpu]
 
+  bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.bench
+    image: flodl-bench
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/workspace
+      - ./.cargo-cache-bench:/usr/local/cargo/registry
+      - ./.cargo-git-bench:/usr/local/cargo/git
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   jekyll:
     image: jekyll/jekyll:4
     volumes:

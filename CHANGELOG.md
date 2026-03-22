@@ -5,6 +5,16 @@ All notable changes to floDl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **`MaxPool2d`** module: 2D max pooling layer with kernel size, stride, padding, dilation, and ceil mode. Full FFI chain (`shim.cpp` → `flodl-sys` → `Tensor::max_pool2d` → `autograd::max_pool2d` → `nn::MaxPool2d`). Matches PyTorch's `nn.MaxPool2d`.
+
+### Fixed
+- **VRAM monitoring**: `cuda_allocated_bytes()` now returns `reserved_bytes` instead of `allocated_bytes` from the CUDA caching allocator. `allocated_bytes` only counts active sub-blocks and never exceeds physical VRAM, masking unified-memory spill. `reserved_bytes` includes host-spilled pages, making spill detection actually work.
+- Removed unused `ResourceSample::vram_used_bytes` field (dead since dashboard switched to allocator stats).
+- Dashboard now uses `vram_alloc` as the sole VRAM metric with a physical-limit reference line.
+
 ## [0.1.2] - 2026-03-19
 
 ### Added

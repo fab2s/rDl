@@ -52,7 +52,7 @@ The full set of differentiable operations includes: `add`, `sub`, `mul`,
 `softmax`, `log_softmax`, `transpose`, `permute`, `reshape`, `flatten`,
 `squeeze`, `unsqueeze`, `expand`, `narrow`, `select`, `cat`, `chunk`,
 `repeat`, `pad`, `index_select`, `gather`, `topk`, `sort`,
-`conv2d`, `conv_transpose2d`, `adaptive_avg_pool2d`, `grid_sample`,
+`conv2d`, `conv_transpose2d`, `max_pool2d`, `adaptive_avg_pool2d`, `grid_sample`,
 `layer_norm`, and more.
 
 ## Backward Pass: Computing Gradients

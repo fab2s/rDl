@@ -385,7 +385,7 @@ Reciprocal, Clamp, ReLU, Sigmoid, Tanh, GELU, SiLU, Softmax, LogSoftmax,
 Sum, SumDim, MeanDim, Mean, Var, Std, Min, Max, VarDim, StdDim,
 Reshape, Transpose, Permute, Squeeze, Unsqueeze, Flatten, Expand,
 Select, Narrow, Cat, Chunk, Repeat, Pad, IndexSelect, Gather, TopK, Sort,
-Conv2d, ConvTranspose2d, AdaptiveAvgPool2d, GridSample, LayerNorm.
+Conv2d, ConvTranspose2d, MaxPool2d, AdaptiveAvgPool2d, GridSample, LayerNorm.
 
 ## Neural Network Layers
 
@@ -395,6 +395,8 @@ layer = nn.Linear(784, 128)
 layer = nn.Linear(784, 128, bias=False)
 layer = nn.Conv2d(3, 64, kernel_size=3, padding=1)
 layer = nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1)
+layer = nn.MaxPool2d(kernel_size=2)
+layer = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 layer = nn.LayerNorm(128)
 layer = nn.BatchNorm1d(128)
 layer = nn.BatchNorm2d(64)
@@ -412,6 +414,8 @@ let layer = Conv2d::new(3, 64, 3)?;                                         // d
 let layer = Conv2d::configure(3, 64, 3).with_padding(1).with_stride(2).done()?;   // fluent builder
 let layer = Conv2d::build(3, 64, 3, true, [1,1], [1,1], [1,1], 1, Device::CPU)?;  // full control
 let layer = ConvTranspose2d::new(64, 3, 4)?;                                // defaults: stride=1, padding=0
+let pool = MaxPool2d::new(2);                                               // kernel=2, stride=2 (defaults to kernel)
+let pool = MaxPool2d::with_stride(3, 2).padding(1);                         // kernel=3, stride=2, padding=1
 let layer = LayerNorm::new(128)?;
 let layer = BatchNorm::new(128)?;                                         // for [B, features] after Linear
 let layer = BatchNorm2d::new(64)?;                                        // for [B, C, H, W] after Conv2d
@@ -1030,8 +1034,8 @@ if let Some(pct) = util {
 
 | PyTorch | flodl | What it reports |
 |---------|-------|----------------|
-| `torch.cuda.memory_allocated()` | `cuda_memory_info()?.0` | Bytes used (hardware level) |
-| `torch.cuda.get_device_properties(0).total_mem` | `cuda_memory_info()?.1` | Total VRAM |
+| `torch.cuda.mem_get_info()` | `cuda_memory_info()?` | `(used, total)` bytes via `cudaMemGetInfo` |
+| `torch.cuda.memory_reserved()` | `cuda_allocated_bytes()?` | Bytes reserved by caching allocator (includes spill) |
 | *(no built-in)* | `cuda_utilization()` | GPU compute % via NVML |
 
 The monitor samples these automatically on every `log()` call — you don't need
@@ -1058,7 +1062,7 @@ to query them manually during training.
 | `torch.save(...)` / `torch.load(...)` | `model.save_checkpoint("m.fdl")?` / `model.load_checkpoint("m.fdl")?` | Named `.fdl` format with `LoadReport` + structural hash validation |
 | `param.requires_grad = False` | `param.freeze()?` | Also: `unfreeze()`, `is_frozen()` |
 | `Adam([{"params":..., "lr":...}])` | `Adam::with_groups().group(&p, lr).build()` | Per-group LR |
-| `torch.cuda.memory_allocated()` | `cuda_memory_info()?` | `(used, total)` bytes |
+| `torch.cuda.memory_reserved()` | `cuda_allocated_bytes()?` | Bytes reserved by caching allocator |
 | `x.pin_memory()` | `x.pin_memory()?` | Page-locked CPU memory for async transfers |
 | `x.is_pinned()` | `x.is_pinned()` | Check if tensor is in pinned memory |
 | `SummaryWriter` + TensorBoard | `Monitor::new(n).serve(3000)?` | Built-in live dashboard |

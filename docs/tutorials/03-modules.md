@@ -70,6 +70,37 @@ Transpose convolution (upsampling).
 let deconv = ConvTranspose2d::new(64, 3, 3)?;  // in=64, out=3, kernel=3
 ```
 
+## Pooling
+
+### MaxPool2d
+
+2D max pooling over `[N, C, H, W]` inputs. Stride defaults to kernel size.
+
+```rust
+let pool = MaxPool2d::new(2);                            // kernel=2, stride=2
+let pool = MaxPool2d::with_stride(3, 2).padding(1);     // kernel=3, stride=2, padding=1
+let output = pool.forward(&input)?;                      // [B, C, H, W] -> [B, C, H/2, W/2]
+```
+
+No learnable parameters. Commonly paired with Conv2d + BatchNorm2d:
+
+```rust
+let model = FlowBuilder::from(Conv2d::new(3, 64, 3)?)
+    .through(BatchNorm2d::new(64)?)
+    .through(ReLU)
+    .through(MaxPool2d::new(2))
+    .build()?;
+```
+
+### AdaptiveAvgPool2d
+
+Outputs a fixed spatial size regardless of input dimensions. Available as
+a free function:
+
+```rust
+let pooled = adaptive_avg_pool2d(&input, [1, 1])?;  // [B, C, H, W] -> [B, C, 1, 1]
+```
+
 ## Normalization
 
 ### LayerNorm

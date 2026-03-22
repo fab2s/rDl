@@ -16,19 +16,18 @@ pub struct ResourceSample {
     pub ram_total_bytes: Option<u64>,
     /// GPU utilization percentage (0-100), None if NVML unavailable.
     pub gpu_util_percent: Option<f32>,
-    /// VRAM used in bytes.
-    pub vram_used_bytes: Option<u64>,
-    /// Total VRAM in bytes.
+    /// Total physical VRAM in bytes.
     pub vram_total_bytes: Option<u64>,
-    /// Bytes handed out by the CUDA caching allocator.
-    /// When this exceeds `vram_total_bytes`, the excess has spilled to host RAM.
+    /// Bytes reserved by the CUDA caching allocator (includes unified-memory
+    /// spill to host RAM).  When this exceeds `vram_total_bytes`, the excess
+    /// has spilled to host RAM.
     pub vram_allocated_bytes: Option<u64>,
 }
 
 impl ResourceSample {
     /// Format a compact resource summary string.
     ///
-    /// Example: `"CPU: 45% | RAM: 3.2/7.8 GB | GPU: 82% | VRAM: 2.1/6.0 GB"`
+    /// Example: `"CPU: 45% | RAM: 3.2/7.8 GB | GPU: 82% | VRAM: 2.1 GB / 0 KB"`
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
 
@@ -45,22 +44,16 @@ impl ResourceSample {
         if let Some(gpu) = self.gpu_util_percent {
             parts.push(format!("GPU: {:.0}%", gpu));
         }
-        if let (Some(used), Some(total)) = (self.vram_used_bytes, self.vram_total_bytes) {
-            let mut vram = format!(
-                "VRAM: {}/{}",
-                super::format::format_bytes(used),
-                super::format::format_bytes(total),
-            );
-            if let Some(alloc) = self.vram_allocated_bytes {
-                if alloc > total {
-                    let spill = alloc - total;
-                    let _ = std::fmt::Write::write_fmt(
-                        &mut vram,
-                        format_args!(" spill: {}", super::format::format_bytes(spill)),
-                    );
-                }
-            }
-            parts.push(vram);
+        if let Some(alloc) = self.vram_allocated_bytes {
+            let spill = match self.vram_total_bytes {
+                Some(total) if alloc > total => alloc - total,
+                _ => 0,
+            };
+            parts.push(format!(
+                "VRAM: {} / {}",
+                super::format::format_bytes(alloc),
+                super::format::format_bytes(spill),
+            ));
         }
 
         parts.join(" | ")
@@ -119,9 +112,8 @@ impl ResourceSampler {
             s.ram_total_bytes = Some(total);
         }
 
-        // GPU memory via FFI (CUDA)
-        if let Ok((used, total)) = crate::tensor::cuda_memory_info() {
-            s.vram_used_bytes = Some(used);
+        // Physical VRAM total via cudaMemGetInfo
+        if let Ok((_, total)) = crate::tensor::cuda_memory_info() {
             s.vram_total_bytes = Some(total);
         }
 

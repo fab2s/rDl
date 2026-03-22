@@ -1299,6 +1299,34 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
+    /// Max pooling over a 2D input (`[B, C, H, W]`).
+    ///
+    /// Equivalent to `torch.nn.functional.max_pool2d`.
+    pub fn max_pool2d(
+        &self,
+        kernel_size: [i64; 2],
+        stride: [i64; 2],
+        padding: [i64; 2],
+        dilation: [i64; 2],
+        ceil_mode: bool,
+    ) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let mut ks = kernel_size;
+        let mut st = stride;
+        let mut pd = padding;
+        let mut dl = dilation;
+        let err = unsafe {
+            ffi::flodl_max_pool2d(
+                self.handle,
+                ks.as_mut_ptr(), st.as_mut_ptr(),
+                pd.as_mut_ptr(), dl.as_mut_ptr(),
+                ceil_mode as i32, &mut handle,
+            )
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
     /// Adaptive average pooling to target spatial size.
     pub fn adaptive_avg_pool2d(&self, output_size: [i64; 2]) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -1982,9 +2010,9 @@ pub fn cuda_memory_info() -> Result<(u64, u64)> {
     cuda_memory_info_idx(0)
 }
 
-/// Query bytes currently handed out by the CUDA caching allocator on a specific device.
+/// Query bytes reserved by the CUDA caching allocator on a specific device.
 ///
-/// This is the Rust equivalent of `torch.cuda.memory_allocated()`. It can exceed
+/// This is the Rust equivalent of `torch.cuda.memory_reserved()`. It can exceed
 /// physical VRAM when unified memory spills to host RAM.
 pub fn cuda_allocated_bytes_idx(device_index: i32) -> Result<u64> {
     let mut allocated: u64 = 0;
@@ -1992,7 +2020,7 @@ pub fn cuda_allocated_bytes_idx(device_index: i32) -> Result<u64> {
     Ok(allocated)
 }
 
-/// Query bytes currently handed out by the CUDA caching allocator on device 0.
+/// Query bytes reserved by the CUDA caching allocator on device 0.
 pub fn cuda_allocated_bytes() -> Result<u64> {
     cuda_allocated_bytes_idx(0)
 }

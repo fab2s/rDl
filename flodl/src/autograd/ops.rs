@@ -517,6 +517,19 @@ pub fn conv_transpose2d(
     Ok(Variable::wrap(result))
 }
 
+/// Max pooling over a 2D input with autograd support (`F.max_pool2d`).
+pub fn max_pool2d(
+    input: &Variable,
+    kernel_size: [i64; 2],
+    stride: [i64; 2],
+    padding: [i64; 2],
+    dilation: [i64; 2],
+    ceil_mode: bool,
+) -> Result<Variable> {
+    let result = input.data().max_pool2d(kernel_size, stride, padding, dilation, ceil_mode)?;
+    Ok(Variable::wrap(result))
+}
+
 /// Adaptive average pooling that outputs a fixed `[H, W]` regardless of input size.
 pub fn adaptive_avg_pool2d(
     input: &Variable,
