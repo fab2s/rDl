@@ -1,4 +1,4 @@
-"""Iterative refinement benchmark: encoder -> refinement loop (5x) -> decoder.
+"""Iterative refinement benchmark: encoder -> refinement loop (8x) -> decoder.
 
 PyTorch equivalent of flodl's `.loop_body().for_n()` — a Python for-loop
 in forward() calling the same submodule repeatedly.
@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 
 
-DIM = 128
-REFINE_STEPS = 5
+DIM = 1024
+REFINE_STEPS = 8
 
 
 class RefineBlock(nn.Module):
@@ -43,7 +43,7 @@ class IterativeRefine(nn.Module):
         return self.decoder(x)
 
 
-def run(device, batches_per_epoch=100, batch_size=128, **kwargs):
+def run(device, batches_per_epoch=50, batch_size=256, **kwargs):
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
     from harness import run_benchmark

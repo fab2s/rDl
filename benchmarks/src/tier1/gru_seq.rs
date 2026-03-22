@@ -5,9 +5,9 @@
 use flodl::*;
 use crate::harness::{BenchConfig, BenchResult, run_benchmark};
 
-const SEQ_LEN: usize = 20;
-const INPUT_DIM: i64 = 64;
-const HIDDEN_DIM: i64 = 128;
+const SEQ_LEN: usize = 50;
+const INPUT_DIM: i64 = 256;
+const HIDDEN_DIM: i64 = 512;
 
 /// Unrolled GRU sequence model: step through timesteps, project final hidden.
 struct GruSeqModel {
@@ -49,11 +49,12 @@ impl Module for GruSeqModel {
     }
 }
 
-pub fn run(device: Device) -> Result<BenchResult> {
+pub fn run(device: Device, vram_baseline: u64) -> Result<BenchResult> {
     let config = BenchConfig {
         name: "gru_seq".into(),
-        batch_size: 64,
-        batches_per_epoch: 100,
+        batch_size: 128,
+        batches_per_epoch: 50,
+        vram_baseline,
         ..Default::default()
     };
 

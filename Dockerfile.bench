@@ -42,6 +42,7 @@ ENV CUDA_HOME="/usr/local/cuda"
 # --- PyTorch (matching libtorch version, CUDA 12.6) ---
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --break-system-packages \
-    torch==${LIBTORCH_VERSION} --index-url https://download.pytorch.org/whl/cu126
+    torch==${LIBTORCH_VERSION} --index-url https://download.pytorch.org/whl/cu126 && \
+    pip3 install --break-system-packages numpy
 
 WORKDIR /workspace

@@ -1,4 +1,4 @@
-"""Residual tower benchmark: 8 layers with skip connections.
+"""Residual tower benchmark: 12 layers with skip connections.
 
 PyTorch equivalent of flodl's `.also()` — manual `x = x + block(x)`.
 """
@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 
 
-DIM = 256
-NUM_BLOCKS = 8
+DIM = 1024
+NUM_BLOCKS = 12
 
 
 class ResidualBlock(nn.Module):
@@ -38,7 +38,7 @@ class ResidualTower(nn.Module):
         return self.output(x)
 
 
-def run(device, batches_per_epoch=100, batch_size=128, **kwargs):
+def run(device, batches_per_epoch=50, batch_size=256, **kwargs):
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
     from harness import run_benchmark

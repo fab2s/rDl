@@ -23,7 +23,7 @@ mod tier1;
 mod tier2;
 
 use flodl::{cuda_available, set_cudnn_benchmark, Device};
-use harness::{BenchResult, print_result};
+use harness::{BenchResult, print_result, vram_baseline};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,7 +47,7 @@ fn main() {
 
     let run_all = !tier1_only && !tier2_only && single.is_none();
 
-    type BenchFn = Box<dyn Fn(Device) -> flodl::Result<BenchResult>>;
+    type BenchFn = Box<dyn Fn(Device, u64) -> flodl::Result<BenchResult>>;
 
     let benchmarks: Vec<(&str, BenchFn)> = vec![
         // Tier 1
@@ -79,7 +79,8 @@ fn main() {
         }
 
         eprintln!("--- {} ---", name);
-        match run_fn(device) {
+        let baseline = vram_baseline();
+        match run_fn(device, baseline) {
             Ok(result) => {
                 if !json {
                     print_result(&result);

@@ -1118,6 +1118,14 @@ extern "C" char* flodl_cuda_alloc_bytes(int device_index,
 #endif
 }
 
+// --- CUDA empty cache ---
+
+extern "C" void flodl_cuda_empty_cache(void) {
+#ifdef FLODL_BUILD_CUDA
+    c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
+}
+
 // --- GPU utilization via NVML (dynamically loaded) ---
 
 #ifdef FLODL_BUILD_CUDA

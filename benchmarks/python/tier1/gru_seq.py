@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 
 
-SEQ_LEN = 20
-INPUT_DIM = 64
-HIDDEN_DIM = 128
+SEQ_LEN = 50
+INPUT_DIM = 256
+HIDDEN_DIM = 512
 
 
 class GruSeqModel(nn.Module):
@@ -24,7 +24,7 @@ class GruSeqModel(nn.Module):
         return self.output(h)
 
 
-def run(device, batches_per_epoch=100, batch_size=64, **kwargs):
+def run(device, batches_per_epoch=50, batch_size=128, **kwargs):
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
     from harness import run_benchmark

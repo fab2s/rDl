@@ -343,6 +343,8 @@ unsafe extern "C" {
         device_index: i32, allocated_bytes: *mut u64,
     ) -> *mut i8;
 
+    pub fn flodl_cuda_empty_cache();
+
     pub fn flodl_cuda_utilization(device_index: i32) -> i32;
 
     pub fn flodl_cuda_device_name(

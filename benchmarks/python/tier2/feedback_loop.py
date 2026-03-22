@@ -12,8 +12,8 @@ import torch
 import torch.nn as nn
 
 
-DIM = 128
-MAX_ITER = 8
+DIM = 512
+MAX_ITER = 10
 
 
 class RefineBlock(nn.Module):
@@ -64,7 +64,7 @@ class FeedbackLoop(nn.Module):
         return self.decoder(x)
 
 
-def run(device, batches_per_epoch=100, batch_size=64, **kwargs):
+def run(device, batches_per_epoch=50, batch_size=128, **kwargs):
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
     from harness import run_benchmark

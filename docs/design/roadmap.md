@@ -202,13 +202,77 @@ Deliverables:
 
 ---
 
-## Phase 10: Future
+## Phase 10: PyTorch API Parity
+
+Close the gaps identified in the [parity audit](../../CHANGELOG.md) so that
+common architectures (transformers, modern CNNs, RL agents) can be expressed
+without workarounds.
+
+### Tier 1 — Immediate Impact (blocks common architectures)
+
+**Tensor ops**: `masked_fill`, `masked_select`, `cumsum`, `tril`, `randperm`,
+`multinomial`, `prod`/`prod(dim)`, `logsumexp(dim)`, `F.normalize`
+
+**Activations**: `LeakyReLU`, `ELU`, `Softplus`, `Mish`
+
+**Modules**: `MultiheadAttention` (or `F.scaled_dot_product_attention`),
+`AvgPool2d`, `RMSNorm`, `nn.Softmax`/`nn.LogSoftmax`, `nn.Flatten`
+
+*Key insight — the single biggest gap is the transformer attention path:
+`masked_fill` + scaled dot-product attention unlocks the entire transformer
+family.*
+
+### Tier 2 — Strong PyTorch Parity
+
+**Tensor ops**: `flip`/`roll`, `split`/`unbind`, `clamp_min`/`clamp_max`,
+`log1p`/`expm1`, `log2`/`log10`, `randint`, `F.one_hot`,
+`maximum`/`minimum`, `any`/`all`, `atan2`, `isnan`/`isinf`,
+`logical_and`/`or`/`not`, `contiguous`/`is_contiguous`, `argsort`, `scatter`
+
+**Modules**: `GroupNorm`, `Conv1d`/`ConvTranspose1d`, sequence-level
+`GRU`/`LSTM`, `nn.ModuleList`/`nn.ParameterList`, `RMSprop`,
+`OneCycleLR`/`ExponentialLR`/`MultiStepLR`
+
+**Functional**: `F.interpolate`, `F.pad` (reflect/replicate),
+`F.cosine_similarity`, `F.binary_cross_entropy`, `F.embedding_bag`
+
+**Init**: `uniform_`/`normal_` (standalone), `orthogonal_`, `trunc_normal_`
+
+**In-place ops**: `mul_(tensor)`, `div_(scalar)`/`div_(tensor)`,
+`fill_`/`copy_`
+
+**Creation**: `empty`, `full_like`/`rand_like`/`randn_like`, `bernoulli`
+
+### Tier 3 — Completeness
+
+**Tensor ops**: inverse trig (`tan`/`asin`/`acos`/`atan`), `erf`/`erfc`,
+`fmod`/`remainder`, `lerp`, `addmm`/`addcmul`/`addcdiv`, `trunc`/`frac`,
+`diagonal`/`movedim`/`tile`, `nonzero`/`unique`/`searchsorted`,
+`count_nonzero`/`median`, dim-wise `norm`, multi-dim `sum`, `cumprod`,
+`isclose`
+
+**Modules**: `Conv3d`/`ConvTranspose3d`, 1D pooling, `AdaptiveMaxPool2d`,
+`InstanceNorm`, `nn.Bilinear`, `AlphaDropout`, `PixelShuffle`/`Upsample`,
+padding modules, `Unfold`/`Fold`
+
+**Activations**: `SELU`, `Hardswish`, `Hardsigmoid`, `PReLU`
+
+**Losses**: `NLLLoss`, `CosineEmbeddingLoss`/`TripletMarginLoss`,
+`HingeEmbeddingLoss`/`MarginRankingLoss`, `CTCLoss`, `PoissonNLLLoss`,
+`FocalLoss`
+
+**Optimizers**: `Adagrad`/`LBFGS`/`RAdam`/`NAdam`, `CyclicLR`
+
+**Init**: `constant_`/`zeros_`/`ones_`, `sparse_`
+
+---
+
+## Phase 11: Future
 
 - **Data loading**: Dataset trait, TensorDataset, Loader with batching/shuffle
 - **Multi-threading**: rayon for parallel level execution
 - **Higher-order gradients**: differentiate through backward
 - **Graph serialization**: save/load graph topology
-- **Attention mechanisms**: as graph primitives
 - **ONNX import/export**
 - **Multi-GPU**: data parallelism, model parallelism
 

@@ -1,28 +1,38 @@
-//! MLP benchmark: Linear → GELU → LayerNorm, 3 layers.
+//! MLP benchmark: Linear → GELU → LayerNorm, 5 layers.
 //!
-//! Tests raw matmul + activation throughput — the simplest possible model.
+//! Tests raw matmul + activation throughput with realistic dimensions.
 
 use flodl::*;
 use crate::harness::{BenchConfig, BenchResult, run_benchmark};
 
-pub fn run(device: Device) -> Result<BenchResult> {
+const DIM: i64 = 1024;
+const HIDDEN: i64 = 2048;
+
+pub fn run(device: Device, vram_baseline: u64) -> Result<BenchResult> {
     let config = BenchConfig {
         name: "mlp".into(),
-        batch_size: 128,
-        batches_per_epoch: 100,
+        batch_size: 256,
+        batches_per_epoch: 50,
+        vram_baseline,
         ..Default::default()
     };
 
     let opts = TensorOptions { dtype: DType::Float32, device };
 
-    // Model: 256 → 512 → 512 → 256
-    let model = FlowBuilder::from(Linear::on_device(256, 512, device)?)
+    // Model: 1024 → 2048 → 2048 → 2048 → 2048 → 1024
+    let model = FlowBuilder::from(Linear::on_device(DIM, HIDDEN, device)?)
         .through(GELU)
-        .through(LayerNorm::on_device(512, device)?)
-        .through(Linear::on_device(512, 512, device)?)
+        .through(LayerNorm::on_device(HIDDEN, device)?)
+        .through(Linear::on_device(HIDDEN, HIDDEN, device)?)
         .through(GELU)
-        .through(LayerNorm::on_device(512, device)?)
-        .through(Linear::on_device(512, 256, device)?)
+        .through(LayerNorm::on_device(HIDDEN, device)?)
+        .through(Linear::on_device(HIDDEN, HIDDEN, device)?)
+        .through(GELU)
+        .through(LayerNorm::on_device(HIDDEN, device)?)
+        .through(Linear::on_device(HIDDEN, HIDDEN, device)?)
+        .through(GELU)
+        .through(LayerNorm::on_device(HIDDEN, device)?)
+        .through(Linear::on_device(HIDDEN, DIM, device)?)
         .build()?;
 
     let params = model.parameters();
@@ -33,8 +43,8 @@ pub fn run(device: Device) -> Result<BenchResult> {
     // Pre-generate synthetic data
     let batches: Vec<(Tensor, Tensor)> = (0..config.batches_per_epoch)
         .map(|_| {
-            let x = Tensor::randn(&[config.batch_size as i64, 256], opts).unwrap();
-            let y = Tensor::randn(&[config.batch_size as i64, 256], opts).unwrap();
+            let x = Tensor::randn(&[config.batch_size as i64, DIM], opts).unwrap();
+            let y = Tensor::randn(&[config.batch_size as i64, DIM], opts).unwrap();
             (x, y)
         })
         .collect();

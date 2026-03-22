@@ -31,6 +31,8 @@ pub struct BenchConfig {
     pub measured_epochs: usize,
     pub batches_per_epoch: usize,
     pub batch_size: usize,
+    /// VRAM usage (bytes) before benchmark setup — subtracted from final reading.
+    pub vram_baseline: u64,
 }
 
 impl Default for BenchConfig {
@@ -41,7 +43,19 @@ impl Default for BenchConfig {
             measured_epochs: 20,
             batches_per_epoch: 100,
             batch_size: 128,
+            vram_baseline: 0,
         }
+    }
+}
+
+/// Flush the caching allocator and snapshot allocator-level VRAM (bytes).
+/// Returns 0 on CPU.
+pub fn vram_baseline() -> u64 {
+    if flodl::cuda_available() {
+        flodl::cuda_empty_cache();
+        flodl::cuda_allocated_bytes().unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -67,7 +81,7 @@ pub fn run_benchmark(
 
     // Sync before measurement
     #[cfg(feature = "cuda")]
-    flodl::cuda_synchronize();
+    flodl::cuda_synchronize(0);
 
     // Measured epochs
     let mut epoch_times = Vec::with_capacity(config.measured_epochs);
@@ -78,15 +92,18 @@ pub fn run_benchmark(
         final_loss = run_epoch(i, false)?;
 
         #[cfg(feature = "cuda")]
-        flodl::cuda_synchronize();
+        flodl::cuda_synchronize(0);
 
         epoch_times.push(start.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // VRAM
-    let vram_mb = flodl::cuda_memory_info()
+    // VRAM (allocator-level, delta from baseline)
+    let vram_mb = flodl::cuda_allocated_bytes()
         .ok()
-        .map(|(free, total)| (total - free) as f64 / (1024.0 * 1024.0));
+        .map(|used| {
+            let delta = used.saturating_sub(config.vram_baseline);
+            delta as f64 / (1024.0 * 1024.0)
+        });
 
     // RSS
     let rss_mb = flodl::rss_kb() as f64 / 1024.0;

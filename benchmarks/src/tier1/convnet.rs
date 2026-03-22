@@ -32,35 +32,49 @@ impl Module for ClassifyHead {
     }
 }
 
-pub fn run(device: Device) -> Result<BenchResult> {
+pub fn run(device: Device, vram_baseline: u64) -> Result<BenchResult> {
     let config = BenchConfig {
         name: "convnet".into(),
-        batch_size: 64,
-        batches_per_epoch: 100,
+        batch_size: 128,
+        batches_per_epoch: 50,
+        vram_baseline,
         ..Default::default()
     };
 
     let opts = TensorOptions { dtype: DType::Float32, device };
 
-    // Conv → BN → ReLU → MaxPool, 3 blocks, then global avg pool → classify
+    // Deeper ConvNet on 64x64 images with wider channels
+    // Conv → BN → ReLU → MaxPool, 5 blocks, then global avg pool → classify
     let model = FlowBuilder::from(
-        Conv2d::configure(3, 32, 3).with_padding(1).on_device(device).done()?
+        Conv2d::configure(3, 64, 3).with_padding(1).on_device(device).done()?
     )
-        .through(BatchNorm2d::on_device(32, device)?)
-        .through(ReLU)
-        .through(MaxPool2d::new(2))
-        .through(
-            Conv2d::configure(32, 64, 3).with_padding(1).on_device(device).done()?
-        )
         .through(BatchNorm2d::on_device(64, device)?)
         .through(ReLU)
-        .through(MaxPool2d::new(2))
+        .through(MaxPool2d::new(2))  // 64x64 → 32x32
         .through(
             Conv2d::configure(64, 128, 3).with_padding(1).on_device(device).done()?
         )
         .through(BatchNorm2d::on_device(128, device)?)
         .through(ReLU)
-        .through(ClassifyHead::new(128, 10, device)?)
+        .through(MaxPool2d::new(2))  // 32x32 → 16x16
+        .through(
+            Conv2d::configure(128, 256, 3).with_padding(1).on_device(device).done()?
+        )
+        .through(BatchNorm2d::on_device(256, device)?)
+        .through(ReLU)
+        .through(MaxPool2d::new(2))  // 16x16 → 8x8
+        .through(
+            Conv2d::configure(256, 512, 3).with_padding(1).on_device(device).done()?
+        )
+        .through(BatchNorm2d::on_device(512, device)?)
+        .through(ReLU)
+        .through(MaxPool2d::new(2))  // 8x8 → 4x4
+        .through(
+            Conv2d::configure(512, 512, 3).with_padding(1).on_device(device).done()?
+        )
+        .through(BatchNorm2d::on_device(512, device)?)
+        .through(ReLU)
+        .through(ClassifyHead::new(512, 100, device)?)
         .build()?;
 
     let params = model.parameters();
@@ -68,11 +82,11 @@ pub fn run(device: Device) -> Result<BenchResult> {
     let mut optimizer = Adam::new(&params, 1e-3);
     model.train();
 
-    // Synthetic image data: [B, 3, 32, 32] → class labels [B, 10]
+    // Synthetic image data: [B, 3, 64, 64] → class labels [B, 100]
     let batches: Vec<(Tensor, Tensor)> = (0..config.batches_per_epoch)
         .map(|_| {
-            let x = Tensor::randn(&[config.batch_size as i64, 3, 32, 32], opts).unwrap();
-            let y = Tensor::randn(&[config.batch_size as i64, 10], opts).unwrap();
+            let x = Tensor::randn(&[config.batch_size as i64, 3, 64, 64], opts).unwrap();
+            let y = Tensor::randn(&[config.batch_size as i64, 100], opts).unwrap();
             (x, y)
         })
         .collect();

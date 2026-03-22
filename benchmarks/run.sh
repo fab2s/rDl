@@ -38,7 +38,7 @@ cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" --release $CARGO_FEATURES 2
 echo ""
 
 echo "=== Running flodl (Rust) benchmarks ==="
-"$WORKSPACE/target/release/flodl-bench" --json "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}" > /tmp/flodl_bench.json 2>/dev/stderr
+"$SCRIPT_DIR/target/release/flodl-bench" --json "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}" > /tmp/flodl_bench.json 2>/dev/stderr
 echo ""
 
 echo "=== Running PyTorch (Python) benchmarks ==="

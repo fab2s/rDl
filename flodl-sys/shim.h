@@ -271,6 +271,10 @@ char* flodl_cuda_mem_info(int device_index, uint64_t* used_bytes, uint64_t* tota
 // spill = max(0, allocated - vram_total).
 char* flodl_cuda_alloc_bytes(int device_index, uint64_t* allocated_bytes);
 
+// Release all unused cached memory from the CUDA caching allocator.
+// Equivalent to torch.cuda.empty_cache().
+void flodl_cuda_empty_cache(void);
+
 // Query GPU utilization percentage (0-100) via NVML.
 // Returns -1 if NVML is not available or query fails.
 int flodl_cuda_utilization(int device_index);

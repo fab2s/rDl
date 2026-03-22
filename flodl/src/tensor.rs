@@ -2025,6 +2025,12 @@ pub fn cuda_allocated_bytes() -> Result<u64> {
     cuda_allocated_bytes_idx(0)
 }
 
+/// Release all unused cached memory from the CUDA caching allocator.
+/// Equivalent to `torch.cuda.empty_cache()`.
+pub fn cuda_empty_cache() {
+    unsafe { ffi::flodl_cuda_empty_cache() }
+}
+
 /// Query GPU utilization percentage (0-100) via NVML.
 /// Returns `None` if NVML is not available or the query fails.
 pub fn cuda_utilization() -> Option<u32> {

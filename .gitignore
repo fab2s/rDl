@@ -11,6 +11,7 @@ Cargo.lock
 .idea/
 .*/
 !.github/
+__pycache__/
 
 # Generated guide pages (built from site/_stubs/ + docs/ by site/build_guide.py)
 site/guide/*.md

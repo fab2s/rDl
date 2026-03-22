@@ -1,4 +1,4 @@
-"""Gated routing (MoE) benchmark: soft routing with 4 expert MLPs.
+"""Gated routing (MoE) benchmark: soft routing with 8 expert MLPs.
 
 PyTorch equivalent of flodl's `.gate()` — manual softmax gating
 and expert stacking.
@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-DIM = 128
-NUM_EXPERTS = 4
+DIM = 512
+NUM_EXPERTS = 8
 
 
 class ExpertBlock(nn.Module):
@@ -46,7 +46,7 @@ class GatedRouting(nn.Module):
         return self.output(x)
 
 
-def run(device, batches_per_epoch=100, batch_size=128, **kwargs):
+def run(device, batches_per_epoch=50, batch_size=256, **kwargs):
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
     from harness import run_benchmark

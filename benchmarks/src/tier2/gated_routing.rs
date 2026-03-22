@@ -6,8 +6,8 @@
 use flodl::*;
 use crate::harness::{BenchConfig, BenchResult, run_benchmark};
 
-const DIM: i64 = 128;
-const NUM_EXPERTS: i64 = 4;
+const DIM: i64 = 512;
+const NUM_EXPERTS: i64 = 8;
 
 fn expert_block(device: Device) -> Result<Graph> {
     FlowBuilder::from(Linear::on_device(DIM, DIM, device)?)
@@ -16,11 +16,12 @@ fn expert_block(device: Device) -> Result<Graph> {
         .build()
 }
 
-pub fn run(device: Device) -> Result<BenchResult> {
+pub fn run(device: Device, vram_baseline: u64) -> Result<BenchResult> {
     let config = BenchConfig {
         name: "gated_routing".into(),
-        batch_size: 128,
-        batches_per_epoch: 100,
+        batch_size: 256,
+        batches_per_epoch: 50,
+        vram_baseline,
         ..Default::default()
     };
 
