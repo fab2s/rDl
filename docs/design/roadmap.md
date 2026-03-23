@@ -267,6 +267,13 @@ padding modules, `Unfold`/`Fold`
 
 ---
 
+## Recently Completed (post-v0.1.2)
+
+- **`Rng`**: CPU-side RNG (SmallRng/Xoshiro256++) for data loading and augmentation
+- **`manual_seed` / `cuda_manual_seed_all`**: Full-stack reproducibility seeding
+- **`cuda_active_bytes`**: Active tensor VRAM measurement (complements `cuda_allocated_bytes`)
+- **`MaxPool2d`**: 2D max pooling with full FFI chain
+
 ## Phase 11: Future
 
 - **Data loading**: Dataset trait, TensorDataset, Loader with batching/shuffle

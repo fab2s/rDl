@@ -9,6 +9,8 @@ use flodl::*;
 use flodl::monitor::Monitor;
 
 fn main() -> Result<()> {
+    manual_seed(42);
+
     // Build the model.
     let model = FlowBuilder::from(Linear::new(2, 16)?)
         .through(GELU)

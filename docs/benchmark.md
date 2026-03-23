@@ -10,19 +10,25 @@ same hardware, same hyperparameters. No synthetic micro-benchmarks.
 | Avg epoch | 49.7s | 40.3s | **-19%** |
 | Total | 82m 50s | 67m 10s | **-19%** |
 | GPU utilization | ~80% (spiky) | 88-92% (flat) | more stable |
-| VRAM (device) | 2,805 MB | 2,977 MB | +6%* |
+| VRAM (reserved) | 2,805 MB | 2,977 MB | +6%* |
 | RAM (RSS peak) | 2,088 MB | 2,222 MB | +6%* |
 | Startup | minutes | seconds | - |
 | Live dashboard | no | yes | - |
 
-\* Higher VRAM on the Rust side is a fixed overhead that does not grow with
-model size. Part of it is the CUDA toolkit version difference: flodl links
-libtorch built against CUDA 12.6 (cu126) while the PyTorch run used CUDA 12.4
-(cu124) — newer CUDA toolkits allocate larger context structures. The
-remainder comes from libtorch's caching allocator rounding and the monitor
-thread. The GPU computation itself dispatches identical CUDA kernels. On a
-larger GPU (24 GB+) this fixed overhead drops below 1% of total VRAM.
-Reproducing on matching CUDA versions would narrow the gap further.
+\* VRAM is measured as allocator reservation (`torch.cuda.memory_reserved` /
+`cuda_allocated_bytes`), which includes cached free blocks. Higher VRAM on
+the Rust side is a fixed overhead that does not grow with model size. Part of
+it is the CUDA toolkit version difference: flodl links libtorch built against
+CUDA 12.6 (cu126) while the PyTorch run used CUDA 12.4 (cu124) — newer CUDA
+toolkits allocate larger context structures. The remainder comes from
+libtorch's caching allocator rounding and the monitor thread. The GPU
+computation itself dispatches identical CUDA kernels. On a larger GPU (24 GB+)
+this fixed overhead drops below 1% of total VRAM. Reproducing on matching
+CUDA versions would narrow the gap further.
+
+For active tensor usage (the `torch.cuda.memory_allocated` /
+`cuda_active_bytes` metric), see the benchmark suite results which report
+both metrics side-by-side.
 
 ## What was measured
 

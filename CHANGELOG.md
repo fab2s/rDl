@@ -9,11 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **`MaxPool2d`** module: 2D max pooling layer with kernel size, stride, padding, dilation, and ceil mode. Full FFI chain (`shim.cpp` → `flodl-sys` → `Tensor::max_pool2d` → `autograd::max_pool2d` → `nn::MaxPool2d`). Matches PyTorch's `nn.MaxPool2d`.
+- **`Rng`** struct: CPU-side random number generator wrapping SmallRng (Xoshiro256++). Methods: `seed`, `from_entropy`, `usize`, `f32`, `f64`, `shuffle`, `bernoulli`, `range`, `normal`. For data loading, shuffling, and augmentation — not for tensor ops (use `manual_seed` for those).
+- **`manual_seed(u64)`**: Seed all libtorch RNGs (CPU + CUDA) for reproducible tensor operations (`rand`, `randn`, dropout masks, etc.). Equivalent to `torch.manual_seed()`.
+- **`cuda_manual_seed_all(u64)`**: Seed all CUDA device RNGs independently. No-op without CUDA. Equivalent to `torch.cuda.manual_seed_all()`.
+- **`cuda_active_bytes()` / `cuda_active_bytes_idx()`**: Query bytes actively used by live tensors (matches `torch.cuda.memory_allocated()` semantics). Complements `cuda_allocated_bytes()` which reports total allocator reservation.
 
 ### Fixed
 - **VRAM monitoring**: `cuda_allocated_bytes()` now returns `reserved_bytes` instead of `allocated_bytes` from the CUDA caching allocator. `allocated_bytes` only counts active sub-blocks and never exceeds physical VRAM, masking unified-memory spill. `reserved_bytes` includes host-spilled pages, making spill detection actually work.
 - Removed unused `ResourceSample::vram_used_bytes` field (dead since dashboard switched to allocator stats).
 - Dashboard now uses `vram_alloc` as the sole VRAM metric with a physical-limit reference line.
+
+### Improved
+- **Benchmark suite**: Both Rust and Python benchmarks now report allocated (active tensors) and reserved (allocator pool) VRAM separately. Python harness resets peak stats between benchmarks with `empty_cache()` + `reset_peak_memory_stats()` for honest per-benchmark measurement.
+- **Docker**: Added `.dockerignore` (excludes everything — source is bind-mounted). Libtorch downloads cached via BuildKit `--mount=type=cache`. Image targets skip rebuild when image exists.
 
 ## [0.1.2] - 2026-03-19
 

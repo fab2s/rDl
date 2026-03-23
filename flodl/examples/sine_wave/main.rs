@@ -10,6 +10,8 @@ use flodl::*;
 use flodl::monitor::Monitor;
 
 fn main() -> Result<()> {
+    manual_seed(42);
+
     // --- Data: sin(x) on [-2pi, 2pi] ---
     let opts = TensorOptions::default();
     let n_samples = 200i64;

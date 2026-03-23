@@ -299,11 +299,19 @@ clip_grad_norm(&params, 0.5)?;
 The CUDA allocator ran out of GPU memory. Common when batch sizes are too large
 or inference runs without disabling gradients.
 
-**Diagnose first** — check how much VRAM you actually have:
+**Diagnose first** — check how much VRAM you actually have and how it's used:
 ```rust
-if let Some((used, total)) = cuda_memory_info() {
-    println!("VRAM: {:.0}/{:.0} MB", used as f64 / 1e6, total as f64 / 1e6);
+if let Ok((used, total)) = cuda_memory_info() {
+    let active = cuda_active_bytes().unwrap_or(0);
+    let reserved = cuda_allocated_bytes().unwrap_or(0);
+    println!("VRAM: {:.0}/{:.0} MB (active: {:.0} MB, reserved: {:.0} MB)",
+        used as f64 / 1e6, total as f64 / 1e6,
+        active as f64 / 1e6, reserved as f64 / 1e6);
 }
+```
+
+If `reserved` is much larger than `active`, the allocator is holding freed
+blocks. Call `cuda_empty_cache()` to release them before checking again.
 ```
 
 **Fix:**

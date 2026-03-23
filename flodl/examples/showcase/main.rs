@@ -692,6 +692,7 @@ fn count_grads(params: &[flodl::Parameter]) -> usize {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    flodl::manual_seed(42);
     println!("=== floDl showcase ===\n");
 
     // -- Build --

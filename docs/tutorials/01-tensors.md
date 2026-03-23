@@ -17,7 +17,7 @@ let opts = TensorOptions::default();  // Float32, CPU
 let zeros = Tensor::zeros(&[3, 4], opts)?;
 let ones = Tensor::ones(&[3, 4], opts)?;
 
-// Random tensors
+// Random tensors (seed with manual_seed() for reproducibility)
 let uniform = Tensor::rand(&[2, 3], opts)?;   // values in [0, 1)
 let normal = Tensor::randn(&[2, 3], opts)?;   // standard normal
 
@@ -183,6 +183,29 @@ if flodl::cuda_available() {
     println!("CUDA devices: {}", flodl::cuda_device_count());
 }
 ```
+
+## Reproducibility
+
+Seed libtorch's RNG before creating random tensors or models:
+
+```rust
+flodl::manual_seed(42);  // seeds CPU + CUDA RNGs
+```
+
+After seeding, `Tensor::rand`, `Tensor::randn`, dropout masks, and weight
+initialization all produce deterministic results.
+
+For CPU-side randomness (shuffling datasets, augmentation), use the `Rng`
+struct:
+
+```rust
+use flodl::Rng;
+
+let mut rng = Rng::seed(42);
+rng.shuffle(&mut data);
+```
+
+See [Tutorial 4: Training](04-training.md) for full reproducibility setup.
 
 ## cuDNN Benchmark Mode
 

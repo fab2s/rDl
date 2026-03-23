@@ -340,12 +340,47 @@ model.end_step();   // increment step counter
 model.end_epoch();  // increment epoch counter, reset step
 ```
 
+## Reproducibility
+
+For deterministic training, seed both libtorch and CPU-side RNG at the start:
+
+```rust
+use flodl::*;
+
+fn main() -> Result<()> {
+    // Seed libtorch: controls rand, randn, dropout, weight init
+    manual_seed(42);
+
+    // CPU-side RNG: controls data shuffling, augmentation
+    let mut rng = Rng::seed(42);
+
+    // Build model AFTER seeding — weight initialization uses the seed
+    let model = FlowBuilder::from(Linear::new(2, 16)?)
+        .through(GELU)
+        .through(Linear::new(16, 2)?)
+        .build()?;
+
+    // Shuffle training data deterministically
+    let mut indices: Vec<usize> = (0..dataset_len).collect();
+    rng.shuffle(&mut indices);
+
+    // ...
+    Ok(())
+}
+```
+
+`manual_seed` covers all libtorch operations (tensor creation, dropout masks,
+weight initialization). `Rng` covers everything else (data loading order,
+augmentation parameters). Together they give full reproducibility.
+
 ## Complete Example
 
 ```rust
 use flodl::*;
 
 fn main() -> Result<()> {
+    manual_seed(42);
+
     // Build model.
     let model = FlowBuilder::from(Linear::new(2, 16)?)
         .through(GELU)

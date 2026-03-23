@@ -54,6 +54,33 @@ use flodl::graph::{FlowBuilder, Graph, MergeOp};
 let y = x.matmul(&w)?.add(&b)?.relu()?;
 ```
 
+## Reproducibility
+
+```python
+# PyTorch
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+```
+
+```rust
+// flodl
+flodl::manual_seed(42);
+flodl::cuda_manual_seed_all(42);  // no-op without CUDA feature
+```
+
+`manual_seed` controls all libtorch random operations: `Tensor::rand`, `Tensor::randn`, dropout masks, weight initialization. Call it before model creation for full reproducibility.
+
+For CPU-side randomness (data shuffling, augmentation), use `Rng`:
+
+```rust
+use flodl::Rng;
+
+let mut rng = Rng::seed(42);       // deterministic
+rng.shuffle(&mut indices);          // Fisher-Yates shuffle
+let val = rng.f32();               // uniform [0, 1)
+let coin = rng.bernoulli(0.5);    // true ~50%
+```
+
 ## Tensor Creation
 
 ```python

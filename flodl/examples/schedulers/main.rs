@@ -9,6 +9,7 @@
 use flodl::*;
 
 fn main() -> Result<()> {
+    manual_seed(42);
     let opts = TensorOptions::default();
 
     // Build a small model.

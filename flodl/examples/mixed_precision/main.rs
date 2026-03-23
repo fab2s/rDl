@@ -10,6 +10,7 @@ use flodl::*;
 use flodl::monitor::Monitor;
 
 fn main() -> Result<()> {
+    manual_seed(42);
     let opts = TensorOptions::default();
 
     // Random regression data.

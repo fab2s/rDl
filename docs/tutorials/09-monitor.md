@@ -167,6 +167,22 @@ The monitor samples system resources on every `log` call:
 Resources that aren't available are silently omitted from both the terminal
 output and the dashboard.
 
+### VRAM metrics
+
+flodl exposes two levels of CUDA memory measurement:
+
+| Function | What it measures | PyTorch equivalent |
+|----------|-----------------|-------------------|
+| `cuda_active_bytes()` | Bytes backing live tensors | `torch.cuda.memory_allocated()` |
+| `cuda_allocated_bytes()` | Total allocator reservation (includes cached free blocks) | `torch.cuda.memory_reserved()` |
+
+The monitor tracks `cuda_allocated_bytes` (reserved) because it detects
+unified-memory spill — when reserved bytes exceed physical VRAM, the
+allocator has spilled to host RAM.
+
+For debugging, compare both: if `active` is small but `reserved` is large,
+the allocator is holding freed blocks. Call `cuda_empty_cache()` to release them.
+
 ### Accessing resource data
 
 ```rust

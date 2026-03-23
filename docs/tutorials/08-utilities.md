@@ -197,6 +197,60 @@ let w = xavier_normal(&[64, 128], 128, 64, Device::CPU)?;
 layer.parameters()[0].set_data(&w);
 ```
 
+## Reproducibility
+
+### Seeding libtorch
+
+`manual_seed` sets the global seed for all libtorch random operations:
+
+```rust
+flodl::manual_seed(42);
+```
+
+This controls `Tensor::rand`, `Tensor::randn`, dropout masks, and weight
+initialization (kaiming, xavier). Call it before model creation.
+
+On CUDA builds, `manual_seed` seeds both CPU and GPU. To re-seed CUDA
+independently:
+
+```rust
+flodl::cuda_manual_seed_all(42);
+```
+
+### CPU-side RNG
+
+For data loading, shuffling, and augmentation, use `Rng` — a lightweight
+wrapper around SmallRng (Xoshiro256++):
+
+```rust
+use flodl::Rng;
+
+let mut rng = Rng::seed(42);       // deterministic from seed
+let mut rng = Rng::from_entropy(); // system-seeded
+
+rng.usize(100)          // uniform [0, 100)
+rng.f32()               // uniform [0, 1)
+rng.f64()               // uniform [0, 1)
+rng.shuffle(&mut data)  // Fisher-Yates
+rng.bernoulli(0.5)      // true with probability p
+rng.range(-5, 5)        // integer [low, high)
+rng.normal(0.0, 1.0)    // Gaussian sample
+```
+
+`Rng` is `Clone` — clone it to fork independent streams from the same state.
+
+### Full reproducibility setup
+
+```rust
+fn main() -> Result<()> {
+    flodl::manual_seed(42);
+    let mut rng = Rng::seed(42);
+
+    let model = build_model()?;  // weight init uses the seed
+    // ...
+}
+```
+
 ## LR Scheduling
 
 Schedulers are pure LR calculators, decoupled from the optimizer:
