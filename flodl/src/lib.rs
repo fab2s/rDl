@@ -74,5 +74,6 @@ pub use graph::{
     SoftmaxRouter, SigmoidRouter, FixedSelector, ArgmaxSelector,
     ThresholdHalt, LearnedHalt,
     Reshape, StateAdd, Reduce, ModelSnapshot,
+    PathKind,
 };
 pub use worker::CpuWorker;

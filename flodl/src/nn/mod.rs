@@ -71,6 +71,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::autograd::Variable;
+use crate::graph::Graph;
 use crate::tensor::Result;
 
 /// The core module trait: forward pass + parameter access.
@@ -167,6 +168,10 @@ pub trait Module {
     /// Override in types that implement `NamedInputModule` to enable
     /// receiving additional named inputs via graph `using()`.
     fn as_named_input(&self) -> Option<&dyn NamedInputModule> { None }
+
+    /// Upcast to [`Graph`] for hierarchical tree composition.
+    /// Override in Graph to enable subgraph nesting with label-path addressing.
+    fn as_graph(&self) -> Option<&Graph> { None }
 
     /// SHA-256 hex hash of module architecture for checkpoint validation.
     /// Override in composite modules (Graph) that compute a deterministic
