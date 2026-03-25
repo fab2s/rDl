@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-03-25
+
+### Fixed
+- Disable example scraping on docs.rs — examples require libtorch which the docs.rs sandbox doesn't have. The scraping failure corrupted dependency artifacts, breaking the doc build.
+
 ## [0.1.3] - 2026-03-25
 
 ### Added

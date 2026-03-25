@@ -22,7 +22,7 @@ default = []
 cuda = ["flodl-sys/cuda"]
 
 [dependencies]
-flodl-sys = { version = "0.1.3", path = "../flodl-sys" }
+flodl-sys = { version = "0.1.4", path = "../flodl-sys" }
 indexmap = "2"
 flate2 = "1"
 hmac-sha256 = "1"
@@ -33,5 +33,41 @@ rand = { version = "0.9", features = ["small_rng"] }
 # docs.rs has no libtorch — build with this cfg so the -sys build.rs can skip compilation.
 rustc-args = ["--cfg", "docsrs"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+# Examples need libtorch — disable scraping on docs.rs to prevent build failures.
+[[example]]
+name = "quickstart"
+path = "examples/quickstart/main.rs"
+doc-scrape-examples = false
+
+[[example]]
+name = "sine_wave"
+path = "examples/sine_wave/main.rs"
+doc-scrape-examples = false
+
+[[example]]
+name = "mixed_precision"
+path = "examples/mixed_precision/main.rs"
+doc-scrape-examples = false
+
+[[example]]
+name = "transfer_learning"
+path = "examples/transfer_learning/main.rs"
+doc-scrape-examples = false
+
+[[example]]
+name = "schedulers"
+path = "examples/schedulers/main.rs"
+doc-scrape-examples = false
+
+[[example]]
+name = "observation"
+path = "examples/observation/main.rs"
+doc-scrape-examples = false
+
+[[example]]
+name = "showcase"
+path = "examples/showcase/main.rs"
+doc-scrape-examples = false
 
 [dev-dependencies]
