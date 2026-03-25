@@ -26,7 +26,7 @@ pub fn mse_loss(pred: &Variable, target: &Variable) -> Result<Variable> {
 /// let loss = cross_entropy_loss(&logits, &labels)?;
 ///
 /// // With one-hot targets (same as before):
-/// let onehot = Variable::new(Tensor::from_f32(&[1.,0.,0., 0.,0.,1., 0.,1.,0.], &[3, 3])?, false);
+/// let onehot = Variable::new(Tensor::from_f32(&[1.,0.,0., 0.,0.,1., 0.,1.,0.], &[3, 3], Device::CPU)?, false);
 /// let loss = cross_entropy_loss(&logits, &onehot)?;
 /// ```
 pub fn cross_entropy_loss(pred: &Variable, target: &Variable) -> Result<Variable> {

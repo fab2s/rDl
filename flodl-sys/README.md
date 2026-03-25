@@ -6,7 +6,7 @@ Raw FFI bindings to [libtorch](https://pytorch.org/cppdocs/) via a thin C++ shim
 
 ## Build requirements
 
-The `build.rs` script expects libtorch to be available. Set `LIBTORCH` to the path of your libtorch installation, or use the Docker-based build provided by the main repository.
+The `build.rs` script expects libtorch to be available. Set `LIBTORCH_PATH` to the path of your libtorch installation, or use the Docker-based build provided by the main repository.
 
 ## License
 

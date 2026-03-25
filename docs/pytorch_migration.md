@@ -505,7 +505,7 @@ model.train()              # propagates to children
 ```
 
 ```rust
-// flodl — declare children via sub_modules()
+// flodl — declare children via parameters()
 struct MLP {
     fc1: Linear,
     fc2: Linear,
@@ -522,10 +522,6 @@ impl Module for MLP {
     }
 
     fn name(&self) -> &str { "MLP" }
-
-    fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
-        vec![Rc::new(self.fc1.clone()), Rc::new(self.fc2.clone())]
-    }
 }
 ```
 

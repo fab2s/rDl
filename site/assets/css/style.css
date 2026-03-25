@@ -910,7 +910,7 @@ a:hover { color: var(--cyan); }
 
 .bench-note {
   font-size: 13px;
-  color: var(--muted);
+  color: var(--dim);
   margin-top: 1rem;
   line-height: 1.5;
 }

@@ -15,7 +15,7 @@ use crate::tensor::{Device, Result, Tensor};
 /// FlowBuilder::from(embed)
 ///     .tag("ctx")
 ///     .through(layer)
-///     .gate(SoftmaxRouter::new(hidden, 3)?, vec![a, b, c])
+///     .gate(SoftmaxRouter::new(hidden, 3)?, modules![a, b, c])
 ///     .build()
 /// ```
 pub struct SoftmaxRouter {

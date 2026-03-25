@@ -10,7 +10,7 @@ use super::Module;
 /// Uses a single fused `torch::dropout` kernel (1 autograd node).
 /// During training: randomly zeros elements with probability `p`,
 /// scales remaining by `1/(1-p)`.
-/// During eval: identity function.
+/// During eval (`model.eval()`): identity function.
 pub struct Dropout {
     p: f64,
     training: Cell<bool>,

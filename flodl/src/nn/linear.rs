@@ -40,7 +40,7 @@ impl Linear {
         })
     }
 
-    /// Create a linear layer without bias.
+    /// Create a linear layer without bias on CPU. Use `on_device()` for CUDA.
     pub fn no_bias(in_features: i64, out_features: i64) -> Result<Self> {
         let w = init::kaiming_uniform(&[out_features, in_features], in_features, 5.0_f64.sqrt(), Device::CPU)?;
         Ok(Linear {

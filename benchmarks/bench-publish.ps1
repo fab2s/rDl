@@ -82,11 +82,10 @@ try {
     # --- Run benchmarks in WSL2 ---
     # CLOCK= (empty) skips the lock attempt inside WSL since we handle it here.
     Write-Host ('=== Starting bench-publish in WSL2, {0} rounds ===' -f $Rounds) -ForegroundColor Cyan
-    $outputArg = ''
+    $wslCmd = 'cd /home/peta/src/fab2s/ai/rdl; make bench-publish ROUNDS={0} CLOCK={1}' -f $Rounds, $Clock
     if ($Output -ne '') {
-        $outputArg = ' OUTPUT={0}' -f $Output
+        $wslCmd += ' OUTPUT={0}' -f $Output
     }
-    $wslCmd = 'cd /home/peta/src/fab2s/ai/rdl; make bench-publish ROUNDS={0} CLOCK={1}' -f $Rounds, $outputArg
     wsl -e bash -c $wslCmd
 }
 finally {

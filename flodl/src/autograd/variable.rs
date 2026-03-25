@@ -108,7 +108,7 @@ impl Variable {
         self.inner.borrow().data.shape()
     }
 
-    /// Data type of the underlying tensor (e.g. `Float`, `Half`).
+    /// Data type of the underlying tensor (e.g. `Float32`, `Float16`).
     pub fn dtype(&self) -> DType {
         self.inner.borrow().data.dtype()
     }

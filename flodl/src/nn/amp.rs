@@ -103,7 +103,7 @@ pub fn cast_parameters(params: &[Parameter], dtype: DType) {
 /// let mut scaler = GradScaler::new();
 /// let scaled_loss = scaler.scale(&loss)?;
 /// scaled_loss.backward()?;
-/// scaler.step(&params, &mut || optim.step())?;
+/// let stepped = scaler.step(&params, &mut || optim.step())?;
 /// scaler.update();
 /// ```
 pub struct GradScaler {

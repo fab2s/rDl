@@ -1,7 +1,11 @@
 /// Learning rate scheduler interface.
+///
 /// Schedulers are pure strategy objects — they compute the LR for a given step
 /// without holding a reference to the optimizer. The user bridges them:
-///     `optimizer.set_lr(sched.lr(step))`
+///
+/// ```ignore
+/// optimizer.set_lr(sched.lr(step));
+/// ```
 pub trait Scheduler {
     /// Learning rate at the given step (0-based).
     fn lr(&self, step: usize) -> f64;

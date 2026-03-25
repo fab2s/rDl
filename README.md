@@ -231,20 +231,30 @@ cd my-project && make run
 
 ### Without Docker
 
-**Requirements:** Rust 1.85+ and [libtorch](https://pytorch.org/get-started/locally/)
-(C++/libtorch variant).
+**Requirements:** [Rust](https://rustup.rs/) 1.85+ and libtorch.
+
+The fastest way to get libtorch:
+
+```bash
+# Auto-detects CPU or CUDA
+curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/download-libtorch.sh | sh
+
+# Or force a specific variant
+sh download-libtorch.sh --cpu
+sh download-libtorch.sh --cuda 12.8
+sh download-libtorch.sh --cuda 12.6
+```
+
+The script downloads libtorch to `~/.local/lib/libtorch` and prints the
+environment variables to add to your shell profile. Then:
 
 ```bash
 cargo add flodl
+cargo build
 ```
 
-Set `LIBTORCH_PATH` to your libtorch directory and `LD_LIBRARY_PATH` to
-include `$LIBTORCH_PATH/lib`. For CUDA, also set `CUDA_HOME` and enable
-the feature: `cargo add flodl --features cuda`.
-
-See [libtorch downloads](https://pytorch.org/get-started/locally/) (pick the
-C++/libtorch variant) and [CUDA toolkit](https://developer.nvidia.com/cuda-downloads)
-if you need GPU support.
+For CUDA, also install the [CUDA toolkit](https://developer.nvidia.com/cuda-downloads)
+and enable the feature: `cargo add flodl --features cuda`.
 
 **Develop floDl itself:**
 ```bash
@@ -408,10 +418,10 @@ g.export_trends("metrics.csv", &["loss"])?;
 ### Numerical Verification
 
 Every differentiable path is verified against finite-difference gradients:
-- 37 autograd op-level checks (every op + compositions)
+- 62 autograd op-level checks (every op + compositions)
 - Module-level checks (every NN module, input + parameter gradients)
 - Exact optimizer step verifications (SGD, Adam, AdamW)
-- 329 library tests, zero clippy warnings — all tests run on both CPU and CUDA
+- 389 library tests, zero clippy warnings — all tests run on both CPU and CUDA
 
 ## Why Rust for Deep Learning?
 
@@ -458,20 +468,25 @@ from what happens *between* kernel launches: dispatch overhead, autograd
 bookkeeping, and memory management. Rust eliminates Python's per-op overhead
 and the GC pauses that plague Go.
 
-Measured on a real training workload (FBRL letter recognition — recurrent
-attention with a 9-component loss stack), same model, same data, same GPU:
+Seven models, ten interleaved rounds, locked GPU clocks, same architectures
+on both sides (RTX 5060 Ti, v0.1.3 vs PyTorch 2.6.0):
 
-| Metric | PyTorch 2.5.1 | flodl 0.1.1 | Delta |
-|--------|--------------|-------|-------|
-| Avg epoch | 49.7s | 40.3s | **-19%** |
-| GPU utilization | ~80% (spiky) | 88-92% (flat) | more stable |
-| VRAM | 2,805 MB | 2,977 MB | +6%* |
+| Model | PyTorch | flodl | Delta | Py σ | Rs σ |
+|---|---:|---:|---:|---:|---:|
+| mlp | 271.0 ms | 188.5 ms | **-30%** | ±10.1 | ±2.9 |
+| convnet | 1189.4 ms | 1190.5 ms | +0% | ±2.7 | ±1.0 |
+| gru_seq | 1015.3 ms | 949.7 ms | **-6%** | ±222.4 | ±10.8 |
+| residual_tower | 371.3 ms | 278.6 ms | **-25%** | ±25.9 | ±3.6 |
+| gated_routing | 222.6 ms | 196.9 ms | **-12%** | ±13.8 | ±2.6 |
+| iterative_refine | 208.7 ms | 186.7 ms | **-11%** | ±27.2 | ±5.6 |
+| feedback_fixed | 250.2 ms | 207.2 ms | **-17%** | ±27.3 | ±8.7 |
 
-\* Fixed overhead (CUDA 12.6 vs 12.4 context size + allocator rounding) — does not grow with model size.
+flodl wins 6 of 7 on speed, with 3-20x tighter variance across every model.
+The convnet tie at +0% proves both frameworks dispatch identical CUDA kernels.
 
 Full methodology, raw data, and reproduction commands:
 **[Benchmark Report](https://github.com/fab2s/floDl/blob/main/docs/benchmark.md)** |
-[Raw artifacts](https://github.com/fab2s/fbrl/tree/5c58d71) (both sides, committed)
+[Interactive benchmark](https://flodl.dev/benchmark)
 
 ### Build profiles
 
@@ -504,9 +519,9 @@ bookkeeping, and module overhead.
 
 ## Hardware Compatibility
 
-floDl is developed and tested on an NVIDIA GTX 1060 (6 GB VRAM, Pascal
-architecture). It works out of the box — no version pinning, no feature
-flags, no workarounds.
+floDl is developed and tested on NVIDIA GPUs from Pascal (GTX 1060 6GB) to
+Blackwell (RTX 5060 Ti 16GB). It works out of the box — no version pinning,
+no feature flags, no workarounds.
 
 This matters because PyTorch dropped Pascal support after version 2.5.1.
 Training on older GPUs now requires pinning `torch==2.5.1` and hoping

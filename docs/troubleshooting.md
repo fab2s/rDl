@@ -17,9 +17,14 @@ make build    # CPU
 make cuda-build  # CUDA
 ```
 
-**Fix (host — advanced):** Set the environment variable:
+**Fix (host):** Use the download script to install libtorch and set up paths:
 ```bash
-export LIBTORCH_PATH=/usr/local/libtorch
+curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/download-libtorch.sh | sh
+```
+This downloads libtorch to `~/.local/lib/libtorch` and prints the exports to
+add to your shell profile. Or set the variables manually:
+```bash
+export LIBTORCH_PATH=/path/to/libtorch
 export LD_LIBRARY_PATH=$LIBTORCH_PATH/lib
 export LIBRARY_PATH=$LIBTORCH_PATH/lib
 ```
@@ -312,7 +317,6 @@ if let Ok((used, total)) = cuda_memory_info() {
 
 If `reserved` is much larger than `active`, the allocator is holding freed
 blocks. Call `cuda_empty_cache()` to release them before checking again.
-```
 
 **Fix:**
 - **Reduce batch size** — the single biggest lever for VRAM usage

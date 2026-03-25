@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-03-25
+
 ### Added
 
 #### GPU Performance
@@ -40,9 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Removed unused `ResourceSample::vram_used_bytes` field.
 - Dashboard uses `vram_alloc` as the sole VRAM metric.
 
-### Improved
-- **Benchmark suite**: Interleaved multi-round execution (`--rounds N`), GPU clock locking (`--lock-clocks FREQ`), configurable warmup (`--warmup-secs`). Peak VRAM tracking (not snapshots). Median interpolation for even-length arrays. `requires_grad=false` on benchmark inputs (matching Python). cuDNN benchmark disabled for GRU (eliminates autotuning variance). `make bench-publish` for publication-grade runs.
-- **Docker**: `.dockerignore`, BuildKit cache for libtorch downloads, skip-if-exists image targets.
+### Changed
+- **Benchmark suite**: Publication-grade methodology with interleaved multi-round execution (`--rounds N`), GPU clock locking (`--lock-clocks FREQ`), configurable warmup (`--warmup-secs`). 7 benchmarks (3 standard + 4 graph-builder). Peak VRAM tracking (not snapshots). WSL2 host-side clock management via `bench-publish.ps1`. `make bench-publish` for reproducible runs.
+- **Docker**: `.dockerignore`, BuildKit cache for libtorch downloads, skip-if-exists image targets, dedicated bench image.
 
 ## [0.1.2] - 2026-03-19
 
@@ -53,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - README links now use absolute GitHub URLs — fixes broken links on crates.io where relative paths don't resolve.
+
+## [0.1.1] - 2026-03-18
+
+### Fixed
+- Replace `sha2` with `hmac-sha256` — fixes docs.rs build (sha2's asm feature doesn't compile on docs.rs).
+- Widen leak test tolerance for CI parallel test jitter.
 
 ## [0.1.0] - 2026-03-18
 
@@ -107,7 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Build**: Makefile with cpu/cuda targets (build, test, clippy, shell).
 
 ### Testing
-- 368 library tests + showcase tests.
+- 389 library tests + showcase tests.
 - Zero clippy warnings.
 - Autograd numerical gradient checks.
 - Module-level gradient checks.

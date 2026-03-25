@@ -38,7 +38,7 @@ CPU_MODE=0
 ROUNDS=1
 LOCK_CLOCKS=""
 WARMUP_SECS=10
-OUTPUT_FILE="benchmarks/report.txt"
+OUTPUT_FILE="$WORKSPACE/benchmarks/report.txt"
 PASS_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -49,18 +49,32 @@ while [ $# -gt 0 ]; do
             ;;
         --rounds)
             ROUNDS="${2:?--rounds requires a number}"
+            if ! [[ "$ROUNDS" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: --rounds expects a numeric value, got '$ROUNDS'" >&2
+                exit 1
+            fi
             shift 2
             ;;
         --lock-clocks)
             LOCK_CLOCKS="${2:?--lock-clocks requires a frequency in MHz}"
+            if ! [[ "$LOCK_CLOCKS" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: --lock-clocks expects a numeric MHz value, got '$LOCK_CLOCKS'" >&2
+                exit 1
+            fi
             shift 2
             ;;
         --warmup-secs)
             WARMUP_SECS="${2:?--warmup-secs requires a number}"
+            if ! [[ "$WARMUP_SECS" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: --warmup-secs expects a numeric value, got '$WARMUP_SECS'" >&2
+                exit 1
+            fi
             shift 2
             ;;
         --output)
             OUTPUT_FILE="${2:?--output requires a file path}"
+            # resolve relative paths against workspace root
+            [[ "$OUTPUT_FILE" != /* ]] && OUTPUT_FILE="$WORKSPACE/$OUTPUT_FILE"
             shift 2
             ;;
         --)
@@ -122,7 +136,11 @@ if [ -z "$LOCK_CLOCKS" ] && [ "$CPU_MODE" -eq 0 ] && [ "$IS_WSL" -eq 0 ] \
 fi
 
 # --- Clock locking ---
+# WSL2 shares the host GPU driver. Clock control must happen on the
+# Windows side (bench-publish.ps1 handles this). Never call nvidia-smi
+# -lgc/-rgc from WSL — the shim may reset the host-side lock.
 CLOCKS_LOCKED=0
+CLOCKS_EXTERNAL=0
 cleanup_clocks() {
     if [ "$CLOCKS_LOCKED" -eq 1 ]; then
         echo ""
@@ -134,16 +152,16 @@ cleanup_clocks() {
 trap cleanup_clocks EXIT
 
 if [ -n "$LOCK_CLOCKS" ] && [ "$CPU_MODE" -eq 0 ]; then
-    echo "=== Locking GPU clocks to ${LOCK_CLOCKS} MHz ==="
-    if nvidia-smi -lgc "$LOCK_CLOCKS","$LOCK_CLOCKS" 2>&1; then
-        CLOCKS_LOCKED=1
+    if [ "$IS_WSL" -eq 1 ]; then
+        echo "=== GPU clocks managed by host (${LOCK_CLOCKS} MHz) ==="
+        CLOCKS_EXTERNAL=1
     else
-        if [ "$IS_WSL" -eq 1 ]; then
-            echo "NOTE: WSL2 cannot lock GPU clocks. Use bench-publish.ps1 from Windows."
+        echo "=== Locking GPU clocks to ${LOCK_CLOCKS} MHz ==="
+        if nvidia-smi -lgc "$LOCK_CLOCKS","$LOCK_CLOCKS" 2>&1; then
+            CLOCKS_LOCKED=1
         else
             echo "WARNING: Could not lock GPU clocks. Results may show higher variance."
         fi
-        echo ""
     fi
     echo ""
 fi
@@ -253,7 +271,11 @@ if [ -n "$OUTPUT_FILE" ]; then
         CUDA_VERSION=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | xargs)
         CUDA_RT=$(python3 -c "import torch; print(torch.version.cuda)" 2>/dev/null || echo "unknown")
         GPU_INFO="GPU:      $GPU_NAME | Driver $DRIVER_VERSION | CUDA $CUDA_RT"
-        [ -n "$LOCK_CLOCKS" ] && GPU_INFO="$GPU_INFO | Clocks locked at ${LOCK_CLOCKS} MHz"
+        if [ "$CLOCKS_LOCKED" -eq 1 ]; then
+            GPU_INFO="$GPU_INFO | Clocks locked at ${LOCK_CLOCKS} MHz"
+        elif [ "$CLOCKS_EXTERNAL" -eq 1 ]; then
+            GPU_INFO="$GPU_INFO | Clocks locked at ${LOCK_CLOCKS} MHz (host)"
+        fi
     else
         GPU_INFO="GPU:      CPU-only"
     fi
