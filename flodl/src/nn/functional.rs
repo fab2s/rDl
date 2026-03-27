@@ -1,5 +1,35 @@
 use crate::autograd::{Variable, NoGradGuard};
 use crate::tensor::{Result, Tensor};
+use super::Module;
+
+/// Gaussian blur as a [`Module`] for use in [`FlowBuilder`](crate::graph::FlowBuilder) graphs.
+///
+/// Wraps [`gaussian_blur_2d`] with a fixed sigma. Stateless (no parameters or buffers).
+///
+/// ```ignore
+/// FlowBuilder::from(GaussianBlur::new(1.5))
+///     .tag("blurred")
+///     .through(next_layer)
+///     .build()
+/// ```
+pub struct GaussianBlur {
+    sigma: f64,
+}
+
+impl GaussianBlur {
+    /// Create a Gaussian blur module with the given sigma.
+    pub fn new(sigma: f64) -> Self {
+        Self { sigma }
+    }
+}
+
+impl Module for GaussianBlur {
+    fn name(&self) -> &str { "gaussian_blur" }
+
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        gaussian_blur_2d(input, self.sigma)
+    }
+}
 
 /// Apply Gaussian blur to a 4-D input `[B, C, H, W]`.
 ///
@@ -149,5 +179,17 @@ mod tests {
             "RSS grew by {growth_mb:.1}MB over 500 iters — likely a leak \
              (before={rss_before}KB, after={rss_after}KB)"
         );
+    }
+
+    #[test]
+    fn test_gaussian_blur_module() {
+        let opts = crate::tensor::test_opts();
+        let blur = GaussianBlur::new(1.5);
+        assert_eq!(blur.name(), "gaussian_blur");
+        assert!(blur.parameters().is_empty());
+
+        let input = Variable::new(Tensor::randn(&[1, 3, 8, 8], opts).unwrap(), false);
+        let output = blur.forward(&input).unwrap();
+        assert_eq!(output.shape(), vec![1, 3, 8, 8]);
     }
 }

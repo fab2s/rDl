@@ -1,14 +1,22 @@
-//! Computation graph: fluent builder, parallel execution, observation, profiling, and visualization.
+//! Computation graph: fluent builder, parallel execution, observation, profiling,
+//! visualization, and hierarchical composition.
 //!
 //! Build graphs with [`FlowBuilder`], execute via the [`Module`] trait.
+//! Label subgraphs for tree features: selective freeze/thaw, subgraph
+//! checkpoints, cross-boundary observation, and per-subgraph optimizer groups.
 //!
 //! ```ignore
-//! let g = FlowBuilder::from(Linear::new(4, 8)?)
+//! let encoder = FlowBuilder::from(Linear::new(4, 8)?)
 //!     .through(GELU)
+//!     .label("encoder")
+//!     .build()?;
+//!
+//! let model = FlowBuilder::from(encoder)
 //!     .through(Linear::new(8, 2)?)
 //!     .build()?;
 //!
-//! let y = g.forward(&x)?;
+//! let y = model.forward(&x)?;
+//! model.freeze("encoder")?;  // freeze by label path
 //! ```
 
 pub mod node;

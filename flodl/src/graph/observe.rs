@@ -124,10 +124,38 @@ impl Graph {
 
     /// Return the latest epoch value for every tag in the epoch history.
     ///
+    /// **Tree-aware**: automatically collects from labeled child subgraphs
+    /// with dotted prefixes (e.g. a child labeled `"subscan"` with tag `"ce"`
+    /// appears as `"subscan.ce"`). Parent metrics come first, then children
+    /// in registration order.
+    ///
     /// Useful for bridging graph observation into
     /// [`Monitor::log()`](crate::monitor::Monitor::log). Returns an empty
     /// vec if no epochs have been flushed yet.
+    ///
+    /// Use [`latest_metrics_local()`](Self::latest_metrics_local) if you
+    /// only want this graph's own metrics.
     pub fn latest_metrics(&self) -> Vec<(String, f64)> {
+        let mut metrics = self.latest_metrics_local();
+        // Collect from labeled children with dotted prefixes
+        for (label, &ni) in &self.children {
+            if let Some(ref module) = self.nodes[ni].module
+                && let Some(child) = module.as_graph()
+            {
+                for (tag, val) in child.latest_metrics() {
+                    metrics.push((format!("{}.{}", label, tag), val));
+                }
+            }
+        }
+        metrics
+    }
+
+    /// Return latest epoch values for this graph only, without child metrics.
+    ///
+    /// Use this when you need only the local metrics (e.g. when children
+    /// report on a different cadence). See [`latest_metrics()`](Self::latest_metrics)
+    /// for the tree-recursive version.
+    pub fn latest_metrics_local(&self) -> Vec<(String, f64)> {
         let history = self.epoch_history.borrow();
         let order = self.metric_order.borrow();
         order
@@ -145,7 +173,40 @@ impl Graph {
 
     /// Compute batch means, append to epoch history, clear batch buffer.
     /// Call once per epoch. If tags is empty, flushes all buffered tags.
+    ///
+    /// **Tree-aware**: automatically recurses into labeled child subgraphs,
+    /// so a single `parent.flush(&[])` flushes the entire tree. Child buffers
+    /// that are already empty (e.g. flushed separately) are skipped safely.
+    ///
+    /// If you need **different flush cadences** per subgraph (e.g. flushing a
+    /// child every 10 parent epochs), use [`flush_local()`](Self::flush_local)
+    /// on both the parent and the child to manage them independently:
+    ///
+    /// ```ignore
+    /// // Every epoch: flush parent only
+    /// parent.flush_local(&[]);
+    /// // Every 10 epochs: flush the child
+    /// if epoch % 10 == 0 {
+    ///     parent.child_graph("slow_child").unwrap().flush_local(&[]);
+    /// }
+    /// ```
     pub fn flush(&self, tags: &[&str]) {
+        self.flush_local(tags);
+        // Recurse into labeled children
+        for &ni in self.children.values() {
+            if let Some(ref module) = self.nodes[ni].module
+                && let Some(child) = module.as_graph()
+            {
+                child.flush(&[]);
+            }
+        }
+    }
+
+    /// Flush only this graph's own batch buffer, without recursing into children.
+    ///
+    /// Use this when you need independent flush cadences per subgraph.
+    /// See [`flush()`](Self::flush) for the tree-recursive version.
+    pub fn flush_local(&self, tags: &[&str]) {
         let mut buffer = self.batch_buffer.borrow_mut();
         let mut history = self.epoch_history.borrow_mut();
 

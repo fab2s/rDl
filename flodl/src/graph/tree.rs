@@ -1009,4 +1009,192 @@ mod tests {
         assert!(summary.contains("(own)"), "missing own params:\n{}", summary);
         assert!(summary.contains("trainable"), "missing trainable:\n{}", summary);
     }
+
+    // ── Phase F: Tree-aware observation ──────────────────────────────
+
+    #[test]
+    fn test_flush_recurses_into_children() {
+        let dev = test_device();
+        let inner = FlowBuilder::from(Linear::on_device(3, 4, dev).unwrap())
+            .label("encoder")
+            .build()
+            .unwrap();
+
+        let outer = FlowBuilder::from(inner)
+            .through(Linear::on_device(4, 2, dev).unwrap())
+            .build()
+            .unwrap();
+
+        // Record into child via tree path
+        outer.record_at("encoder.loss", 0.5).unwrap();
+        outer.record_at("encoder.loss", 0.3).unwrap();
+        // Record into parent
+        outer.record_scalar("parent_loss", 1.0);
+
+        // Single flush on parent should flush both
+        outer.flush(&[]);
+
+        // Parent flushed
+        assert_eq!(outer.flush_count(), 1);
+        assert_eq!(outer.trend("parent_loss").len(), 1);
+
+        // Child also flushed
+        let child = outer.child_graph("encoder").unwrap();
+        assert_eq!(child.flush_count(), 1);
+        assert_eq!(child.trend("loss").len(), 1);
+    }
+
+    #[test]
+    fn test_latest_metrics_includes_children() {
+        let dev = test_device();
+        let inner = FlowBuilder::from(Linear::on_device(3, 4, dev).unwrap())
+            .label("encoder")
+            .build()
+            .unwrap();
+
+        let outer = FlowBuilder::from(inner)
+            .through(Linear::on_device(4, 2, dev).unwrap())
+            .build()
+            .unwrap();
+
+        // Record and flush
+        outer.record_at("encoder.ce", 0.5).unwrap();
+        outer.record_scalar("total_loss", 1.0);
+        outer.flush(&[]);
+
+        let metrics = outer.latest_metrics();
+        let names: Vec<&str> = metrics.iter().map(|(n, _)| n.as_str()).collect();
+
+        // Parent metric present
+        assert!(names.contains(&"total_loss"), "missing parent metric: {:?}", names);
+        // Child metric present with dotted prefix
+        assert!(names.contains(&"encoder.ce"), "missing child metric: {:?}", names);
+    }
+
+    #[test]
+    fn test_latest_metrics_local_excludes_children() {
+        let dev = test_device();
+        let inner = FlowBuilder::from(Linear::on_device(3, 4, dev).unwrap())
+            .label("encoder")
+            .build()
+            .unwrap();
+
+        let outer = FlowBuilder::from(inner)
+            .through(Linear::on_device(4, 2, dev).unwrap())
+            .build()
+            .unwrap();
+
+        outer.record_at("encoder.ce", 0.5).unwrap();
+        outer.record_scalar("total_loss", 1.0);
+        outer.flush(&[]);
+
+        let local = outer.latest_metrics_local();
+        let names: Vec<&str> = local.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert!(names.contains(&"total_loss"));
+        assert!(!names.contains(&"encoder.ce"), "local should not include children: {:?}", names);
+    }
+
+    #[test]
+    fn test_double_flush_is_safe() {
+        let dev = test_device();
+        let inner = FlowBuilder::from(Linear::on_device(3, 4, dev).unwrap())
+            .label("encoder")
+            .build()
+            .unwrap();
+
+        let outer = FlowBuilder::from(inner)
+            .through(Linear::on_device(4, 2, dev).unwrap())
+            .build()
+            .unwrap();
+
+        outer.record_at("encoder.loss", 0.5).unwrap();
+
+        // Flush child explicitly first
+        let child = outer.child_graph("encoder").unwrap();
+        child.flush(&[]);
+        assert_eq!(child.flush_count(), 1);
+
+        // Parent flush recurses — child buffer already empty, no double epoch
+        outer.flush(&[]);
+        assert_eq!(child.flush_count(), 1); // still 1, not 2
+        assert_eq!(child.trend("loss").len(), 1); // one epoch, not two
+    }
+
+    #[test]
+    fn test_flush_local_skips_children() {
+        let dev = test_device();
+        let inner = FlowBuilder::from(Linear::on_device(3, 4, dev).unwrap())
+            .label("encoder")
+            .build()
+            .unwrap();
+
+        let outer = FlowBuilder::from(inner)
+            .through(Linear::on_device(4, 2, dev).unwrap())
+            .build()
+            .unwrap();
+
+        outer.record_at("encoder.loss", 0.5).unwrap();
+        outer.record_scalar("parent_loss", 1.0);
+
+        // flush_local: only parent
+        outer.flush_local(&[]);
+
+        assert_eq!(outer.flush_count(), 1);
+        assert_eq!(outer.trend("parent_loss").len(), 1);
+
+        // Child NOT flushed — data still in batch buffer
+        let child = outer.child_graph("encoder").unwrap();
+        assert_eq!(child.flush_count(), 0);
+        assert_eq!(child.collected("loss").len(), 1); // still in batch buffer
+    }
+
+    #[test]
+    fn test_flush_recurses_multi_level() {
+        let dev = test_device();
+        let innermost = FlowBuilder::from(Linear::on_device(3, 4, dev).unwrap())
+            .label("read")
+            .build()
+            .unwrap();
+        let middle = FlowBuilder::from(innermost)
+            .through(Linear::on_device(4, 2, dev).unwrap())
+            .label("letter")
+            .build()
+            .unwrap();
+        let outer = FlowBuilder::from(middle)
+            .through(Linear::on_device(2, 1, dev).unwrap())
+            .build()
+            .unwrap();
+
+        // Record into deepest child
+        outer.record_at("letter.read.hidden_loss", 0.7).unwrap();
+        // Record into middle child
+        outer.record_at("letter.mid_loss", 0.4).unwrap();
+
+        outer.flush(&[]);
+
+        // All levels flushed
+        let metrics = outer.latest_metrics();
+        let names: Vec<&str> = metrics.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"letter.mid_loss"), "missing middle: {:?}", names);
+        assert!(names.contains(&"letter.read.hidden_loss"), "missing deep: {:?}", names);
+    }
+
+    #[test]
+    fn test_metrics_no_children_unchanged() {
+        // Verify single-graph behavior is identical (no regression)
+        let dev = test_device();
+        let g = FlowBuilder::from(Linear::on_device(3, 4, dev).unwrap())
+            .build()
+            .unwrap();
+
+        g.record_scalar("loss", 0.5);
+        g.record_scalar("loss", 0.3);
+        g.flush(&[]);
+
+        let metrics = g.latest_metrics();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].0, "loss");
+        assert!((metrics[0].1 - 0.4).abs() < 1e-10); // mean of 0.5 and 0.3
+    }
 }

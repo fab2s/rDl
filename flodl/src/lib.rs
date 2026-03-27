@@ -56,7 +56,8 @@ pub use nn::{
     Module, NamedInputModule,
     Parameter, Buffer, Linear, Optimizer, Stateful, SGD, SGDBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder,
     save_checkpoint, load_checkpoint, save_checkpoint_file, load_checkpoint_file,
-    LoadReport,
+    migrate_checkpoint, migrate_checkpoint_file, checkpoint_version,
+    LoadReport, MigrateReport,
     GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled,
     Identity, ReLU, Sigmoid, Tanh, GELU, SiLU,
     Dropout, Dropout2d, LayerNorm, Embedding, GRUCell, LSTMCell,
@@ -67,6 +68,7 @@ pub use nn::{
     xavier_uniform, xavier_normal,
     walk_modules, walk_modules_visited,
     CudaGraph, MemPoolId, CaptureMode, cuda_graph_capture, cuda_graph_pool_handle,
+    GaussianBlur, gaussian_blur_2d,
 };
 pub use graph::{
     FlowBuilder, MergeOp, Graph, MapBuilder, Trend, TrendGroup,

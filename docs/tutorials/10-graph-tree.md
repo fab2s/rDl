@@ -173,14 +173,67 @@ Record and track metrics across boundaries:
 ```rust
 // Record into child's observation buffer
 model.record_at("encoder.loss", loss_value)?;
+model.record_at("encoder.accuracy", acc)?;
 
-// Flush child's buffers
-model.child_graph("encoder").unwrap().flush(&[]);
+// Single flush on the parent flushes the entire tree
+model.flush(&[]);
 
 // Read trend from child
 let trend = model.trend_at("encoder.loss")?;
 println!("encoder loss trend: {:?}", trend.last());
 ```
+
+### Tree-aware flush and metrics
+
+`flush()` **automatically recurses** into all labeled child subgraphs. A single
+`model.flush(&[])` on the root graph flushes the entire tree -- no need to walk
+children manually. If a child's buffer is already empty (flushed separately),
+it's safely skipped (no double epoch entries).
+
+`latest_metrics()` collects from the entire tree with **dotted prefixes**. A
+child labeled `"encoder"` with a metric `"loss"` appears as `"encoder.loss"`.
+Deep nesting works too: `"letter.read.confidence"`.
+
+This means `Monitor::log()` sees the whole tree automatically:
+
+```rust
+model.record_at("subscan.ce", ce_value)?;
+model.record_at("letter.accuracy", acc)?;
+model.record_scalar("total_loss", total);
+
+model.flush(&[]);  // flushes parent + subscan + letter
+
+// Monitor sees: total_loss, subscan.ce, letter.accuracy
+monitor.log(epoch, t.elapsed(), &model);
+```
+
+The dashboard displays each metric as a separate curve -- the dotted names
+provide natural grouping in the legend.
+
+### Independent flush cadences
+
+Sometimes child subgraphs train on a different schedule (e.g. a slow auxiliary
+loss that's only meaningful every N epochs). Use `flush_local()` and
+`latest_metrics_local()` to manage each graph's observation cycle independently:
+
+```rust
+// Every epoch: flush parent only
+model.flush_local(&[]);
+
+// Every 10 epochs: flush the slow child
+if epoch % 10 == 0 {
+    model.child_graph("auxiliary").unwrap().flush_local(&[]);
+}
+
+// For monitoring, choose what to show:
+// - latest_metrics_local() = only this graph's own metrics
+// - latest_metrics()       = this graph + all children (tree-recursive)
+monitor.log(epoch, t.elapsed(), &model);  // uses latest_metrics() by default
+```
+
+When using independent cadences, the parent's `latest_metrics()` still collects
+from children -- it reads whatever the child last flushed. So the dashboard
+shows the child's most recent epoch value, updated at the child's own pace.
 
 ## Internal tags
 
@@ -291,6 +344,10 @@ calls -- they only run when you call them, never during forward/backward.
 | `collect_at(paths)` | `Result<()>` | Collect metrics across boundaries |
 | `record_at(path, value)` | `Result<()>` | Record scalar into child's buffer |
 | `trend_at(path)` | `Result<Trend>` | Epoch trend from child's history |
+| `flush(tags)` | `()` | Flush batch buffer (recurses into children) |
+| `flush_local(tags)` | `()` | Flush this graph only (no recursion) |
+| `latest_metrics()` | `Vec<(String, f64)>` | Latest epoch values (children with dotted prefixes) |
+| `latest_metrics_local()` | `Vec<(String, f64)>` | Latest epoch values (this graph only) |
 | `tree_summary()` | `String` | Tree structure visualization |
 | `param_summary()` | `String` | Per-subgraph param breakdown |
 | `internal_tags()` | `&HashSet<String>` | Tags hidden from parent |
@@ -303,9 +360,49 @@ calls -- they only run when you call them, never during forward/backward.
 | `.internal(tag)` | Mark a tag as internal (hidden from parent) |
 | `.verbose(true)` | Print tree structure on build |
 
+## Migrating checkpoints from earlier versions
+
+If you trained a model with flodl 0.1.x and renamed tags or restructured the
+graph for 0.2.0, use `migrate_checkpoint_file()` to remap parameter names
+without retraining:
+
+```rust
+use flodl::nn::{checkpoint_version, migrate_checkpoint_file};
+
+if checkpoint_version("encoder_v1.fdl")? < 2 {
+    let report = migrate_checkpoint_file(
+        "encoder_v1.fdl",
+        "encoder_v2.fdl",
+        &encoder.named_parameters(),
+        &encoder.named_buffers(),
+    )?;
+    println!("{}", report);
+    assert!(report.is_complete());
+}
+
+// Load into the subgraph as usual
+model.load_subgraph_checkpoint("encoder", "encoder_v2.fdl")?;
+```
+
+The migrated checkpoint is written as v2 with a zeroed structural hash, so it
+loads without architecture validation. Same architecture required -- if you
+changed layer sizes, retrain instead.
+
 ## What's next
 
 The graph tree is the foundation for progressive model composition --
 training layers independently, checkpointing them, and composing them
 into larger models with fine-grained training control. See the
 [design document](../design/graph-tree.md) for the full architecture.
+
+---
+
+Previous tutorials: [09-Training Monitor](09-monitor.md) |
+[08-Utilities](08-utilities.md) |
+[07-Visualization](07-visualization.md) |
+[06-Advanced Graphs](06-advanced-graphs.md) |
+[05-Graph Builder](05-graph-builder.md) |
+[04-Training](04-training.md) |
+[03-Modules](03-modules.md) |
+[02-Autograd](02-autograd.md) |
+[01-Tensors](01-tensors.md)
