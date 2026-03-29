@@ -97,6 +97,54 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
+    /// Leaky ReLU: `max(0, x) + negative_slope * min(0, x)`.
+    pub fn leaky_relu(&self, negative_slope: f64) -> Result<Variable> {
+        let result = self.data().leaky_relu(negative_slope)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// ELU: `max(0, x) + min(0, alpha * (exp(x) - 1))`.
+    pub fn elu(&self, alpha: f64) -> Result<Variable> {
+        let result = self.data().elu(alpha)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Softplus: `(1/beta) * log(1 + exp(beta * x))`.
+    pub fn softplus(&self, beta: f64, threshold: f64) -> Result<Variable> {
+        let result = self.data().softplus(beta, threshold)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Mish: `x * tanh(softplus(x))`.
+    pub fn mish(&self) -> Result<Variable> {
+        let result = self.data().mish()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// SELU: self-normalizing ELU with fixed alpha/lambda.
+    pub fn selu(&self) -> Result<Variable> {
+        let result = self.data().selu()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Hardswish: `x * clamp(x + 3, 0, 6) / 6`.
+    pub fn hardswish(&self) -> Result<Variable> {
+        let result = self.data().hardswish()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Hardsigmoid: `clamp(x + 3, 0, 6) / 6`.
+    pub fn hardsigmoid(&self) -> Result<Variable> {
+        let result = self.data().hardsigmoid()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// PReLU: `max(0, x) + weight * min(0, x)`.
+    pub fn prelu(&self, weight: &Variable) -> Result<Variable> {
+        let result = self.data().prelu(&weight.data())?;
+        Ok(Variable::wrap(result))
+    }
+
     // --- Reductions ---
 
     /// Sum of all elements, returning a scalar.
@@ -120,6 +168,30 @@ impl Variable {
     /// Mean along a dimension. If `keepdim`, the reduced dimension is retained with size 1.
     pub fn mean_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
         let result = self.data().mean_dim(dim, keepdim)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Product of all elements, returning a scalar.
+    pub fn prod(&self) -> Result<Variable> {
+        let result = self.data().prod()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Product along a dimension.
+    pub fn prod_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
+        let result = self.data().prod_dim(dim, keepdim)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Cumulative sum along a dimension.
+    pub fn cumsum(&self, dim: i32) -> Result<Variable> {
+        let result = self.data().cumsum(dim)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Log of summed exponentials along a dimension (numerically stable).
+    pub fn logsumexp(&self, dim: i32, keepdim: bool) -> Result<Variable> {
+        let result = self.data().logsumexp(dim, keepdim)?;
         Ok(Variable::wrap(result))
     }
 
@@ -223,6 +295,12 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
+    /// Lower triangular part. `diagonal=0` keeps the main diagonal; negative shifts down.
+    pub fn tril(&self, diagonal: i64) -> Result<Variable> {
+        let result = self.data().tril(diagonal)?;
+        Ok(Variable::wrap(result))
+    }
+
     /// Element-wise sine.
     pub fn sin(&self) -> Result<Variable> {
         let result = self.data().sin()?;
@@ -268,6 +346,78 @@ impl Variable {
     /// Clamp all elements to `[min, max]`.
     pub fn clamp(&self, min: f64, max: f64) -> Result<Variable> {
         let result = self.data().clamp(min, max)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Clamp all elements to be at least `min`.
+    pub fn clamp_min(&self, min: f64) -> Result<Variable> {
+        let result = self.data().clamp_min(min)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Clamp all elements to be at most `max`.
+    pub fn clamp_max(&self, max: f64) -> Result<Variable> {
+        let result = self.data().clamp_max(max)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Element-wise `log(1 + x)`, numerically stable for small x.
+    pub fn log1p(&self) -> Result<Variable> {
+        let result = self.data().log1p()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Element-wise `exp(x) - 1`, numerically stable for small x.
+    pub fn expm1(&self) -> Result<Variable> {
+        let result = self.data().expm1()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Element-wise base-2 logarithm.
+    pub fn log2(&self) -> Result<Variable> {
+        let result = self.data().log2()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Element-wise base-10 logarithm.
+    pub fn log10(&self) -> Result<Variable> {
+        let result = self.data().log10()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Element-wise atan2 (arc tangent of y/x).
+    pub fn atan2(&self, other: &Variable) -> Result<Variable> {
+        let result = self.data().atan2(&other.data())?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Element-wise maximum of two variables.
+    pub fn maximum(&self, other: &Variable) -> Result<Variable> {
+        let result = self.data().maximum(&other.data())?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Element-wise minimum of two variables.
+    pub fn minimum(&self, other: &Variable) -> Result<Variable> {
+        let result = self.data().minimum(&other.data())?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Fill elements where `mask` is true (non-zero) with `value`.
+    pub fn masked_fill(&self, mask: &Tensor, value: f64) -> Result<Variable> {
+        let result = self.data().masked_fill(mask, value)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// L_p normalize along a dimension.
+    pub fn normalize(&self, p: f64, dim: i32) -> Result<Variable> {
+        let result = self.data().normalize(p, dim)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Cosine similarity between two variables along a dimension.
+    pub fn cosine_similarity(&self, other: &Variable, dim: i64, eps: f64) -> Result<Variable> {
+        let result = self.data().cosine_similarity(&other.data(), dim, eps)?;
         Ok(Variable::wrap(result))
     }
 
@@ -517,6 +667,65 @@ pub fn conv_transpose2d(
     Ok(Variable::wrap(result))
 }
 
+/// 1D convolution with autograd support (`F.conv1d`).
+/// `input` is `[N, C_in, L]`, `weight` is `[C_out, C_in/groups, K]`.
+pub fn conv1d(
+    input: &Variable,
+    weight: &Variable,
+    bias: Option<&Variable>,
+    stride: i64,
+    padding: i64,
+    dilation: i64,
+    groups: i64,
+) -> Result<Variable> {
+    let bias_tensor = bias.map(|b| b.data());
+    let result = input.data().conv1d(
+        &weight.data(),
+        bias_tensor.as_ref(),
+        stride, padding, dilation, groups,
+    )?;
+    Ok(Variable::wrap(result))
+}
+
+/// Transposed 1D convolution with autograd support (`F.conv_transpose1d`).
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose1d(
+    input: &Variable,
+    weight: &Variable,
+    bias: Option<&Variable>,
+    stride: i64,
+    padding: i64,
+    output_padding: i64,
+    dilation: i64,
+    groups: i64,
+) -> Result<Variable> {
+    let bias_tensor = bias.map(|b| b.data());
+    let result = input.data().conv_transpose1d(
+        &weight.data(),
+        bias_tensor.as_ref(),
+        stride, padding, output_padding, dilation, groups,
+    )?;
+    Ok(Variable::wrap(result))
+}
+
+/// Group normalization with autograd support.
+/// `weight` (gamma) and `bias` (beta) are shape `[num_channels]`.
+pub fn group_norm(
+    input: &Variable,
+    num_groups: i64,
+    weight: &Variable,
+    bias: &Variable,
+    eps: f64,
+) -> Result<Variable> {
+    let result = input.data().group_norm(
+        num_groups,
+        Some(&weight.data()),
+        Some(&bias.data()),
+        eps,
+    )?;
+    Ok(Variable::wrap(result))
+}
+
 /// Max pooling over a 2D input with autograd support (`F.max_pool2d`).
 pub fn max_pool2d(
     input: &Variable,
@@ -530,12 +739,175 @@ pub fn max_pool2d(
     Ok(Variable::wrap(result))
 }
 
+/// Average pooling over spatial dimensions.
+pub fn avg_pool2d(
+    input: &Variable,
+    kernel_size: [i64; 2],
+    stride: [i64; 2],
+    padding: [i64; 2],
+    ceil_mode: bool,
+    count_include_pad: bool,
+) -> Result<Variable> {
+    let result = input.data().avg_pool2d(kernel_size, stride, padding, ceil_mode, count_include_pad)?;
+    Ok(Variable::wrap(result))
+}
+
 /// Adaptive average pooling that outputs a fixed `[H, W]` regardless of input size.
 pub fn adaptive_avg_pool2d(
     input: &Variable,
     output_size: [i64; 2],
 ) -> Result<Variable> {
     let result = input.data().adaptive_avg_pool2d(output_size)?;
+    Ok(Variable::wrap(result))
+}
+
+/// Unfold (im2col) with autograd support.
+pub fn im2col(
+    input: &Variable,
+    kernel_size: [i64; 2],
+    dilation: [i64; 2],
+    padding: [i64; 2],
+    stride: [i64; 2],
+) -> Result<Variable> {
+    let result = input.data().im2col(kernel_size, dilation, padding, stride)?;
+    Ok(Variable::wrap(result))
+}
+
+/// Fold (col2im) with autograd support.
+pub fn col2im(
+    input: &Variable,
+    output_size: [i64; 2],
+    kernel_size: [i64; 2],
+    dilation: [i64; 2],
+    padding: [i64; 2],
+    stride: [i64; 2],
+) -> Result<Variable> {
+    let result = input.data().col2im(output_size, kernel_size, dilation, padding, stride)?;
+    Ok(Variable::wrap(result))
+}
+
+/// 3D convolution with autograd support (`F.conv3d`).
+/// `input` is `[N, C_in, D, H, W]`, `weight` is `[C_out, C_in/groups, kD, kH, kW]`.
+#[allow(clippy::too_many_arguments)]
+pub fn conv3d(
+    input: &Variable,
+    weight: &Variable,
+    bias: Option<&Variable>,
+    stride: [i64; 3],
+    padding: [i64; 3],
+    dilation: [i64; 3],
+    groups: i64,
+) -> Result<Variable> {
+    let bias_tensor = bias.map(|b| b.data());
+    let result = input.data().conv3d(
+        &weight.data(),
+        bias_tensor.as_ref(),
+        stride, padding, dilation, groups,
+    )?;
+    Ok(Variable::wrap(result))
+}
+
+/// Transposed 3D convolution with autograd support.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose3d(
+    input: &Variable,
+    weight: &Variable,
+    bias: Option<&Variable>,
+    stride: [i64; 3],
+    padding: [i64; 3],
+    output_padding: [i64; 3],
+    dilation: [i64; 3],
+    groups: i64,
+) -> Result<Variable> {
+    let bias_tensor = bias.map(|b| b.data());
+    let result = input.data().conv_transpose3d(
+        &weight.data(),
+        bias_tensor.as_ref(),
+        stride, padding, output_padding, dilation, groups,
+    )?;
+    Ok(Variable::wrap(result))
+}
+
+/// 1D max pooling with autograd support.
+pub fn max_pool1d(
+    input: &Variable,
+    kernel_size: i64,
+    stride: i64,
+    padding: i64,
+    dilation: i64,
+    ceil_mode: bool,
+) -> Result<Variable> {
+    let result = input.data().max_pool1d(kernel_size, stride, padding, dilation, ceil_mode)?;
+    Ok(Variable::wrap(result))
+}
+
+/// 1D average pooling with autograd support.
+pub fn avg_pool1d(
+    input: &Variable,
+    kernel_size: i64,
+    stride: i64,
+    padding: i64,
+    ceil_mode: bool,
+    count_include_pad: bool,
+) -> Result<Variable> {
+    let result = input.data().avg_pool1d(kernel_size, stride, padding, ceil_mode, count_include_pad)?;
+    Ok(Variable::wrap(result))
+}
+
+/// Adaptive max pooling 2D with autograd support.
+pub fn adaptive_max_pool2d(
+    input: &Variable,
+    output_size: [i64; 2],
+) -> Result<Variable> {
+    let result = input.data().adaptive_max_pool2d(output_size)?;
+    Ok(Variable::wrap(result))
+}
+
+/// Instance normalization with autograd support.
+#[allow(clippy::too_many_arguments)]
+pub fn instance_norm(
+    input: &Variable,
+    weight: Option<&Variable>,
+    bias: Option<&Variable>,
+    running_mean: Option<&Tensor>,
+    running_var: Option<&Tensor>,
+    use_input_stats: bool,
+    momentum: f64,
+    eps: f64,
+) -> Result<Variable> {
+    let w = weight.map(|v| v.data());
+    let b = bias.map(|v| v.data());
+    let result = input.data().instance_norm(
+        w.as_ref(), b.as_ref(),
+        running_mean, running_var,
+        use_input_stats, momentum, eps,
+    )?;
+    Ok(Variable::wrap(result))
+}
+
+/// Pixel shuffle with autograd support.
+pub fn pixel_shuffle(input: &Variable, upscale_factor: i64) -> Result<Variable> {
+    let result = input.data().pixel_shuffle(upscale_factor)?;
+    Ok(Variable::wrap(result))
+}
+
+/// Pixel unshuffle with autograd support.
+pub fn pixel_unshuffle(input: &Variable, downscale_factor: i64) -> Result<Variable> {
+    let result = input.data().pixel_unshuffle(downscale_factor)?;
+    Ok(Variable::wrap(result))
+}
+
+/// Bilinear transformation with autograd support.
+pub fn bilinear(
+    input1: &Variable,
+    input2: &Variable,
+    weight: &Variable,
+    bias: Option<&Variable>,
+) -> Result<Variable> {
+    let b = bias.map(|v| v.data());
+    let result = Tensor::bilinear(
+        &input1.data(), &input2.data(), &weight.data(), b.as_ref(),
+    )?;
     Ok(Variable::wrap(result))
 }
 
@@ -551,5 +923,21 @@ pub fn grid_sample(
     let result = input.data().grid_sample(
         &grid.data(), mode, padding_mode, align_corners,
     )?;
+    Ok(Variable::wrap(result))
+}
+
+/// Fused embedding lookup + reduction with autograd support.
+///
+/// `weight`: learnable embedding table (Variable).
+/// `indices`: 1-D i64 index tensor.
+/// `offsets`: 1-D i64 tensor marking the start of each bag.
+/// `mode`: 0 = sum, 1 = mean, 2 = max.
+pub fn embedding_bag(
+    weight: &Variable,
+    indices: &Tensor,
+    offsets: &Tensor,
+    mode: i64,
+) -> Result<Variable> {
+    let result = Tensor::embedding_bag(&weight.data(), indices, offsets, mode)?;
     Ok(Variable::wrap(result))
 }

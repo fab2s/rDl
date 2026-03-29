@@ -18,14 +18,14 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 </p>
 
 <p align="center">
+  <a href="#if-you-know-pytorch-you-know-flodl">PyTorch Users</a> &bull;
   <a href="#getting-started">Getting Started</a> &bull;
   <a href="#the-graph-builder">Graph Builder</a> &bull;
-  <a href="#training-monitor">Training Monitor</a> &bull;
-  <a href="#features">Features</a> &bull;
-  <a href="https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md">Tutorials</a> &bull;
-  <a href="https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md">PyTorch Migration</a> &bull;
-  <a href="https://github.com/fab2s/floDl/blob/main/docs/troubleshooting.md">Troubleshooting</a> &bull;
-  <a href="#architecture">Architecture</a>
+  <a href="#graph-tree-hierarchical-composition">Graph Tree</a> &bull;
+  <a href="#the-training-experience">Training</a> &bull;
+  <a href="#pytorch-parity">Parity</a> &bull;
+  <a href="#performance">Benchmarks</a> &bull;
+  <a href="https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md">Migration Guide</a>
 </p>
 
 ---
@@ -73,12 +73,11 @@ replaces silent failures with compile-time error handling. `Drop` replaces the
 garbage collector. The [full migration guide](https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md) covers
 every op, module, and pattern.
 
+> **New to Rust?** Read [Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes.
+
 ## Getting Started
 
-**Prerequisite:** [Docker](https://docs.docker.com/get-docker/) (no Rust or
-libtorch needed on your machine — everything runs in containers).
-
-Create a new project with one command:
+**With Docker** (no Rust or libtorch needed):
 
 ```bash
 curl -sL https://flodl.dev/init.sh | sh -s my-project
@@ -87,206 +86,33 @@ make build    # first build (~5 min, downloads libtorch)
 make run      # train the template model
 ```
 
-This generates a complete project with Dockerfiles, Makefile, and an annotated
-training template. Edit `src/main.rs` to build your model.
-
-> **New to Rust?** Read [Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes.
-
-## The Graph Builder
-
-floDl's fluent graph builder lets you describe complex architectures as
-readable data flow — no boilerplate, no graph construction commands.
-
-```rust
-let model = FlowBuilder::from(Linear::new(2, 16)?)
-    .through(GELU)                        // activation
-    .through(LayerNorm::new(16)?)         // normalization
-    .also(Linear::new(16, 16)?)           // residual connection
-    .through(Linear::new(16, 2)?)         // output projection
-    .build()?;
-```
-
-That's a trainable model. `also` adds the residual — input flows through the
-Linear *and* gets added to its output. `build()` returns a `Graph` that
-implements `Module` — you can nest it inside other graphs.
-
-Things get interesting when architectures get complex:
-
-```rust
-let g = FlowBuilder::from(encoder).tag("encoded")
-    .split(modules![head_a, head_b, head_c]).merge(MergeOp::Mean)
-    .loop_body(refinement_block).for_n(3).tag("refined")
-    .gate(router, modules![expert_a, expert_b]).using(&["encoded"])
-    .switch(selector, modules![light_path, heavy_path]).using(&["refined"])
-    .through(StateAdd).using(&["memory"]).tag("memory")
-    .loop_body(decoder).while_cond(halt_condition, 10)
-    .through(output_head)
-    .build()?;
-```
-
-Every construct — `split/merge`, `also`, `loop_body`, `gate`, `switch`, `map`,
-`tag/using` — composes cleanly. Sub-graphs nest like any module. Forward
-references (`using` before `tag`) carry state across calls, enabling recurrent
-architectures without special-casing. Enough to express transformers,
-mixture-of-experts, iterative refinement, attention with memory, or any
-architecture you can draw as a data flow graph.
-
-See the **[Graph Builder Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md)** and
-the [full showcase](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) that exercises every builder
-method.
-
-## Training Monitor
-
-Drop-in training monitor with adaptive ETA, system resource tracking, and a
-live web dashboard — no external dependencies, no separate process.
-
-```rust
-use flodl::monitor::Monitor;
-
-let mut monitor = Monitor::new(num_epochs);
-monitor.serve(3000)?;  // optional: live dashboard at http://localhost:3000
-
-for epoch in 0..num_epochs {
-    let t = std::time::Instant::now();
-    // ... training ...
-
-    monitor.log(epoch, t.elapsed(), &[("loss", loss_val), ("lr", lr)]);
-}
-monitor.finish();
-```
-
-Terminal output adapts automatically — duration and ETA switch between hours,
-minutes, seconds, and milliseconds as needed:
-
-```
-  epoch   1/100  loss=1.5264  [49ms  ETA 4.8s]
-  epoch  10/100  loss=0.3817  [25ms  ETA 2.2s]  VRAM: 2.1/6.0 GB (82%)
-  epoch  50/100  loss=0.0023  [24ms  ETA 1.2s]  VRAM: 2.1/6.0 GB (82%)
-  epoch 100/100  loss=0.0012  [23ms]             VRAM: 2.1/6.0 GB (82%)
-  training complete in 2.8s  | loss: 0.0012
-```
-
-### Live dashboard
-
-Call `monitor.serve(port)` and open the URL in a browser. The page updates
-in real time via Server-Sent Events — no polling, no WebSocket, no npm.
-
-<p align="center">
-  <a href="https://flodl.dev/benchmark">
-    <img src="https://raw.githubusercontent.com/fab2s/floDl/main/docs/dashboard.gif" alt="floDl live training dashboard — click for interactive version" width="800">
-  </a>
-</p>
-<p align="center"><em><a href="https://flodl.dev/benchmark">Interactive benchmark dashboard</a> — real data from a 100-epoch training run</em></p>
-
-The dashboard includes:
-
-| Panel | What it shows |
-|-------|--------------|
-| **Header** | Epoch counter, progress bar, ETA, elapsed time |
-| **Metrics chart** | All logged metrics (loss, lr, ...) as live canvas chart |
-| **Resource chart** | CPU%, GPU%, RAM%, VRAM% over time |
-| **Resource bars** | Current usage with values (e.g., `VRAM: 2.1/6.0 GB`) |
-| **Epoch log** | Every epoch, newest first, with duration and resources |
-| **Graph SVG** | Collapsible architecture diagram (via `monitor.watch(&model)`) |
-
-Late join works — open the dashboard mid-training and it backfills all
-past epochs instantly.
-
-### Resource tracking
-
-| Metric | Source | Availability |
-|--------|--------|-------------|
-| CPU % | `/proc/stat` delta | Linux |
-| RAM | `/proc/meminfo` | Linux |
-| GPU utilization % | NVML (dynamic `dlopen`) | NVIDIA GPU + driver |
-| VRAM used/total | `cudaMemGetInfo` via FFI | CUDA builds |
-
-Resources that aren't available are silently omitted. CPU-only builds show
-CPU and RAM; CUDA builds add GPU and VRAM automatically.
-
-### Export
-
-```rust
-monitor.save_html("training_report.html");  // self-contained dashboard archive
-monitor.write_log("training.log")?;          // human-readable log
-monitor.export_csv("training.csv")?;         // metrics + resources as CSV
-```
-
-`save_html` writes a complete dashboard at `finish()` — all metrics, resource
-charts, and graph SVG baked into a single HTML file. Open it in any browser,
-no server needed. Set it once before training and forget about it.
-
-See the full **[Training Monitor Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/09-monitor.md)**.
-
-## Quick Start
-
-### With Docker (recommended)
-
-No Rust or libtorch needed — everything runs in containers:
-
-```bash
-curl -sL https://flodl.dev/init.sh | sh -s my-project
-cd my-project && make run
-```
-
-### Without Docker
-
-**Requirements:** [Rust](https://rustup.rs/) 1.85+ and libtorch.
-
-The fastest way to get libtorch:
+**Without Docker** — [Rust](https://rustup.rs/) 1.85+ and libtorch:
 
 ```bash
 # Auto-detects CPU or CUDA
 curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/download-libtorch.sh | sh
-
-# Or force a specific variant
-sh download-libtorch.sh --cpu
-sh download-libtorch.sh --cuda 12.8
-sh download-libtorch.sh --cuda 12.6
+cargo add flodl && cargo build
 ```
 
-The script downloads libtorch to `~/.local/lib/libtorch` and prints the
-environment variables to add to your shell profile. Then:
+For CUDA: `cargo add flodl --features cuda` + [CUDA toolkit](https://developer.nvidia.com/cuda-downloads).
 
-```bash
-cargo add flodl
-cargo build
-```
-
-For CUDA, also install the [CUDA toolkit](https://developer.nvidia.com/cuda-downloads)
-and enable the feature: `cargo add flodl --features cuda`.
-
-**Develop floDl itself:**
-```bash
-git clone https://github.com/fab2s/floDl.git
-cd floDl
-make image      # build dev container (Rust + libtorch)
-make test       # run all tests (CPU)
-make cuda-test  # run all tests on CUDA (requires NVIDIA GPU)
-make test-all   # CPU first, then CUDA if a GPU is available
-make clippy     # lint
-make shell      # interactive shell in container
-```
-
-### Train a model
+Both paths generate an annotated training template. Edit `src/main.rs` to
+build your model:
 
 ```rust
 use flodl::*;
 
-// Build the model.
 let model = FlowBuilder::from(Linear::new(2, 16)?)
     .through(GELU)
     .through(LayerNorm::new(16)?)
-    .also(Linear::new(16, 16)?)
+    .also(Linear::new(16, 16)?)     // residual connection
     .through(Linear::new(16, 2)?)
     .build()?;
 
-// Set up training.
 let params = model.parameters();
 let mut optimizer = Adam::new(&params, 0.01);
 model.train();
 
-// Training loop.
 for (input_t, target_t) in &batches {
     let input = Variable::new(input_t.clone(), true);
     let target = Variable::new(target_t.clone(), false);
@@ -301,176 +127,268 @@ for (input_t, target_t) in &batches {
 }
 ```
 
-## Features
+## The Graph Builder
 
-### Core Stack
+floDl's fluent graph builder lets you describe complex architectures as
+readable data flow — no boilerplate, no `nn.Module` subclassing.
 
-| Layer | What it does |
-|-------|-------------|
-| **Tensor** | Owned RAII tensors with `Drop`, `Clone`. CPU and CUDA. |
-| **Autograd** | Reverse-mode automatic differentiation. Full backward for every op. |
-| **NN Modules** | `Linear`, `Conv2d`, `ConvTranspose2d`, `MaxPool2d`, `LayerNorm`, `BatchNorm`/`BatchNorm2d`, `Dropout`, `Dropout2d`, `Embedding`, `GRUCell`, `LSTMCell` |
-| **Activations** | `Identity`, `ReLU`, `Sigmoid`, `Tanh`, `GELU`, `SiLU` |
-| **Losses** | `mse_loss`, `cross_entropy_loss`, `bce_with_logits_loss`, `l1_loss`, `smooth_l1_loss`, `kl_div_loss` |
-| **Optimizers** | `SGD` (with momentum), `Adam`, `AdamW` — all support parameter groups for per-group LR |
-| **LR Scheduling** | `StepDecay`, `CosineScheduler`, `WarmupScheduler` (composable), `PlateauScheduler` |
-| **Mixed Precision** | `Float16`/`BFloat16` dtype casting, `GradScaler` for loss scaling |
-| **Monitor** | Human-readable ETA, CPU/GPU/RAM/VRAM tracking, live web dashboard |
-| **Graph Tree** | Hierarchical subgraph composition, label-path addressing, selective freeze/thaw, subgraph checkpoints, cross-boundary observation |
+```rust
+let model = FlowBuilder::from(Linear::new(2, 16)?)
+    .through(GELU)                        // activation
+    .through(LayerNorm::new(16)?)         // normalization
+    .also(Linear::new(16, 16)?)           // residual connection
+    .through(Linear::new(16, 2)?)         // output projection
+    .build()?;
+```
 
-### Graph Builder
+`build()` returns a `Graph` that implements `Module` — you can nest it
+inside other graphs. Things get interesting when architectures get complex:
+
+```rust
+let g = FlowBuilder::from(encoder).tag("encoded")
+    .split(modules![head_a, head_b, head_c]).merge(MergeOp::Mean)
+    .loop_body(refinement_block).for_n(3).tag("refined")
+    .gate(router, modules![expert_a, expert_b]).using(&["encoded"])
+    .switch(selector, modules![light_path, heavy_path]).using(&["refined"])
+    .through(StateAdd).using(&["memory"]).tag("memory")
+    .loop_body(decoder).while_cond(halt_condition, 10)
+    .through(output_head)
+    .build()?;
+```
+
+Every construct — `split/merge`, `also`, `loop_body`, `gate`, `switch`, `map`,
+`tag/using` — composes cleanly. Forward references (`using` before `tag`) carry
+state across calls, enabling recurrent architectures without special-casing.
 
 | Method | What it does |
 |--------|-------------|
 | `from(m).through(m)` | Linear chain |
-| `fork(m)` | Side branch: runs module, captures output as tag, stream continues unchanged |
-| `input(names)` | Auxiliary graph inputs, accessible via `using(name)` — multi-input graphs |
+| `also(m)` | Residual: `input + m(input)` |
+| `fork(m)` | Side branch: capture output as tag, stream continues |
 | `split(modules![...]).merge(op)` | Parallel branches, merged by `Add` or `Mean` |
-| `also(m)` | Residual connection: `input + m(input)` |
-| `tag(name)` / `using(refs)` | Named references — backward (same pass) or forward (across calls) |
+| `tag(name)` / `using(refs)` | Named references — backward or forward (across calls) |
 | `loop_body(body).for_n(n)` | Fixed iteration with BPTT |
-| `loop_body(body).while_cond(cond, max)` | Condition before body (0..max iterations) |
-| `loop_body(body).until_cond(cond, max)` | Condition after body (1..max iterations) |
-| `gate(router, modules![...])` | Soft routing — all experts execute, weighted combination |
-| `switch(selector, modules![...])` | Hard routing — only selected branch executes |
-| `map(body).each()` | Apply body to each element along dim 0 |
-| `map(body).over(tag)` | Iterate over a tagged tensor |
-| `map(body).slices(n)` | Decompose last dim into n slices, map, recompose |
-| `.batched()` | Fast path for Map — full batch in one call |
-| `tag_group(name)` | Name parallel branches: `split(...).tag_group("head")` |
+| `loop_body(body).while_cond` / `until_cond` | Conditional loops |
+| `gate(router, modules![...])` | Soft routing — weighted combination |
+| `switch(selector, modules![...])` | Hard routing — only selected branch |
+| `map(body).each()` / `.over(tag)` / `.slices(n)` | Element-wise, tagged, or sliced iteration |
+| `input(names)` | Auxiliary graph inputs for multi-input architectures |
 
-### Training Tools
+See the **[Graph Builder Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md)** and
+the [full showcase](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/).
 
-| Tool | What it does |
-|------|-------------|
-| `clip_grad_norm` | L2 norm gradient clipping |
-| `clip_grad_value` | Element-wise gradient clamping |
-| `save_checkpoint` / `load_checkpoint` | Named `.fdl` checkpoint with partial loading, persists parameters + buffers, structural hash validation, `LoadReport` (file path or `Write`/`Read`) |
-| `Parameter::freeze` / `unfreeze` | Disable/enable gradient tracking per parameter |
-| `xavier_uniform/normal` | Weight initialization (also `kaiming_*` via `nn::init`) |
-| LR schedulers | `StepDecay`, `CosineScheduler`, `WarmupScheduler`, `PlateauScheduler` (composable) |
-| `GradScaler` | Dynamic loss scaling for mixed precision (float16) training |
-| `cast_parameters` | Cast model parameters to any dtype |
-| **Background** | `CpuWorker` (work queue), `ModelSnapshot` / `snapshot_cpu()` — offload checkpoints & eval to a background thread |
+## Graph Tree: Hierarchical Composition
 
-### Module Traits
+This is where floDl goes beyond PyTorch. Graphs nest inside graphs with
+**label-path addressing** — dot-separated paths that let you reach into any
+subgraph from the root. Train components independently, compose them into
+larger architectures, and control training phases declaratively.
 
-Beyond the core `forward`/`parameters` methods, `Module` provides optional
-methods that the graph recognizes automatically:
+```rust
+// Build components independently
+let scan = FlowBuilder::from(scan_net).tag("hidden")
+    .label("scan").build()?;
 
-| Method | Default | What happens |
-|--------|---------|-------------|
-| `as_named_input()` | `None` | Returns `&dyn NamedInputModule` — loop and node `using()` refs arrive as a named map |
-| `reset()` | no-op | Loops auto-call before iterating — clears per-forward state |
-| `detach_state()` | no-op | `graph.detach_state()` propagates — breaks gradient chains on retained state |
+let read = FlowBuilder::from(read_net).tag("confidence")
+    .label("read").build()?;
 
-Stateful modules just override `reset()` and/or `detach_state()` directly —
-no separate trait impls needed. Modules that own child modules implement
-`sub_modules()` for recursive device placement, training mode, and parameter
-collection.
+let encoder = FlowBuilder::from(scan)
+    .through(read)
+    .label("encoder").build()?;
 
-### Observation & Trends
+// Compose into full model
+let model = FlowBuilder::from(encoder)
+    .through(classifier)
+    .build()?;
+```
 
-Tags double as observation points — collect metrics during training, flush
-to epoch history, and query trends to drive training decisions:
+### Dotted paths reach anywhere
+
+Every tag and subgraph is addressable through dotted paths from the root:
+
+```rust
+model.validate_path("encoder")?;                 // -> Subgraph
+model.validate_path("encoder.scan.hidden")?;      // -> Tag (three levels deep)
+model.validate_path("encoder.read.confidence")?;  // -> Tag
+```
+
+### Declarative training phases
+
+Freeze and thaw entire subtrees by path — no manual parameter iteration:
+
+```rust
+// Phase 1: train only the classifier, encoder is frozen
+model.freeze("encoder")?;
+let fresh_params = model.parameters();  // only unfrozen params
+let mut opt = Adam::new(&fresh_params, 1e-3);
+// ... train ...
+
+// Phase 2: thaw scan, keep read frozen (it's proven)
+model.thaw("encoder.scan")?;
+let mut opt = Adam::with_groups()
+    .group(&model.parameters_at("encoder.scan")?, 1e-4)  // low LR
+    .group(&model.parameters_at("classifier")?, 1e-3)
+    .build();
+```
+
+### Subgraph checkpoints
+
+Train a component standalone, save it, load it into a larger model:
+
+```rust
+// Pre-trained encoder saved earlier
+encoder.save_checkpoint("encoder_v1.fdl.gz")?;
+
+// Load into the composed model — namespace + hash validated
+model.load_subgraph_checkpoint("encoder", "encoder_v1.fdl.gz")?;
+model.freeze("encoder.read")?;  // lock what's proven
+```
+
+### Cross-boundary observation
+
+Metrics flow up through the tree automatically:
+
+```rust
+model.record_at("encoder.scan.loss", scan_loss)?;
+model.record_at("encoder.read.accuracy", read_acc)?;
+model.record_scalar("total_loss", total)?;
+
+model.flush(&[]);  // single call flushes the entire tree
+
+// Trends across boundaries — drive training decisions
+if model.trend_at("encoder.scan.loss")?.stalled(10, 1e-4) {
+    model.thaw("encoder.read")?;  // scan stalled, unfreeze read
+}
+
+// Monitor sees all metrics with dotted names automatically
+monitor.log(epoch, elapsed, &model);
+// -> total_loss, encoder.scan.loss, encoder.read.accuracy
+```
+
+This is progressive model composition: each component is trained and
+validated independently before becoming a building block in a larger
+architecture. Checkpoints, metrics, and training phases compose just like
+the graphs themselves.
+
+See the full **[Graph Tree Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/10-graph-tree.md)**.
+
+## The Training Experience
+
+### Training Monitor
+
+Drop-in monitor with adaptive ETA, resource tracking, and a live web
+dashboard — no external dependencies, no separate process.
+
+```rust
+use flodl::monitor::Monitor;
+
+let mut monitor = Monitor::new(num_epochs);
+monitor.serve(3000)?;  // optional: live dashboard at http://localhost:3000
+
+for epoch in 0..num_epochs {
+    let t = std::time::Instant::now();
+    // ... training ...
+    monitor.log(epoch, t.elapsed(), &model);  // sees entire graph tree
+}
+monitor.finish();
+```
+
+```
+  epoch   1/100  loss=1.5264  [49ms  ETA 4.8s]
+  epoch  10/100  loss=0.3817  [25ms  ETA 2.2s]  VRAM: 2.1/6.0 GB (82%)
+  epoch  50/100  loss=0.0023  [24ms  ETA 1.2s]  VRAM: 2.1/6.0 GB (82%)
+  epoch 100/100  loss=0.0012  [23ms]             VRAM: 2.1/6.0 GB (82%)
+  training complete in 2.8s  | loss: 0.0012
+```
+
+<p align="center">
+  <a href="https://flodl.dev/benchmark">
+    <img src="https://raw.githubusercontent.com/fab2s/floDl/main/docs/dashboard.gif" alt="floDl live training dashboard — click for interactive version" width="800">
+  </a>
+</p>
+<p align="center"><em><a href="https://flodl.dev/benchmark">Interactive benchmark dashboard</a> — real data from a 100-epoch training run</em></p>
+
+The live dashboard updates via Server-Sent Events (no WebSocket, no npm),
+tracks CPU/GPU/RAM/VRAM, and supports late join — open it mid-training and
+all past epochs backfill instantly.
+
+```rust
+monitor.save_html("training_report.html");  // self-contained archive
+monitor.export_csv("training.csv")?;         // for external analysis
+```
+
+### Observation and Trend Queries
+
+Tags double as observation points. Collect metrics during training and use
+trend queries to make programmatic training decisions:
 
 ```rust
 for epoch in 0..num_epochs {
     for (input, target) in &batches {
         let pred = graph.forward(&input)?;
         graph.collect(&["hidden"])?;                 // from graph tag
-
-        let loss = mse_loss(&pred, &target)?;
         graph.record_scalar("loss", loss.item()?);   // external metric
     }
     graph.flush(&["hidden", "loss"]);
 
+    // Programmatic training control
     if graph.trend("loss").stalled(5, 1e-4) {
-        // decay learning rate
+        optimizer.set_lr(optimizer.lr() * 0.5);      // decay LR
+    }
+    if graph.trend("loss").converged(5, 1e-5) {
+        break;                                        // early stopping
     }
 }
 ```
 
 | Method | What it does |
 |--------|-------------|
-| `g.tagged(tag)` | Access a tagged node's output after forward |
-| `g.collect(tags)` / `g.flush(tags)` | Batch -> epoch metric collection |
-| `g.record_scalar(tag, value)` | Inject external metrics |
-| `g.trend(tag)` | Epoch-level trend: `slope`, `stalled`, `improving`, `converged` |
-| `g.trends(tags)` | Group trends: `all_improving`, `any_stalled`, `mean_slope` |
-| `g.end_step()` / `g.end_epoch()` | Training housekeeping |
+| `g.collect(tags)` / `g.flush(tags)` | Batch -> epoch metric aggregation |
+| `g.record_scalar(tag, value)` | Inject external metrics (loss, accuracy) |
+| `g.trend(tag).slope(n)` | OLS slope over last n epochs |
+| `g.trend(tag).stalled(n, tol)` | Is \|slope\| below tolerance? |
+| `g.trend(tag).improving(n)` | Is loss decreasing? |
+| `g.trend(tag).converged(n, tol)` | Is variance below tolerance? |
+| `g.trends(tags).all_improving(n)` | Group queries across branches |
 
 ### Visualization
 
 ```rust
-println!("{}", g.dot());                       // Graphviz DOT with parameter counts
-let svg = g.svg(Some("model.svg"))?;          // render to SVG
-
-// Timing-annotated: nodes colored green->yellow->red by execution time.
-g.enable_profiling();
-g.forward(&input)?;
-g.svg_with_profile(Some("profile.svg"))?;
-
-// Training curves as self-contained HTML.
-g.plot_html("training.html", &["loss", "head"])?;
-g.export_trends("metrics.csv", &["loss"])?;
+let svg = g.svg(Some("model.svg"))?;              // architecture diagram
+g.svg_with_profile(Some("profile.svg"))?;          // timing heatmap
+g.plot_html("training.html", &["loss", "head"])?;  // interactive curves
 ```
 
-### Numerical Verification
+See the **[Training Monitor Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/09-monitor.md)** and
+the **[Observation example](https://github.com/fab2s/floDl/tree/main/flodl/examples/observation/)**.
 
-Every differentiable path is verified against finite-difference gradients:
-- 62 autograd op-level checks (every op + compositions)
-- Module-level checks (every NN module, input + parameter gradients)
-- Exact optimizer step verifications (SGD, Adam, AdamW)
-- 420+ library tests, zero clippy warnings — all tests run on both CPU and CUDA
+## PyTorch Parity
 
-## Why Rust for Deep Learning?
+floDl covers the modules, losses, and optimizers you actually use:
 
-### The memory management problem
+| Category | Count | Highlights |
+|----------|------:|-----------|
+| **NN Modules** | 30+ | `Linear`, `Conv1d`/`2d`/`3d` + transpose, `GRU`/`LSTM`, `MultiheadAttention`, `Bilinear`, all norms (`Layer`/`RMS`/`Group`/`Batch`/`Instance`), all pooling, `Embedding`/`EmbeddingBag`, `PixelShuffle`, `Upsample`, `Unfold`/`Fold` |
+| **Activations** | 17 | `ReLU`, `LeakyReLU`, `ELU`, `GELU`, `SiLU`, `Mish`, `SELU`, `Softplus`, `Hardswish`, `PReLU`, `Softmax`, ... |
+| **Losses** | 15 | MSE, CrossEntropy, BCE, NLL, CTC, Focal, Triplet, KLDiv, SmoothL1, Cosine, Hinge, Margin, Poisson, ... |
+| **Optimizers** | 7 | `SGD`, `Adam`, `AdamW`, `RMSprop`, `Adagrad`, `RAdam`, `NAdam` — all with parameter groups |
+| **Schedulers** | 8 | Step, Cosine, Exponential, MultiStep, OneCycle, Cyclic, Warmup (composable), Plateau |
+| **Init** | 9 | Xavier, Kaiming, orthogonal, truncated normal, uniform, normal |
+| **Tensor Ops** | 100+ | Full arithmetic, trig, reductions, shape, indexing, comparisons, fused ops |
+| **Autograd** | 90+ | Differentiable backward for every op above |
 
-Python adds ~3-5 us of framework overhead to every GPU operation. For
-architectures built on many small sequential operations — recurrent steps,
-iterative refinement, multi-head attention — this overhead dominates.
+Fused Adam/AdamW on CUDA (single kernel for all parameters). Fused gradient
+clipping via foreach ops. Mixed precision with `AutocastGuard` + `GradScaler`.
+CUDA Graphs for replay-based training.
 
-Go solves the dispatch overhead with compiled binaries and goroutines, but
-Go's garbage collector cannot manage VRAM deterministically. GPU memory lives
-in libtorch's C++ allocator — invisible to Go's GC. An earlier Go
-implementation required a 5-phase memory management system: atomic refcounting,
-saved-tensor lifecycle, GC callbacks, VRAM budgets, and autograd Scope.
-Hundreds of lines of `runtime.KeepAlive`, `Retain()`/`Release()`, and
-pending-free queues.
-
-Rust's ownership model eliminates all of this. `Tensor` owns a C++ handle.
-`Drop` frees it immediately when it goes out of scope. No GC, no finalizers,
-no reference counting, no VRAM budget heuristics, no KeepAlive. Five phases
-of memory management infrastructure replaced by a single `impl Drop for Tensor`.
-
-### Zero-cost safety
-
-Rust's type system catches errors at compile time that other languages defer
-to runtime:
-
-- **Ownership**: tensors are freed exactly once, exactly when no longer needed
-- **Result types**: every fallible operation returns `Result<T>` — no silent
-  error propagation, no nil pointer panics
-- **No data races**: the borrow checker prevents concurrent mutation bugs
-
-### Same GPU kernels
-
-floDl binds libtorch — the same C++ library that powers PyTorch. The actual
-GPU math (CUDA kernels, cuBLAS, cuDNN) is identical. floDl replaces everything
-above: the dispatch path, autograd tracking, module composition, and graph
-execution.
+The [full migration guide](https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md) has side-by-side
+code for every op, module, and pattern.
 
 ## Performance
 
-floDl runs the same CUDA kernels as PyTorch — the performance difference comes
-from what happens *between* kernel launches: dispatch overhead, autograd
-bookkeeping, and memory management. Rust eliminates Python's per-op overhead
-and the GC pauses that plague Go.
-
-Seven models, ten interleaved rounds, locked GPU clocks, same architectures
-on both sides (RTX 5060 Ti, v0.1.3 vs PyTorch 2.6.0):
+Same CUDA kernels as PyTorch — the difference comes from what happens
+*between* kernel launches. Seven models, ten interleaved rounds, locked GPU
+clocks (RTX 5060 Ti, v0.1.3 vs PyTorch 2.6.0):
 
 | Model | PyTorch | flodl | Delta | Py σ | Rs σ |
 |---|---:|---:|---:|---:|---:|
@@ -482,21 +400,67 @@ on both sides (RTX 5060 Ti, v0.1.3 vs PyTorch 2.6.0):
 | iterative_refine | 208.7 ms | 186.7 ms | **-11%** | ±27.2 | ±5.6 |
 | feedback_fixed | 250.2 ms | 207.2 ms | **-17%** | ±27.3 | ±8.7 |
 
-flodl wins 6 of 7 on speed, with 3-20x tighter variance across every model.
-The convnet tie at +0% proves both frameworks dispatch identical CUDA kernels.
+Wins 6 of 7 on speed, 3-20x tighter variance across every model. The
+convnet tie proves both frameworks dispatch identical CUDA kernels — the
+gap comes from Rust eliminating Python's per-op dispatch overhead.
 
-Full methodology, raw data, and reproduction commands:
 **[Benchmark Report](https://github.com/fab2s/floDl/blob/main/docs/benchmark.md)** |
-[Interactive benchmark](https://flodl.dev/benchmark)
+[Interactive dashboard](https://flodl.dev/benchmark)
 
-### Build profiles
+## Why Rust for Deep Learning?
 
-Add this to your project's `Cargo.toml` to get optimized floDl with fast
-recompilation of your own code:
+**Deterministic memory.** Python adds ~3-5 us of framework overhead per GPU
+op. Go's GC can't manage VRAM — an [earlier Go implementation](https://github.com/fab2s/goDl)
+required 5 phases of lifecycle management (refcounting, GC callbacks, VRAM
+budgets, pending-free queues). Rust replaces all of that with
+`impl Drop for Tensor`. Memory is freed the instant a tensor leaves scope.
+
+**Zero-cost safety.** Every op returns `Result<T>` — no silent failures.
+Ownership ensures tensors are freed exactly once. The borrow checker
+prevents data races at compile time.
+
+**Same GPU kernels.** floDl binds libtorch — the C++ library under
+PyTorch. CUDA, cuBLAS, cuDNN are identical. floDl replaces the dispatch
+path, autograd tracking, and graph execution.
+
+## Features Reference
+
+<details>
+<summary><strong>Training Tools</strong></summary>
+
+| Tool | What it does |
+|------|-------------|
+| `clip_grad_norm` / `clip_grad_value` | Fused gradient clipping (2 kernels total via foreach ops) |
+| `save_checkpoint` / `load_checkpoint` | Named `.fdl` checkpoints, structural hash, partial loading, `LoadReport` |
+| `migrate_checkpoint` | Remap parameter names across versions |
+| `Parameter::freeze` / `unfreeze` | Per-parameter gradient control |
+| `GradScaler` | Dynamic loss scaling for fp16 training |
+| `cast_parameters` | Cast model parameters to any dtype |
+| `CpuWorker` / `ModelSnapshot` | Background checkpoint saving |
+| `CudaGraph` | Capture/replay training steps for fixed-shape models |
+
+</details>
+
+<details>
+<summary><strong>Module Traits</strong></summary>
+
+Beyond `forward`/`parameters`, `Module` provides optional methods the graph
+recognizes automatically:
+
+| Method | What happens |
+|--------|-------------|
+| `as_named_input()` | `using()` refs arrive as a named map |
+| `reset()` | Loops auto-call before iterating — clears per-forward state |
+| `detach_state()` | Break gradient chains on retained state |
+| `sub_modules()` | Recursive device placement, training mode, parameter collection |
+
+</details>
+
+<details>
+<summary><strong>Build Profiles</strong></summary>
 
 ```toml
 # Optimize floDl in dev builds — your code stays fast to compile.
-# After the first build, only your graph code recompiles.
 [profile.dev.package.flodl]
 opt-level = 3
 
@@ -514,25 +478,59 @@ codegen-units = 1
 | `cargo build` | `-O3` (cached) | `-O0` (fast) | < 2s |
 | `cargo build --release` | `-O3` + LTO | `-O3` + LTO | full link |
 
-The GPU kernels (cuBLAS, cuDNN) run at the same speed regardless of Rust
-optimization level — the profile settings affect graph dispatch, autograd
-bookkeeping, and module overhead.
+</details>
 
-## Hardware Compatibility
+### Numerical Verification
 
-floDl is developed and tested on NVIDIA GPUs from Pascal (GTX 1060 6GB) to
-Blackwell (RTX 5060 Ti 16GB). It works out of the box — no version pinning,
-no feature flags, no workarounds.
+Every differentiable path is verified against finite-difference gradients:
+- 117 autograd op-level checks (every op + compositions)
+- Module-level checks (every NN module, input + parameter gradients)
+- Exact optimizer step verifications (SGD, Adam, AdamW, RMSprop, Adagrad, RAdam, NAdam)
+- 769 library tests, zero clippy warnings — all tests run on both CPU and CUDA
 
-This matters because PyTorch dropped Pascal support after version 2.5.1.
-Training on older GPUs now requires pinning `torch==2.5.1` and hoping
-nothing in your dependency tree pulls a newer version. floDl sidesteps
-this entirely: it links against libtorch's stable C API, which continues
-to support every CUDA architecture that the driver supports.
+### Hardware Compatibility
 
-If your GPU runs `nvidia-smi`, floDl can train on it.
+Developed and tested from NVIDIA Pascal (GTX 1060 6GB) to Blackwell
+(RTX 5060 Ti 16GB). PyTorch dropped Pascal support after 2.5.1 — floDl
+links libtorch's stable C API, which supports every architecture the driver
+supports. If `nvidia-smi` works, floDl trains on it.
 
-## Architecture
+## Documentation
+
+### Choose your path
+
+| Background | Start here |
+|-----------|-----------|
+| **New to Rust** | [Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes |
+| **Know Rust, new to DL** | [Tensors](https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md) then [Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/04-training.md) |
+| **Know PyTorch** | [Migration Guide](https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md) then [Graph Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md) |
+| **Just show me code** | [`quickstart`](https://github.com/fab2s/floDl/tree/main/flodl/examples/quickstart/) or [`showcase`](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) |
+
+### Tutorials
+
+0. **[Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md)** — 10 Rust patterns in 15 minutes
+1. **[Tensors](https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md)** — creation, ops, memory, CUDA
+2. **[Autograd](https://github.com/fab2s/floDl/blob/main/docs/tutorials/02-autograd.md)** — variables, gradients, backward
+3. **[Modules](https://github.com/fab2s/floDl/blob/main/docs/tutorials/03-modules.md)** — all layers, convolutions, RNNs, attention, normalization
+4. **[Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/04-training.md)** — losses, optimizers, mixed precision, full loop
+5. **[Graph Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md)** — fluent API from simple to complex
+6. **[Advanced Graphs](https://github.com/fab2s/floDl/blob/main/docs/tutorials/06-advanced-graphs.md)** — forward refs, loops, gates, switches
+7. **[Visualization](https://github.com/fab2s/floDl/blob/main/docs/tutorials/07-visualization.md)** — DOT/SVG, profiling heatmaps
+8. **[Utilities](https://github.com/fab2s/floDl/blob/main/docs/tutorials/08-utilities.md)** — checkpoints, clipping, freezing, initialization, scheduling
+9. **[Training Monitor](https://github.com/fab2s/floDl/blob/main/docs/tutorials/09-monitor.md)** — ETA, resource tracking, live dashboard
+10. **[Graph Tree](https://github.com/fab2s/floDl/blob/main/docs/tutorials/10-graph-tree.md)** — hierarchical composition, freeze/thaw, subgraph checkpoints
+
+### Examples
+
+- [`quickstart`](https://github.com/fab2s/floDl/tree/main/flodl/examples/quickstart/) — build, train, and monitor a model with residual connections
+- [`sine_wave`](https://github.com/fab2s/floDl/tree/main/flodl/examples/sine_wave/) — sine regression with monitor, checkpoint round-trip
+- [`mixed_precision`](https://github.com/fab2s/floDl/tree/main/flodl/examples/mixed_precision/) — float16 training with `GradScaler`
+- [`transfer_learning`](https://github.com/fab2s/floDl/tree/main/flodl/examples/transfer_learning/) — checkpoint, partial load, freeze, fine-tune
+- [`schedulers`](https://github.com/fab2s/floDl/tree/main/flodl/examples/schedulers/) — warmup + cosine + plateau composition
+- [`observation`](https://github.com/fab2s/floDl/tree/main/flodl/examples/observation/) — collect, flush, trend queries, early stopping
+- [`showcase`](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) — every graph builder method in one graph
+
+### Architecture
 
 ```
 +-----------------------------------------------------------+
@@ -540,7 +538,7 @@ If your GPU runs `nvidia-smi`, floDl can train on it.
 +-----------------------------------------------------------+
 |  monitor/  ETA, resource tracking, live web dashboard     |
 +-----------------------------------------------------------+
-|  graph/    Fluent builder, execution, DOT/SVG             |
+|  graph/    Fluent builder, graph tree, execution, DOT/SVG |
 +-----------------------------------------------------------+
 |  nn/       Modules, losses, optimizers, checkpoints       |
 +-----------------------------------------------------------+
@@ -553,54 +551,6 @@ If your GPU runs `nvidia-smi`, floDl can train on it.
 |  libtorch / CUDA / CPU                                    |
 +-----------------------------------------------------------+
 ```
-
-floDl is developed and tested on **NVIDIA CUDA** (Pascal and newer) and
-**CPU**. Since floDl binds libtorch — not CUDA directly — additional backends
-(AMD ROCm, Apple MPS, Intel XPU) are architecturally possible but not yet
-exposed or tested. Contributions welcome — see [CONTRIBUTING.md](https://github.com/fab2s/floDl/blob/main/CONTRIBUTING.md).
-
-## Documentation
-
-### Choose your path
-
-| Background | Start here |
-|-----------|-----------|
-| **New to Rust** | [Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes |
-| **Know Rust, new to DL** | [Tensors](https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md) then [Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/04-training.md) |
-| **Know PyTorch** | [PyTorch Migration Guide](https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md) then [Graph Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md) |
-| **Just show me code** | [`quickstart`](https://github.com/fab2s/floDl/tree/main/flodl/examples/quickstart/) or [`showcase`](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) |
-
-### Tutorials
-
-Step-by-step guides from basics to advanced, each with code examples:
-
-0. **[Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md)** — 10 Rust patterns in 15 minutes (new to Rust? start here)
-1. **[Tensors](https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md)** — creation, ops, error handling, memory
-2. **[Autograd](https://github.com/fab2s/floDl/blob/main/docs/tutorials/02-autograd.md)** — variables, gradients, backward pass
-3. **[Modules](https://github.com/fab2s/floDl/blob/main/docs/tutorials/03-modules.md)** — Linear, Conv2d, normalization, RNN cells
-4. **[Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/04-training.md)** — losses, optimizers, full training loop
-5. **[Graph Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md)** — the fluent API from simple to complex
-6. **[Advanced Graphs](https://github.com/fab2s/floDl/blob/main/docs/tutorials/06-advanced-graphs.md)** — forward refs, loops, gates, switches
-7. **[Visualization](https://github.com/fab2s/floDl/blob/main/docs/tutorials/07-visualization.md)** — DOT/SVG output, reading diagrams
-8. **[Utilities](https://github.com/fab2s/floDl/blob/main/docs/tutorials/08-utilities.md)** — checkpoints, clipping, freezing, initialization
-9. **[Training Monitor](https://github.com/fab2s/floDl/blob/main/docs/tutorials/09-monitor.md)** — ETA, resource tracking, live web dashboard
-10. **[Graph Tree](https://github.com/fab2s/floDl/blob/main/docs/tutorials/10-graph-tree.md)** — hierarchical composition, freeze/thaw, subgraph checkpoints
-
-### Design
-
-- [Benchmark](https://github.com/fab2s/floDl/blob/main/docs/benchmark.md) — flodl vs PyTorch head-to-head with raw data
-- [Roadmap](https://github.com/fab2s/floDl/blob/main/docs/design/roadmap.md) — development plan and port status
-- [Trajectory Thesis](https://github.com/fab2s/floDl/blob/main/docs/design/trajectory-thesis.md) — geometric intuition behind the project
-
-### Examples
-
-- [`quickstart`](https://github.com/fab2s/floDl/tree/main/flodl/examples/quickstart/) — build, train, and monitor a model with residual connections
-- [`sine_wave`](https://github.com/fab2s/floDl/tree/main/flodl/examples/sine_wave/) — sine regression with monitor, checkpoint round-trip
-- [`mixed_precision`](https://github.com/fab2s/floDl/tree/main/flodl/examples/mixed_precision/) — float16 training with `GradScaler`
-- [`transfer_learning`](https://github.com/fab2s/floDl/tree/main/flodl/examples/transfer_learning/) — checkpoint, partial load, freeze, fine-tune
-- [`schedulers`](https://github.com/fab2s/floDl/tree/main/flodl/examples/schedulers/) — warmup + cosine + plateau composition
-- [`observation`](https://github.com/fab2s/floDl/tree/main/flodl/examples/observation/) — collect, flush, trend queries, early stopping
-- [`showcase`](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) — every graph builder method in one graph
 
 ## Story
 

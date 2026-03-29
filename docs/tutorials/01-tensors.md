@@ -74,17 +74,92 @@ a.mul_scalar(0.5)?  // multiply every element by a scalar
 a.add_scalar(1.0)?  // add a scalar to every element
 ```
 
-### Activations and Math
+### Activations
 
 ```rust
 t.relu()?           // max(0, x)
 t.sigmoid()?        // 1 / (1 + exp(-x))
-t.tanh()?           // hyperbolic tangent
-t.exp()?            // element-wise e^x
-t.log()?            // element-wise ln(x)
-t.sqrt()?           // element-wise square root
-t.neg()?            // element-wise negation
+t.tanh_op()?        // hyperbolic tangent
+t.gelu()?           // Gaussian Error Linear Unit
+t.silu()?           // x * sigmoid(x) (Swish)
+t.selu()?           // scaled ELU (self-normalizing)
+t.hardswish()?      // efficient Swish approximation
+t.hardsigmoid()?    // piecewise-linear sigmoid
+t.prelu(&weight)?   // parametric ReLU
 t.softmax(-1)?      // softmax along dimension
+t.log_softmax(-1)?  // log(softmax(x)) — numerically stable
+```
+
+### Math
+
+```rust
+t.exp()?            // e^x
+t.log()?            // ln(x)
+t.sqrt()?           // square root
+t.neg()?            // negation
+t.abs()?            // absolute value
+t.pow_scalar(2.0)?  // element-wise power
+t.clamp(-1.0, 1.0)? // clamp to range
+t.clamp_min(0.0)?   // clamp from below
+t.clamp_max(1.0)?   // clamp from above
+t.reciprocal()?     // 1/x
+t.sign()?           // sign (-1, 0, or 1)
+t.floor()?          // round down
+t.ceil()?           // round up
+t.round()?          // round to nearest
+t.trunc()?          // truncate toward zero
+t.frac()?           // fractional part
+```
+
+#### Trigonometry
+
+```rust
+t.sin()?            // sine
+t.cos()?            // cosine
+t.tan()?            // tangent
+t.asin()?           // arc sine
+t.acos()?           // arc cosine
+t.atan()?           // arc tangent
+```
+
+#### Numerically Stable
+
+```rust
+t.log1p()?          // ln(1 + x) — stable for small x
+t.expm1()?          // exp(x) - 1 — stable for small x
+t.log2()?           // log base 2
+t.log10()?          // log base 10
+t.erf()?            // Gauss error function
+t.erfc()?           // complementary error function (1 - erf)
+```
+
+#### Modular Arithmetic
+
+```rust
+t.fmod(3.0)?                // C-style remainder (scalar)
+t.fmod_tensor(&divisor)?    // C-style remainder (tensor)
+t.remainder(3.0)?           // Python-style modulo (scalar)
+t.remainder_tensor(&other)? // Python-style modulo (tensor)
+```
+
+#### Fused Operations
+
+```rust
+// self + mat1 @ mat2 * alpha + self * beta — single kernel
+t.addmm(&mat1, &mat2, 1.0, 1.0)?;
+
+// self + tensor1 * tensor2 * value — fused multiply-accumulate
+t.addcmul(&t1, &t2, 1.0)?;
+
+// self + tensor1 / tensor2 * value — fused divide-accumulate
+t.addcdiv(&t1, &t2, 1.0)?;
+
+// linear interpolation: self + (end - self) * weight
+t.lerp(&end, 0.5)?;
+t.lerp_tensor(&end, &weights)?;  // per-element weight
+
+// element-wise closeness check
+t.isclose(&other, 1e-5, 1e-8)?;
 ```
 
 ### Reductions
@@ -96,7 +171,18 @@ t.sum_dim(1, true)?           // reduce along dim, keep dimension
 t.mean_dim(1, true)?          // mean along dim
 t.max()?                      // scalar max
 t.min()?                      // scalar min
+t.max_dim(1, true)?           // max along dim, keep dimension
+t.min_dim(1, true)?           // min along dim, keep dimension
 t.argmax(-1)?                 // index of max along dim
+t.var()?                      // variance of all elements
+t.std()?                      // standard deviation
+t.var_dim(1, true)?           // variance along dim
+t.std_dim(1, true)?           // std along dim
+t.prod()?                     // product of all elements
+t.prod_dim(1, true)?          // product along dim
+t.cumsum(0)?                  // cumulative sum along dim
+t.logsumexp(1, true)?         // log(sum(exp(x))) — numerically stable
+t.norm()?                     // L2 norm of all elements
 ```
 
 ### Shape Manipulation
@@ -107,16 +193,63 @@ t.transpose(0, 1)?           // swap two dimensions
 t.flatten(0, -1)?            // flatten all dims
 t.squeeze(0)?                // remove dim of size 1
 t.unsqueeze(0)?              // add dim of size 1
+t.unsqueeze_many(&[0, 2])?   // add multiple dims at once
 t.permute(&[1, 0])?          // arbitrary axis reorder
+t.contiguous()?              // ensure contiguous memory layout
+t.movedim(0, 2)?             // move dimension to new position
+t.flip(&[0, 1])?            // reverse along dimensions
+t.roll(2, 0)?               // circular shift along dim
+t.diagonal(0, 0, 1)?        // extract diagonal
+t.tile(&[2, 3])?            // repeat by tiling
+t.triu(0)?                   // upper triangular
+t.tril(0)?                   // lower triangular
 ```
 
 ### Slicing and Joining
 
 ```rust
-t.narrow(0, 1, 2)?           // extract a contiguous slice along dim
-t.select(0, 1)?              // pick one index along dim, removing that dim
-a.cat(&b, 0)?                // concatenate two tensors along dim
-t.index_select(0, &indices)? // gather slices at given indices
+t.narrow(0, 1, 2)?                  // extract a contiguous slice along dim
+t.select(0, 1)?                     // pick one index along dim, removing that dim
+a.cat(&b, 0)?                       // concatenate two tensors along dim
+Tensor::cat_many(&[&a, &b, &c], 0)? // concatenate many tensors
+Tensor::stack(&[&a, &b], 0)?        // stack along new dim
+t.index_select(0, &indices)?        // gather slices at given indices
+t.split(2, 0)?                      // split into chunks of size 2 along dim
+t.chunk(3, 0)?                      // split into N equal chunks along dim
+t.unbind(0)?                        // remove a dim, returning Vec<Tensor>
+t.repeat(&[2, 3])?                  // repeat tensor along each dim
+t.pad(&[1, 1], 0.0)?               // constant-value padding
+t.pad_mode(&[1, 1], 1, 0.0)?       // mode: 0=constant, 1=reflect, 2=replicate, 3=circular
+t.batches(32)?                       // split into mini-batches along dim 0
+Tensor::meshgrid(&[&x, &y])?        // coordinate grids (ij indexing)
+```
+
+### Comparisons and Conditionals
+
+```rust
+let mask = x.gt(&threshold)?;        // element-wise >
+let mask = x.gt_scalar(0.0)?;        // compare with scalar
+let mask = x.lt_scalar(1.0)?;        // less than scalar
+let mask = x.ge_scalar(0.0)?;        // greater or equal
+let mask = x.le_scalar(1.0)?;        // less or equal
+let y = Tensor::where_cond(&mask, &a, &b)?;  // conditional select
+
+// Element-wise min/max of two tensors
+let z = a.maximum(&b)?;
+let z = a.minimum(&b)?;
+```
+
+### Similarity and Normalization
+
+```rust
+// Cosine similarity along a dimension
+let sim = a.cosine_similarity(&b, 1, 1e-8)?;
+
+// Lp normalization along a dimension
+let normed = t.normalize(2.0, 1)?;   // L2-normalize along dim 1
+
+// Masked fill — set elements where mask is true
+let y = t.masked_fill(&mask, 0.0)?;
 ```
 
 ## Extracting Data

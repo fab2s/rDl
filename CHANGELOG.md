@@ -5,6 +5,60 @@ All notable changes to floDl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-03-29
+
+### Added
+
+#### PyTorch Parity — Tensor Operations
+- **Math ops**: `log1p`, `expm1`, `log2`, `log10`, `tan`, `asin`, `acos`, `atan`, `erf`, `erfc`, `trunc`, `frac`, `fmod`, `fmod_tensor`, `remainder`, `remainder_tensor`, `lerp`, `lerp_tensor`, `isclose`, `addmm`, `addcmul`, `addcdiv`, `clamp_min`, `clamp_max`, `selu`, `hardswish`, `hardsigmoid`, `prelu`
+- **Reductions**: `prod`, `prod_dim`, `cumsum`, `logsumexp`
+- **Shape ops**: `flip`, `roll`, `diagonal`, `movedim`, `tile`, `split`, `unbind`, `contiguous`, `cat_many`, `unsqueeze_many`, `narrow_scatter`, `pad_mode` (constant/reflect/replicate/circular), `meshgrid`
+- **NN tensor ops**: `conv1d`, `conv_transpose1d`, `conv3d`, `conv_transpose3d`, `avg_pool2d`, `avg_pool1d`, `max_pool1d`, `adaptive_max_pool2d`, `instance_norm`, `group_norm`, `linear` (fused), `pixel_shuffle`, `pixel_unshuffle`, `bilinear`, `embedding_bag`, `interpolate` (nearest/bilinear/bicubic/trilinear), `im2col`, `col2im`, `bce_loss`, `nll_loss`, `ctc_loss`
+- **Comparison/similarity**: `maximum`, `minimum`, `atan2`, `masked_fill`, `normalize`, `cosine_similarity`
+
+#### PyTorch Parity — Autograd
+- **New differentiable ops**: `leaky_relu`, `elu`, `softplus`, `mish`, `selu`, `hardswish`, `hardsigmoid`, `prelu`, `clamp_min`, `clamp_max`, `log1p`, `expm1`, `log2`, `log10`, `atan2`, `maximum`, `minimum`, `masked_fill`, `normalize`, `cosine_similarity`, `prod`, `prod_dim`, `cumsum`, `logsumexp`, `unsqueeze_many`, `cat_many`, `stack`, `triu`, `tril`
+- **NN autograd ops**: `conv1d`, `conv_transpose1d`, `conv3d`, `conv_transpose3d`, `avg_pool2d`, `avg_pool1d`, `max_pool1d`, `adaptive_max_pool2d`, `instance_norm`, `group_norm`, `pixel_shuffle`, `pixel_unshuffle`, `bilinear`, `embedding_bag`, `im2col`, `col2im`
+
+#### PyTorch Parity — Modules
+- **Convolutions**: `Conv1d` (with `Conv1dBuilder`), `Conv3d` (with `Conv3dBuilder`), `ConvTranspose1d`, `ConvTranspose3d`
+- **Recurrent**: `GRU` (multi-layer sequence module), `LSTM` (multi-layer sequence module) — match `nn.GRU`/`nn.LSTM` interface with `forward_seq`, batch-first support
+- **Normalization**: `GroupNorm`, `InstanceNorm`, `RMSNorm`
+- **Pooling**: `AvgPool2d`, `MaxPool1d`, `AvgPool1d`, `AdaptiveMaxPool2d`, `PixelShuffle`, `PixelUnshuffle`, `Upsample`, `Unfold`, `Fold`
+- **Attention**: `MultiheadAttention` — self-attention and cross-attention with optional masking
+- **Bilinear**: `Bilinear` — bilinear transformation `y = x1^T A x2 + b`
+- **Activations**: `LeakyReLU`, `ELU`, `Softplus`, `Mish`, `SELU`, `Hardswish`, `Hardsigmoid`, `PReLU` (learnable), `Softmax`, `LogSoftmax`, `Flatten`
+- **Dropout**: `AlphaDropout` — maintains self-normalizing property for SELU networks
+- **Embedding**: `EmbeddingBag` — bag-of-embeddings with sum/mean/max aggregation
+- **Padding**: `ZeroPad2d`, `ReflectionPad2d` — symmetric and asymmetric padding modules
+
+#### PyTorch Parity — Losses
+- `bce_loss` (from probabilities), `nll_loss`, `ctc_loss`, `focal_loss` (class imbalance), `triplet_margin_loss`, `cosine_embedding_loss`, `hinge_embedding_loss`, `margin_ranking_loss`, `poisson_nll_loss`
+
+#### PyTorch Parity — Optimizers
+- `RMSprop` (with `RMSpropBuilder` for parameter groups)
+- `Adagrad` (with `AdagradBuilder` for parameter groups)
+- `RAdam` — Rectified Adam with variance-aware warmup
+- `NAdam` — Nesterov-accelerated Adam
+
+#### PyTorch Parity — LR Schedulers
+- `ExponentialLR` — exponential decay (`lr = base_lr * gamma^step`)
+- `MultiStepLR` — decay at specific milestones
+- `OneCycleLR` — super-convergence schedule (warmup + cosine decay)
+- `CyclicLR` — triangular wave between base and max LR (symmetric and asymmetric)
+
+#### PyTorch Parity — Initialization
+- `kaiming_uniform`, `kaiming_normal` now re-exported at crate root
+- New: `uniform`, `normal`, `orthogonal`, `trunc_normal`, `uniform_bias`
+
+#### Test Coverage (+165 tests, 769 total)
+- **Autograd gradient verification** (55 tests): finite-difference checks for every new differentiable op — `leaky_relu`, `elu`, `softplus`, `mish`, `selu`, `hardswish`, `hardsigmoid`, `prelu`, `clamp_min`/`clamp_max`, `log1p`, `expm1`, `log2`, `log10`, `maximum`, `minimum`, `masked_fill`, `cosine_similarity`, `normalize`, `prod`, `cumsum`, `logsumexp`, `tril`, `flatten`; fused NN op gradients for all conv variants (1d/2d/3d + transpose), all pooling variants, `layer_norm`, `group_norm`, `instance_norm`, `bilinear`, `embedding_bag`, `pixel_shuffle`/`unshuffle`, `im2col`/`col2im`, `grid_sample`, `gru_cell`, `lstm_cell`; Variable API coverage (`set_grad`, `set_requires_grad`, `is_leaf`, `numel`, `zero_grad_set_to_none`, `set_data`, `to_device`)
+- **Module forward/backward** (60+ tests): Conv1d (builder, groups, stride/padding, no-bias, gradient), Conv2d (builder, grouped, stride, no-bias, gradient), Conv3d, ConvTranspose1d/2d/3d (forward, gradient, stride, parameters), GroupNorm (batch-size-one, single-group, groups=channels, gradient), InstanceNorm (3D input, affine parameters, gradient), LayerNorm (3D, normalization, gradient), BatchNorm/BatchNorm2d (training, eval, running stats, rejects invalid dims, gradient), Bilinear (gradient, no-bias, rejects single input), Dropout (training, eval identity, p=0), ZeroPad2d/ReflectionPad2d (asymmetric, values, no-parameters)
+- **Loss functions** (20+ tests): MSE (basic, zero loss), cross-entropy (class indices, wrong predictions, gradient), BCE/BCEWithLogits (gradient), L1, SmoothL1 (negative beta rejection), KLDiv, CTC, focal (reduces to CE at gamma=0), triplet margin (zero when far), cosine embedding (similar/dissimilar), hinge embedding (positive/negative), margin ranking (with margin), Poisson NLL (log/no-log)
+- **Mixed precision** (7 tests): AutocastGuard lifecycle, autocast closure, GradScaler (defaults, scale, step finite/inf, update growth/backoff, state roundtrip), cast_parameters (basic, noop same dtype)
+- **Gradient clipping** (6 tests): clip_grad_norm (scales down, no-op when small, multiple params), clip_grad_value (clamps, no-op, no-grad params)
+- **Graph observation** (8 tests): collect/flush/trend pipeline, reduction modes (mean, sum, min, max, norm, scalar passthrough), rejects non-scalar, map operations (over tag, slices, batched, gradient, error cases)
+
 ## [0.2.0] - 2026-03-29
 
 ### Added
