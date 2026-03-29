@@ -73,79 +73,35 @@ impl LSTM {
         input: &Variable,
         state_0: Option<(&Variable, &Variable)>,
     ) -> Result<(Variable, (Variable, Variable))> {
-        // Normalize to [seq_len, batch, features]
-        let x = if self.batch_first {
-            input.transpose(0, 1)?
-        } else {
-            input.clone()
-        };
-
-        let seq_len = x.shape()[0];
-        let batch = x.shape()[1];
+        let shape = input.shape();
+        let batch = if self.batch_first { shape[0] } else { shape[1] };
+        let nl = self.num_layers as i64;
         let hs = self.hidden_size;
         let opts = TensorOptions {
             dtype: DType::Float32,
             device: self.cells[0].parameters()[0].variable.device(),
         };
 
-        // Initialize hidden and cell states per layer
-        let (mut h, mut c): (Vec<Variable>, Vec<Variable>) = if let Some((h0, c0)) = state_0 {
-            let h_vec = (0..self.num_layers)
-                .map(|l| h0.select(0, l as i64))
-                .collect::<Result<Vec<_>>>()?;
-            let c_vec = (0..self.num_layers)
-                .map(|l| c0.select(0, l as i64))
-                .collect::<Result<Vec<_>>>()?;
-            (h_vec, c_vec)
-        } else {
-            let h_vec = (0..self.num_layers)
-                .map(|_| {
-                    Ok(Variable::new(
-                        Tensor::zeros(&[batch, hs], opts)?,
-                        false,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let c_vec = (0..self.num_layers)
-                .map(|_| {
-                    Ok(Variable::new(
-                        Tensor::zeros(&[batch, hs], opts)?,
-                        false,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (h_vec, c_vec)
+        // Initial states (zeros if not provided)
+        let (h_0, c_0) = match state_0 {
+            Some((h, c)) => (h.data(), c.data()),
+            None => (
+                Tensor::zeros(&[nl, batch, hs], opts)?,
+                Tensor::zeros(&[nl, batch, hs], opts)?,
+            ),
         };
 
-        // Run through timesteps and layers
-        let mut outputs = Vec::with_capacity(seq_len as usize);
-        for t in 0..seq_len {
-            let mut layer_input = x.select(0, t)?;
-            for (l, cell) in self.cells.iter().enumerate() {
-                // Pack state for LSTMCell: cat(h, c, dim=1)
-                let state = h[l].cat(&c[l], 1)?;
-                let new_state = cell.forward_step(&layer_input, Some(&state))?;
-                // Unpack: h = state[:, :hs], c = state[:, hs:]
-                h[l] = new_state.narrow(1, 0, hs)?;
-                c[l] = new_state.narrow(1, hs, hs)?;
-                layer_input = h[l].clone();
-            }
-            outputs.push(layer_input);
-        }
+        // Collect all weight tensors in order: [w_ih, w_hh, b_ih, b_hh] per layer
+        let params: Vec<Tensor> = self.cells.iter()
+            .flat_map(|cell| cell.parameters().into_iter().map(|p| p.variable.data()))
+            .collect();
 
-        // Stack outputs: [seq_len, batch, hidden_size]
-        let output = Variable::stack(&outputs, 0)?;
-        let output = if self.batch_first {
-            output.transpose(0, 1)?
-        } else {
-            output
-        };
+        // Fused at::lstm — single cuDNN kernel call for the full sequence
+        let (output, h_n, c_n) = input.data().lstm_seq(
+            &h_0, &c_0, &params, nl, self.batch_first,
+        )?;
 
-        // Stack final hidden/cell states: [num_layers, batch, hidden_size]
-        let h_n = Variable::stack(&h, 0)?;
-        let c_n = Variable::stack(&c, 0)?;
-
-        Ok((output, (h_n, c_n)))
+        Ok((Variable::wrap(output), (Variable::wrap(h_n), Variable::wrap(c_n))))
     }
 }
 

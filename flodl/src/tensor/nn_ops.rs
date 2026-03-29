@@ -182,6 +182,53 @@ impl Tensor {
         Ok((Tensor::from_raw(h_out), Tensor::from_raw(c_out)))
     }
 
+    /// Fused LSTM sequence: processes all timesteps in a single cuDNN kernel call.
+    ///
+    /// `params` must be the flat weight list: `[w_ih, w_hh, b_ih, b_hh]` per layer.
+    /// Returns `(output, h_n, c_n)`.
+    pub fn lstm_seq(
+        &self, h_0: &Tensor, c_0: &Tensor,
+        params: &[Tensor], num_layers: i64, batch_first: bool,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let handles: Vec<FlodlTensor> = params.iter().map(|t| t.handle).collect();
+        let mut output: FlodlTensor = ptr::null_mut();
+        let mut h_n: FlodlTensor = ptr::null_mut();
+        let mut c_n: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_lstm(
+                self.handle, h_0.handle, c_0.handle,
+                handles.as_ptr(), handles.len() as i64,
+                num_layers, batch_first,
+                &mut output, &mut h_n, &mut c_n,
+            )
+        };
+        check_err(err)?;
+        Ok((Tensor::from_raw(output), Tensor::from_raw(h_n), Tensor::from_raw(c_n)))
+    }
+
+    /// Fused GRU sequence: processes all timesteps in a single cuDNN kernel call.
+    ///
+    /// `params` must be the flat weight list: `[w_ih, w_hh, b_ih, b_hh]` per layer.
+    /// Returns `(output, h_n)`.
+    pub fn gru_seq(
+        &self, h_0: &Tensor,
+        params: &[Tensor], num_layers: i64, batch_first: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let handles: Vec<FlodlTensor> = params.iter().map(|t| t.handle).collect();
+        let mut output: FlodlTensor = ptr::null_mut();
+        let mut h_n: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_gru(
+                self.handle, h_0.handle,
+                handles.as_ptr(), handles.len() as i64,
+                num_layers, batch_first,
+                &mut output, &mut h_n,
+            )
+        };
+        check_err(err)?;
+        Ok((Tensor::from_raw(output), Tensor::from_raw(h_n)))
+    }
+
     /// Max pooling over a 2D input (`[B, C, H, W]`).
     ///
     /// Equivalent to `torch.nn.functional.max_pool2d`.

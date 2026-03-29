@@ -452,6 +452,16 @@ char* flodl_lstm_cell(FlodlTensor input, FlodlTensor hx, FlodlTensor cx,
                      FlodlTensor b_ih, FlodlTensor b_hh,
                      FlodlTensor* h_out, FlodlTensor* c_out);
 
+// Fused sequence ops (cuDNN-accelerated full-sequence LSTM/GRU)
+char* flodl_lstm(FlodlTensor input, FlodlTensor h_0, FlodlTensor c_0,
+                 const FlodlTensor* params, int64_t num_params,
+                 int64_t num_layers, bool batch_first,
+                 FlodlTensor* output, FlodlTensor* h_n, FlodlTensor* c_n);
+char* flodl_gru(FlodlTensor input, FlodlTensor h_0,
+                const FlodlTensor* params, int64_t num_params,
+                int64_t num_layers, bool batch_first,
+                FlodlTensor* output, FlodlTensor* h_n);
+
 // --- Device ---
 
 char* flodl_to_device(FlodlTensor t, int device_type, int device_index,

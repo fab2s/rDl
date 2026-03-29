@@ -61,14 +61,17 @@ instead of ±25ms, your effective throughput scales better.
 
 ### Tier 1 — Standard architectures
 
-These models use only basic nn modules (Linear, Conv2d, GRUCell, activations,
-normalization). Both sides use identical PyTorch-equivalent code.
+These models use standard nn modules (Linear, Conv2d, LSTM, GRU, MultiheadAttention,
+ConvTranspose2d, activations, normalization). Both sides use identical PyTorch-equivalent code.
 
 | Model | Architecture | Params | Batch | What it tests |
 |---|---|---:|---:|---|
 | **mlp** | 5-layer Linear+GELU+LayerNorm (1024→2048→1024) | 16.8M | 256 | Raw matmul + activation throughput |
 | **convnet** | 4-layer Conv2d+BN+MaxPool → classifier head | 4.0M | 128 | Convolution pipeline, cuDNN dispatch |
-| **gru_seq** | 50-step unrolled GRU → linear projection | 1.3M | 128 | Sequential RNN dispatch overhead |
+| **gru_seq** | 50-step GRU → linear projection | 1.3M | 128 | Fused RNN sequence throughput |
+| **transformer** | 4-layer encoder (MHA+FFN+LayerNorm+residual) | ~25M | 32 | Attention throughput, cross-entropy loss |
+| **lstm_seq** | 2-layer LSTM → linear projection | ~2.5M | 128 | Fused LSTM throughput (comparable to gru_seq) |
+| **conv_autoenc** | Conv2d encoder + ConvTranspose2d decoder | ~3.5M | 64 | Transposed convolution, image reconstruction |
 
 ### Tier 2 — Graph builder architectures
 

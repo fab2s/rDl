@@ -3045,6 +3045,53 @@ extern "C" char* flodl_lstm_cell(FlodlTensor input, FlodlTensor hx,
     }
 }
 
+// --- Fused sequence ops (cuDNN-accelerated) ---
+
+extern "C" char* flodl_lstm(FlodlTensor input, FlodlTensor h_0, FlodlTensor c_0,
+                             const FlodlTensor* params, int64_t num_params,
+                             int64_t num_layers, bool batch_first,
+                             FlodlTensor* output, FlodlTensor* h_n, FlodlTensor* c_n) {
+    try {
+        std::vector<at::Tensor> params_vec;
+        params_vec.reserve(num_params);
+        for (int64_t i = 0; i < num_params; i++) {
+            params_vec.push_back(unwrap(params[i]));
+        }
+        auto result = at::lstm(
+            unwrap(input), {unwrap(h_0), unwrap(c_0)}, params_vec,
+            /*has_biases=*/true, num_layers, /*dropout=*/0.0,
+            /*train=*/true, /*bidirectional=*/false, batch_first);
+        *output = wrap(std::get<0>(result));
+        *h_n = wrap(std::get<1>(result));
+        *c_n = wrap(std::get<2>(result));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_gru(FlodlTensor input, FlodlTensor h_0,
+                            const FlodlTensor* params, int64_t num_params,
+                            int64_t num_layers, bool batch_first,
+                            FlodlTensor* output, FlodlTensor* h_n) {
+    try {
+        std::vector<at::Tensor> params_vec;
+        params_vec.reserve(num_params);
+        for (int64_t i = 0; i < num_params; i++) {
+            params_vec.push_back(unwrap(params[i]));
+        }
+        auto result = at::gru(
+            unwrap(input), unwrap(h_0), params_vec,
+            /*has_biases=*/true, num_layers, /*dropout=*/0.0,
+            /*train=*/true, /*bidirectional=*/false, batch_first);
+        *output = wrap(std::get<0>(result));
+        *h_n = wrap(std::get<1>(result));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
 // --- cuDNN benchmark ---
 
 extern "C" void flodl_set_cudnn_benchmark(int enable) {

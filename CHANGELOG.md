@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 - `Tensor::nbytes()` — total size in bytes (`numel() * element_size()`), matches `torch.Tensor.nbytes`
 
+#### Fused sequence RNN kernels
+- **`LSTM::forward_seq`** now calls `at::lstm()` — single cuDNN kernel for the entire sequence across all layers, replacing per-timestep cell unrolling. Eliminates N×L kernel launches (N=timesteps, L=layers) per forward pass.
+- **`GRU::forward_seq`** now calls `at::gru()` — same fused optimization. Also eliminates the cuDNN benchmark variance that caused ±270ms σ in per-cell dispatch.
+- FFI chain: `flodl_lstm` / `flodl_gru` in shim → `Tensor::lstm_seq` / `Tensor::gru_seq` in nn_ops
+- `LSTMCell::forward_step` and `GRUCell::forward_step` unchanged — still available for single-step / streaming use cases
+
+#### Benchmark suite extensions
+- **`transformer`** benchmark — 4-layer encoder (MultiheadAttention + FFN + LayerNorm + residual), Embedding, cross-entropy loss. B=32, seq=128, d_model=512, 8 heads.
+- **`lstm_seq`** benchmark — 2-layer LSTM + linear projection, directly comparable to gru_seq. B=128, seq=50.
+- **`conv_autoenc`** benchmark — Conv2d encoder + ConvTranspose2d decoder (DCGAN-style), reconstruction with MSE loss. B=64, 64×64 images.
+
 ## [0.2.1] - 2026-03-29
 
 ### Added

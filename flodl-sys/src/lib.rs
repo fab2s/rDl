@@ -913,6 +913,21 @@ unsafe extern "C" {
         h_out: *mut FlodlTensor, c_out: *mut FlodlTensor,
     ) -> *mut i8;
 
+    // Fused sequence ops (cuDNN-accelerated)
+    pub fn flodl_lstm(
+        input: FlodlTensor, h_0: FlodlTensor, c_0: FlodlTensor,
+        params: *const FlodlTensor, num_params: i64,
+        num_layers: i64, batch_first: bool,
+        output: *mut FlodlTensor, h_n: *mut FlodlTensor, c_n: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    pub fn flodl_gru(
+        input: FlodlTensor, h_0: FlodlTensor,
+        params: *const FlodlTensor, num_params: i64,
+        num_layers: i64, batch_first: bool,
+        output: *mut FlodlTensor, h_n: *mut FlodlTensor,
+    ) -> *mut i8;
+
     // --- cuDNN benchmark ---
 
     pub fn flodl_set_cudnn_benchmark(enable: i32);
