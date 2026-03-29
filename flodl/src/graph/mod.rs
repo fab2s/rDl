@@ -490,24 +490,29 @@ impl Graph {
                 let inputs: Vec<Variable> = (0..input_count)
                     .map(|i| {
                         match slots[ni][i].as_ref() {
-                            Some(v) => v.clone(),
+                            Some(v) => Ok(v.clone()),
                             None if i > 0 => {
                                 // Zero fill for unconnected ref ports (forward refs)
-                                let first = slots[ni][0]
-                                    .as_ref()
-                                    .expect("missing primary input");
-                                Variable::new(
-                                    Tensor::zeros_like(&first.data()).unwrap(),
+                                let first = slots[ni][0].as_ref().ok_or_else(|| {
+                                    TensorError::new(&format!(
+                                        "node '{}': ref port {} has no data and primary input \
+                                         is also missing — check that all inputs are connected",
+                                        node.id, i
+                                    ))
+                                })?;
+                                Ok(Variable::new(
+                                    Tensor::zeros_like(&first.data())?,
                                     false,
-                                )
+                                ))
                             }
-                            _ => panic!(
-                                "missing input port {} for node '{}'",
-                                i, node.id
-                            ),
+                            _ => Err(TensorError::new(&format!(
+                                "node '{}': missing primary input (port {}) — check that all \
+                                 inputs to this node are connected in the graph builder",
+                                node.id, i
+                            ))),
                         }
                     })
-                    .collect();
+                    .collect::<Result<Vec<Variable>>>()?;
 
                 // Release input slots early (frees Rc references)
                 for slot in slots[ni].iter_mut() {

@@ -191,14 +191,20 @@ for epoch in 0..num_epochs {
 `record` pushes raw `f64` values into the same buffer. `flush` computes
 the mean, stores it in epoch history, and clears the buffer.
 
-## Stateful Graphs — detach_state
+## Stateful Graphs — end_step
 
-Call `detach_state()` between training steps to sever autograd references
-held by the graph. It detaches:
+Call `end_step()` after each training step. It severs autograd references
+held by the graph and increments the step counter (used by schedulers and
+observation). It detaches:
 
 - **Forward-reference state buffers** (recurrent state carried between calls)
 - **Tagged outputs** (Variables captured by `tag()` for observation)
 - **Module internal state** (e.g., recurrent hidden state in custom modules)
+
+> **Warning:** Forgetting `end_step()` causes linear memory growth — the
+> autograd graph accumulates across batches without bound. If you see
+> steadily rising RAM during training, a missing `end_step()` is the most
+> likely cause.
 
 ```rust
 model.train();
@@ -213,16 +219,20 @@ for (input_t, target_t) in &batches {
     optimizer.zero_grad();
     loss.backward()?;
     clip_grad_norm(&params, 1.0)?;
-
-    model.detach_state();  // break gradient chains on state buffers + tagged outputs
     optimizer.step()?;
+
+    model.end_step();  // break gradient chains + increment step counter
 }
 ```
 
 **When is it needed?** For any graph with forward references (`using("x")`
 before `tag("x")`) it is mandatory. For graphs that use `tag()` for
 observation, it prevents tagged output Variables from holding stale
-autograd graph references between batches.
+autograd graph references between batches. Even for simple graphs, it is
+good practice — it keeps the step counter accurate and costs nothing.
+
+The lower-level `detach_state()` is available if you need to break gradient
+chains without incrementing the step counter.
 
 ## Parameter Groups
 
@@ -456,11 +466,13 @@ no_grad(|| {
 
 ## Training Housekeeping
 
-The graph tracks step and epoch counts for schedulers and observation:
+The graph tracks step and epoch counts for schedulers and observation.
+`end_step()` should be called after every training step (it detaches state
+and increments the counter — see above). `end_epoch()` closes out the epoch:
 
 ```rust
-model.end_step();   // increment step counter
-model.end_epoch();  // increment epoch counter, reset step
+model.end_step();   // detach state + increment step counter (call every batch)
+model.end_epoch();  // increment epoch counter, reset step count
 ```
 
 ## Reproducibility
