@@ -44,16 +44,19 @@ let y = x.mul(&w)?.sum()?;
 // The graph now records: Sum <- Mul <- (x, w)
 ```
 
-The full set of differentiable operations includes: `add`, `sub`, `mul`,
-`div`, `matmul`, `relu`, `sigmoid`, `tanh`, `gelu`, `silu`, `exp`,
-`log`, `neg`, `sqrt`, `abs`, `pow_scalar`, `sin`, `cos`, `sign`, `floor`,
-`ceil`, `round`, `reciprocal`, `clamp`, `sum`, `sum_dim`, `mean`, `mean_dim`,
-`min`, `max`, `min_dim`, `max_dim`, `var`, `std`, `var_dim`, `std_dim`, `mul_scalar`, `add_scalar`, `div_scalar`,
-`softmax`, `log_softmax`, `transpose`, `permute`, `reshape`, `flatten`,
-`squeeze`, `unsqueeze`, `expand`, `narrow`, `select`, `cat`, `chunk`,
-`repeat`, `pad`, `index_select`, `gather`, `topk`, `sort`,
-`conv2d`, `conv_transpose2d`, `max_pool2d`, `adaptive_avg_pool2d`, `grid_sample`,
-`layer_norm`, and more.
+The full set of differentiable operations includes:
+
+**Arithmetic:** `add`, `sub`, `mul`, `div`, `matmul`, `mul_scalar`, `add_scalar`, `div_scalar`, `neg`
+
+**Activations:** `relu`, `sigmoid`, `tanh`, `gelu`, `silu`, `leaky_relu`, `elu`, `softplus`, `mish`, `selu`, `hardswish`, `hardsigmoid`, `prelu`, `softmax`, `log_softmax`
+
+**Math:** `exp`, `log`, `sqrt`, `abs`, `pow_scalar`, `sin`, `cos`, `sign`, `floor`, `ceil`, `round`, `reciprocal`, `clamp`, `clamp_min`, `clamp_max`, `log1p`, `expm1`, `log2`, `log10`, `atan2`, `maximum`, `minimum`, `masked_fill`, `normalize`, `cosine_similarity`, `triu`, `tril`
+
+**Reductions:** `sum`, `sum_dim`, `mean`, `mean_dim`, `min`, `max`, `min_dim`, `max_dim`, `var`, `std`, `var_dim`, `std_dim`, `prod`, `prod_dim`, `cumsum`, `logsumexp`
+
+**Shape:** `transpose`, `permute`, `reshape`, `flatten`, `squeeze`, `unsqueeze`, `unsqueeze_many`, `expand`, `narrow`, `select`, `cat`, `cat_many`, `stack`, `chunk`, `repeat`, `pad`, `index_select`, `gather`, `topk`, `sort`
+
+**NN ops:** `conv1d`, `conv_transpose1d`, `conv2d`, `conv_transpose2d`, `conv3d`, `conv_transpose3d`, `max_pool2d`, `avg_pool2d`, `max_pool1d`, `avg_pool1d`, `adaptive_avg_pool2d`, `adaptive_max_pool2d`, `instance_norm`, `group_norm`, `layer_norm`, `grid_sample`, `pixel_shuffle`, `pixel_unshuffle`, `bilinear`, `embedding_bag`, `im2col`, `col2im`
 
 ## Backward Pass: Computing Gradients
 

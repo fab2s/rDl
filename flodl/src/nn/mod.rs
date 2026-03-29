@@ -6,11 +6,11 @@
 //!
 //! # Features
 //!
-//! - **Layers**: Linear, Conv1d, Conv2d, ConvTranspose1d, ConvTranspose2d, LayerNorm, GroupNorm, BatchNorm, Dropout, Embedding, EmbeddingBag, GRUCell, GRU, LSTMCell, LSTM, MaxPool2d
-//! - **Activations**: ReLU, Sigmoid, Tanh, GELU, SiLU (zero-sized types), GaussianBlur (fixed-sigma preprocessing)
-//! - **Losses**: MSE, CrossEntropy, BCE, L1, SmoothL1, KLDiv
-//! - **Optimizers**: SGD (momentum), Adam, AdamW, RMSprop -- fused Adam/AdamW uses `_fused_adamw_` on CUDA for single-kernel multi-tensor updates
-//! - **Schedulers**: StepDecay, Cosine, Warmup, Plateau, ExponentialLR, MultiStepLR, OneCycleLR
+//! - **Layers**: Linear, Conv1d/Conv2d/Conv3d, ConvTranspose1d/2d/3d, MaxPool1d/2d, AvgPool1d/2d, AdaptiveMaxPool2d, PixelShuffle/Unshuffle, Upsample, Unfold/Fold, LayerNorm, RMSNorm, GroupNorm, BatchNorm/BatchNorm2d, InstanceNorm, Dropout/Dropout2d/AlphaDropout, Embedding/EmbeddingBag, GRUCell, GRU, LSTMCell, LSTM, MultiheadAttention, Bilinear, ZeroPad2d, ReflectionPad2d
+//! - **Activations**: Identity, ReLU, LeakyReLU, ELU, Sigmoid, Tanh, GELU, SiLU, Softplus, Mish, SELU, Hardswish, Hardsigmoid, PReLU, Softmax, LogSoftmax, Flatten, GaussianBlur
+//! - **Losses**: MSE, CrossEntropy, BCE, BCEWithLogits, L1, SmoothL1, KLDiv, NLL, CTC, Focal, TripletMargin, CosineEmbedding, HingeEmbedding, MarginRanking, PoissonNLL
+//! - **Optimizers**: SGD (momentum), Adam, AdamW, RMSprop, Adagrad, RAdam, NAdam -- fused Adam/AdamW uses `_fused_adamw_` on CUDA for single-kernel multi-tensor updates
+//! - **Schedulers**: StepDecay, Cosine, Warmup, Plateau, ExponentialLR, MultiStepLR, OneCycleLR, CyclicLR
 //! - **Gradient clipping**: `clip_grad_norm` / `clip_grad_value` -- fused clipping via foreach ops (2 kernels instead of 2N)
 //! - **Mixed precision**: [`AutocastGuard`] / [`autocast`] for automatic dtype casting, [`GradScaler`] for loss scaling, [`cast_parameters`] for dtype conversion
 //! - **CUDA Graphs**: [`CudaGraph`] capture/replay/reset via [`cuda_graph_capture`], memory pool handles, configurable capture modes

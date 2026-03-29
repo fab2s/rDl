@@ -175,15 +175,19 @@ override this when needed.
 
 ### Built-in initializers
 
+All initializers are available at the crate root (`use flodl::*`).
+
 | Function | Distribution | Best for |
 |----------|-------------|----------|
-| `kaiming_uniform(shape, fan_in, a, device)` | U(-bound, bound) | ReLU activations |
+| `kaiming_uniform(shape, fan_in, a, device)` | U(-bound, bound) | ReLU activations (default for Linear) |
 | `kaiming_normal(shape, fan_in, a, device)` | N(0, std) | ReLU activations |
 | `xavier_uniform(shape, fan_in, fan_out, device)` | U(-bound, bound) | Sigmoid / Tanh |
 | `xavier_normal(shape, fan_in, fan_out, device)` | N(0, std) | Sigmoid / Tanh |
-
-Note: `kaiming_uniform` and `kaiming_normal` are available in the `nn::init` module
-but are not re-exported at the crate root. Use `flodl::nn::init::kaiming_uniform(...)`.
+| `uniform(shape, low, high, device)` | U(low, high) | General purpose |
+| `normal(shape, mean, std, device)` | N(mean, std) | General purpose |
+| `orthogonal(shape, gain, device)` | Orthogonal (Gram-Schmidt) | RNNs, preserves gradient norms |
+| `trunc_normal(shape, mean, std, a, b, device)` | Truncated normal | Vision Transformers (ViT) |
+| `uniform_bias(fan_in, shape, device)` | U(-1/sqrt(fan_in), 1/sqrt(fan_in)) | Bias terms |
 
 ### Custom initialization
 
@@ -253,7 +257,8 @@ fn main() -> Result<()> {
 
 ## LR Scheduling
 
-Schedulers are pure LR calculators, decoupled from the optimizer:
+Schedulers are pure LR calculators, decoupled from the optimizer. You call
+`.lr(step)` and set the optimizer's LR yourself — no hidden optimizer coupling.
 
 ```rust
 use flodl::*;
@@ -264,11 +269,25 @@ let scheduler = StepDecay::new(0.01, 30, 0.1);  // base_lr, step_size, gamma
 // Cosine annealing
 let scheduler = CosineScheduler::new(0.001, 1e-6, 100);  // base_lr, min_lr, total_steps
 
+// Exponential decay: lr = base_lr * gamma^step
+let scheduler = ExponentialLR::new(0.001, 0.95);  // base_lr, gamma
+
+// Multi-step decay: drop lr at specific milestones
+let scheduler = MultiStepLR::new(0.001, &[30, 60, 90], 0.1);  // base_lr, milestones, gamma
+
+// One-cycle: warmup then cosine decay (super-convergence)
+let scheduler = OneCycleLR::new(0.01, 1000);  // max_lr, total_steps (30% warmup)
+let scheduler = OneCycleLR::with_warmup_frac(0.01, 1000, 0.2);  // custom warmup fraction
+
+// Cyclic LR: triangle wave between base and max
+let scheduler = CyclicLR::new(1e-4, 1e-2, 500);  // base_lr, max_lr, step_size (symmetric)
+let scheduler = CyclicLR::asymmetric(1e-4, 1e-2, 400, 600);  // different up/down phases
+
 // Warmup wrapper (composes with any scheduler)
 let inner = CosineScheduler::new(0.001, 1e-6, 100);
 let scheduler = WarmupScheduler::new(inner, 0.001, 10);  // inner, target_lr, warmup_steps
 
-// Reduce on plateau
+// Reduce on plateau (reactive, driven by metrics)
 let mut scheduler = PlateauScheduler::new(0.001, 5, 0.1, 1e-6);  // base_lr, patience, factor, min_lr
 ```
 

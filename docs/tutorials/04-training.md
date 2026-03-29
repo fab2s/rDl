@@ -6,31 +6,62 @@ clipping, mixed precision training, and the training loop. It builds on
 
 ## Loss Functions
 
+All loss functions are free functions returning a scalar `Variable` ready
+for `backward()`.
+
+### Regression Losses
+
 ```rust
 use flodl::*;
 
-// Mean Squared Error: mean((pred - target)^2)
-let loss = mse_loss(&pred, &target)?;
+let loss = mse_loss(&pred, &target)?;              // Mean Squared Error
+let loss = l1_loss(&pred, &target)?;               // Mean Absolute Error
+let loss = smooth_l1_loss(&pred, &target, 1.0)?;   // Huber loss (beta=1.0)
+let loss = poisson_nll_loss(&pred, &target, true)?; // Poisson NLL (log_input=true)
+```
 
-// Cross-Entropy from raw logits (not probabilities).
+### Classification Losses
+
+```rust
+// Cross-Entropy from raw logits.
 // pred: [batch, classes] logits.
 // target: [batch] class indices (Int64) or [batch, classes] one-hot/soft labels.
 let loss = cross_entropy_loss(&logits, &target)?;
 
-// Binary Cross-Entropy with logits
-let loss = bce_with_logits_loss(&pred, &target)?;
+// Negative Log Likelihood — use after log_softmax
+let loss = nll_loss(&log_probs, &target)?;
 
-// L1 Loss (Mean Absolute Error)
-let loss = l1_loss(&pred, &target)?;
+// Binary Cross-Entropy (from probabilities, after sigmoid)
+let loss = bce_loss(&probs, &target)?;
 
-// Smooth L1 Loss (Huber)
-let loss = smooth_l1_loss(&pred, &target, 1.0)?;
+// Binary Cross-Entropy with logits (numerically stable — preferred)
+let loss = bce_with_logits_loss(&logits, &target)?;
+
+// Focal Loss — down-weights easy examples for class imbalance
+let loss = focal_loss(&logits, &target, 0.25, 2.0)?;  // alpha, gamma
 
 // KL Divergence
 let loss = kl_div_loss(&log_pred, &target)?;
+
+// CTC Loss — for sequence-to-sequence without alignment (speech, OCR)
+let loss = ctc_loss(&log_probs, &targets, &input_lengths, &target_lengths, 0)?;
 ```
 
-All return a scalar `Variable` ready for `backward()`.
+### Metric Learning Losses
+
+```rust
+// Triplet margin loss — push negatives away from anchor-positive pairs
+let loss = triplet_margin_loss(&anchor, &positive, &negative, 1.0)?;
+
+// Cosine embedding loss — similar pairs close, dissimilar far
+let loss = cosine_embedding_loss(&x1, &x2, &labels, 0.5)?;
+
+// Hinge embedding loss — for binary tasks with {-1, +1} labels
+let loss = hinge_embedding_loss(&input, &labels, 1.0)?;
+
+// Margin ranking loss — x1 should be ranked higher than x2
+let loss = margin_ranking_loss(&x1, &x2, &labels, 0.0)?;
+```
 
 ## Optimizers
 
@@ -48,23 +79,39 @@ pub trait Optimizer {
 ### SGD
 
 ```rust
-// SGD with momentum
-let optimizer = SGD::new(&params, 0.01, 0.9);
+let optimizer = SGD::new(&params, 0.01, 0.9);  // lr, momentum (0.0 for vanilla SGD)
 ```
 
-### Adam
+### Adam / AdamW
 
 ```rust
-// Default betas (0.9, 0.999), eps=1e-8
-let optimizer = Adam::new(&params, 0.001);
+let optimizer = Adam::new(&params, 0.001);          // default betas (0.9, 0.999), eps=1e-8
+let optimizer = AdamW::new(&params, 0.001, 0.01);   // decoupled weight decay
 ```
 
-### AdamW
+### RMSprop
 
-Adam with decoupled weight decay:
+Adaptive learning rate with exponential moving average of squared gradients:
 
 ```rust
-let optimizer = AdamW::new(&params, 0.001, 0.01);
+let optimizer = RMSprop::new(&params, 0.01);  // default alpha=0.99, eps=1e-8
+```
+
+### Adagrad
+
+Accumulates all past squared gradients — works well for sparse features:
+
+```rust
+let optimizer = Adagrad::new(&params, 0.01);
+```
+
+### RAdam / NAdam
+
+Rectified Adam (variance-aware warmup) and Nesterov-accelerated Adam:
+
+```rust
+let optimizer = RAdam::new(&params, 0.001);  // auto-warmup via variance rectification
+let optimizer = NAdam::new(&params, 0.001);  // Nesterov momentum with Adam
 ```
 
 ### Fused CUDA Optimizers

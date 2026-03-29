@@ -163,13 +163,40 @@ y = torch.sqrt(x)
 y = torch.abs(x)
 y = torch.pow(x, 2.0)
 y = torch.clamp(x, -1.0, 1.0)
+y = torch.clamp(x, min=0.0)
+y = torch.clamp(x, max=1.0)
 y = torch.sin(x)
 y = torch.cos(x)
+y = torch.tan(x)
+y = torch.asin(x)
+y = torch.acos(x)
+y = torch.atan(x)
+y = torch.atan2(y, x)
 y = torch.sign(x)
 y = torch.floor(x)
 y = torch.ceil(x)
 y = torch.round(x)
+y = torch.trunc(x)
+y = torch.frac(x)
 y = torch.reciprocal(x)
+y = torch.log1p(x)
+y = torch.expm1(x)
+y = torch.log2(x)
+y = torch.log10(x)
+y = torch.erf(x)
+y = torch.erfc(x)
+y = torch.fmod(x, 3.0)
+y = torch.remainder(x, 3.0)
+y = torch.lerp(start, end, weight)
+y = torch.addmm(bias, mat1, mat2)
+y = torch.addcmul(input, t1, t2, value=1.0)
+y = torch.addcdiv(input, t1, t2, value=1.0)
+y = torch.isclose(x, y, rtol=1e-5, atol=1e-8)
+y = torch.maximum(a, b)
+y = torch.minimum(a, b)
+y = x.masked_fill(mask, 0.0)
+y = F.normalize(x, p=2, dim=1)
+y = F.cosine_similarity(a, b, dim=1)
 ```
 
 ```rust
@@ -180,16 +207,43 @@ let y = x.sqrt()?;
 let y = x.abs()?;
 let y = x.pow_scalar(2.0)?;
 let y = x.clamp(-1.0, 1.0)?;
+let y = x.clamp_min(0.0)?;
+let y = x.clamp_max(1.0)?;
 let y = x.sin()?;
 let y = x.cos()?;
+let y = x.tan()?;
+let y = x.asin()?;
+let y = x.acos()?;
+let y = x.atan()?;
+let y = y_var.atan2(&x_var)?;            // Variable method
 let y = x.sign()?;
 let y = x.floor()?;
 let y = x.ceil()?;
 let y = x.round()?;
+let y = x.trunc()?;
+let y = x.frac()?;
 let y = x.reciprocal()?;
+let y = x.log1p()?;                      // ln(1+x), stable for small x
+let y = x.expm1()?;                      // exp(x)-1, stable for small x
+let y = x.log2()?;
+let y = x.log10()?;
+let y = x.erf()?;
+let y = x.erfc()?;
+let y = x.fmod(3.0)?;                    // C-style remainder
+let y = x.remainder(3.0)?;               // Python-style modulo
+let y = start.lerp(&end, 0.5)?;          // linear interpolation
+let y = bias.addmm(&mat1, &mat2, 1.0, 1.0)?;  // beta*self + alpha*(mat1 @ mat2)
+let y = inp.addcmul(&t1, &t2, 1.0)?;    // self + value * t1 * t2
+let y = inp.addcdiv(&t1, &t2, 1.0)?;    // self + value * t1 / t2
+let y = x.isclose(&y, 1e-5, 1e-8)?;
+let y = a.maximum(&b)?;
+let y = a.minimum(&b)?;
+let y = x.masked_fill(&mask, 0.0)?;      // Variable method
+let y = x.normalize(2.0, 1)?;            // Lp-normalize along dim
+let y = a.cosine_similarity(&b, 1, 1e-8)?;
 ```
 
-### Activations
+### Activations and Element-wise Ops
 
 ```python
 # PyTorch
@@ -198,6 +252,13 @@ y = torch.sigmoid(x)
 y = torch.tanh(x)
 y = F.gelu(x)
 y = F.silu(x)
+y = F.leaky_relu(x, 0.01)
+y = F.elu(x, alpha=1.0)
+y = F.softplus(x, beta=1.0)
+y = F.mish(x)
+y = torch.selu(x)
+y = F.hardswish(x)
+y = F.hardsigmoid(x)
 y = torch.softmax(x, dim=1)
 y = F.log_softmax(x, dim=1)
 ```
@@ -209,6 +270,13 @@ let y = x.sigmoid()?;
 let y = x.tanh()?;
 let y = x.gelu()?;
 let y = x.silu()?;
+let y = x.leaky_relu(0.01)?;
+let y = x.elu(1.0)?;
+let y = x.softplus(1.0, 20.0)?;
+let y = x.mish()?;
+let y = x.selu()?;
+let y = x.hardswish()?;
+let y = x.hardsigmoid()?;
 let y = x.softmax(1)?;
 let y = x.log_softmax(1)?;
 ```
@@ -227,6 +295,10 @@ v = x.max(dim=1, keepdim=True).values
 v = x.min(dim=1, keepdim=True).values
 idx = x.argmax(dim=1)
 n = x.norm()
+p = x.prod()
+p = x.prod(dim=1, keepdim=True)
+c = x.cumsum(dim=0)
+l = torch.logsumexp(x, dim=1, keepdim=True)
 ```
 
 ```rust
@@ -241,6 +313,10 @@ let v = x.max_dim(1, true)?;
 let v = x.min_dim(1, true)?;
 let idx = x.argmax(1, false)?;
 let n = x.norm()?;
+let p = x.prod()?;
+let p = x.prod_dim(1, true)?;
+let c = x.cumsum(0)?;
+let l = x.logsumexp(1, true)?;
 ```
 
 ### Shape Operations
@@ -255,6 +331,17 @@ y = x.flatten(1)
 y = x.permute(0, 2, 1)
 y = x.transpose(0, 1)
 y = x.expand(4, 3)
+y = x.contiguous()
+y = x.movedim(0, 2)
+y = x.flip([0, 1])
+y = x.roll(2, dims=0)
+y = x.diagonal(0, 0, 1)
+y = x.tile((2, 3))
+y = x.triu(0)
+y = x.tril(0)
+y = x.split(2, dim=0)
+y = x.unbind(dim=0)
+grids = torch.meshgrid(x, y, indexing='ij')
 ```
 
 ```rust
@@ -267,6 +354,17 @@ let y = x.flatten(1, -1)?;
 let y = x.permute(&[0, 2, 1])?;
 let y = x.transpose(0, 1)?;
 let y = x.expand(&[4, 3])?;
+let y = x.contiguous()?;
+let y = x.movedim(0, 2)?;
+let y = x.flip(&[0, 1])?;
+let y = x.roll(2, 0)?;
+let y = x.diagonal(0, 0, 1)?;
+let y = x.tile(&[2, 3])?;
+let y = x.triu(0)?;
+let y = x.tril(0)?;
+let parts = x.split(2, 0)?;
+let slices = x.unbind(0)?;
+let grids = Tensor::meshgrid(&[&x, &y])?;
 ```
 
 ### Indexing and Slicing
@@ -288,9 +386,12 @@ let y = x.select(0, 0)?;
 let y = x.narrow(1, 1, 2)?;
 let y = x.index_select(0, &indices)?;
 let y = a.cat(&b, 0)?;
+let y = Tensor::cat_many(&[&a, &b, &c], 0)?;  // concatenate many tensors
 let y = Tensor::stack(&[&a, &b], 0)?;
 let chunks = x.chunk(3, 1)?;
 let y = x.repeat(&[2, 3])?;
+let y = x.pad(&[1, 1], 0.0)?;                  // constant-value pad
+let y = x.pad_mode(&[1, 1], 1, 0.0)?;          // 0=constant, 1=reflect, 2=replicate, 3=circular
 
 // Batch iteration (split along dim 0)
 for batch in data.batches(32)? {
@@ -406,13 +507,19 @@ println!("{:?}", x.grad());  // Some(tensor([2.0, 4.0]))
 | Check grad enabled | `torch.is_grad_enabled()` | `is_grad_enabled()` |
 | Leaf check | `x.is_leaf` | `x.is_leaf()` |
 
-**Differentiable ops on Variable:** Add, Sub, Mul, Div, Matmul, MulScalar, AddScalar,
-DivScalar, Neg, Exp, Log, Sqrt, Abs, Pow, Sin, Cos, Sign, Floor, Ceil, Round,
-Reciprocal, Clamp, ReLU, Sigmoid, Tanh, GELU, SiLU, Softmax, LogSoftmax,
-Sum, SumDim, MeanDim, Mean, Var, Std, Min, Max, VarDim, StdDim,
-Reshape, Transpose, Permute, Squeeze, Unsqueeze, Flatten, Expand,
-Select, Narrow, Cat, Chunk, Repeat, Pad, IndexSelect, Gather, TopK, Sort,
-Conv2d, ConvTranspose2d, MaxPool2d, AdaptiveAvgPool2d, GridSample, LayerNorm.
+**Differentiable ops on Variable:**
+
+*Arithmetic:* Add, Sub, Mul, Div, Matmul, MulScalar, AddScalar, DivScalar, Neg
+
+*Activations:* ReLU, Sigmoid, Tanh, GELU, SiLU, LeakyReLU, ELU, Softplus, Mish, SELU, Hardswish, Hardsigmoid, PReLU, Softmax, LogSoftmax
+
+*Math:* Exp, Log, Sqrt, Abs, Pow, Sin, Cos, Sign, Floor, Ceil, Round, Reciprocal, Clamp, ClampMin, ClampMax, Log1p, Expm1, Log2, Log10, Atan2, Maximum, Minimum, MaskedFill, Normalize, CosineSimilarity, Triu, Tril
+
+*Reductions:* Sum, SumDim, Mean, MeanDim, Var, Std, VarDim, StdDim, Min, Max, MinDim, MaxDim, Prod, ProdDim, Cumsum, Logsumexp
+
+*Shape:* Reshape, Transpose, Permute, Squeeze, Unsqueeze, UnsqueezeMany, Flatten, Expand, Select, Narrow, Cat, CatMany, Stack, Chunk, Repeat, Pad, IndexSelect, Gather, TopK, Sort
+
+*NN:* Conv1d, ConvTranspose1d, Conv2d, ConvTranspose2d, Conv3d, ConvTranspose3d, MaxPool2d, AvgPool2d, MaxPool1d, AvgPool1d, AdaptiveAvgPool2d, AdaptiveMaxPool2d, InstanceNorm, GroupNorm, LayerNorm, GridSample, PixelShuffle, PixelUnshuffle, Bilinear, EmbeddingBag, Im2col, Col2im
 
 ## Neural Network Layers
 
@@ -420,45 +527,102 @@ Conv2d, ConvTranspose2d, MaxPool2d, AdaptiveAvgPool2d, GridSample, LayerNorm.
 # PyTorch
 layer = nn.Linear(784, 128)
 layer = nn.Linear(784, 128, bias=False)
+layer = nn.Conv1d(3, 16, kernel_size=5, stride=2, padding=2)
 layer = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+layer = nn.Conv3d(1, 32, kernel_size=3, padding=1)
+layer = nn.ConvTranspose1d(16, 3, kernel_size=5)
 layer = nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1)
+layer = nn.ConvTranspose3d(32, 1, kernel_size=3)
 layer = nn.MaxPool2d(kernel_size=2)
 layer = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+layer = nn.AvgPool2d(kernel_size=2)
+layer = nn.MaxPool1d(kernel_size=2)
+layer = nn.AvgPool1d(kernel_size=2)
+layer = nn.AdaptiveMaxPool2d((7, 7))
+layer = nn.PixelShuffle(2)
+layer = nn.PixelUnshuffle(2)
+layer = nn.Upsample(size=(64, 64), mode='bilinear')
+layer = nn.Unfold(kernel_size=3)
+layer = nn.Fold(output_size=(28, 28), kernel_size=3)
 layer = nn.LayerNorm(128)
+layer = nn.RMSNorm(128)
+layer = nn.GroupNorm(4, 16)
 layer = nn.BatchNorm1d(128)
 layer = nn.BatchNorm2d(64)
+layer = nn.InstanceNorm2d(64, affine=True)
 layer = nn.Dropout(p=0.5)
+layer = nn.Dropout2d(p=0.1)
+layer = nn.AlphaDropout(p=0.1)
+layer = nn.ZeroPad2d(1)
+layer = nn.ReflectionPad2d(1)
 layer = nn.Embedding(1000, 128)
+layer = nn.EmbeddingBag(1000, 128)
 cell = nn.GRUCell(128, 256)
 cell = nn.LSTMCell(128, 256)
+layer = nn.GRU(128, 256, num_layers=2)
+layer = nn.LSTM(128, 256, num_layers=2)
+layer = nn.MultiheadAttention(512, 8)
+layer = nn.Bilinear(128, 64, 32)
 ```
 
 ```rust
 // flodl
 let layer = Linear::new(784, 128)?;
 let layer = Linear::no_bias(784, 128)?;
-let layer = Conv2d::new(3, 64, 3)?;                                         // defaults: stride=1, padding=0
-let layer = Conv2d::configure(3, 64, 3).with_padding(1).with_stride(2).done()?;   // fluent builder
-let layer = Conv2d::build(3, 64, 3, true, [1,1], [1,1], [1,1], 1, Device::CPU)?;  // full control
-let layer = ConvTranspose2d::new(64, 3, 4)?;                                // defaults: stride=1, padding=0
-let pool = MaxPool2d::new(2);                                               // kernel=2, stride=2 (defaults to kernel)
-let pool = MaxPool2d::with_stride(3, 2).padding(1);                         // kernel=3, stride=2, padding=1
+let layer = Conv1d::configure(3, 16, 5).with_stride(2).with_padding(2).done()?;
+let layer = Conv2d::new(3, 64, 3)?;                                          // defaults: stride=1, padding=0
+let layer = Conv2d::configure(3, 64, 3).with_padding(1).with_stride(2).done()?;    // fluent builder
+let layer = Conv2d::build(3, 64, 3, true, [1,1], [1,1], [1,1], 1, Device::CPU)?;   // full control
+let layer = Conv3d::configure(1, 32, [3,3,3]).with_padding([1,1,1]).done()?;
+let layer = ConvTranspose1d::new(16, 3, 5)?;
+let layer = ConvTranspose2d::new(64, 3, 4)?;
+let layer = ConvTranspose3d::new(32, 1, [3,3,3])?;
+let pool = MaxPool2d::new(2);                                                // kernel=2, stride=2 (defaults to kernel)
+let pool = MaxPool2d::with_stride(3, 2).padding(1);                          // kernel=3, stride=2, padding=1
+let pool = AvgPool2d::new(2);
+let pool = MaxPool1d::new(2);
+let pool = AvgPool1d::new(2);
+let pool = AdaptiveMaxPool2d::new(7, 7);
+let layer = PixelShuffle::new(2);
+let layer = PixelUnshuffle::new(2);
+let layer = Upsample::new(&[64, 64], 1);                                    // mode: 0=nearest, 1=bilinear
+let layer = Unfold::new([3,3], [1,1], [0,0], [1,1]);
+let layer = Fold::new([28,28], [3,3], [1,1], [0,0], [1,1]);
 let layer = LayerNorm::new(128)?;
-let layer = BatchNorm::new(128)?;                                         // for [B, features] after Linear
-let layer = BatchNorm2d::new(64)?;                                        // for [B, C, H, W] after Conv2d
+let layer = RMSNorm::new(128)?;
+let layer = GroupNorm::new(4, 16)?;
+let layer = BatchNorm::new(128)?;                                            // for [B, features] after Linear
+let layer = BatchNorm2d::new(64)?;                                           // for [B, C, H, W] after Conv2d
+let layer = InstanceNorm::new(64, true)?;                                    // affine=true
 let layer = Dropout::new(0.5);
+let layer = Dropout2d::new(0.1);
+let layer = AlphaDropout::new(0.1);                                          // for SELU networks
+let layer = ZeroPad2d::new(1);
+let layer = ReflectionPad2d::new(1);
 let layer = Embedding::new(1000, 128)?;
+let layer = EmbeddingBag::new(1000, 128)?;
 let cell = GRUCell::new(128, 256)?;
 let cell = LSTMCell::new(128, 256)?;
+let layer = GRU::new(128, 256, 2)?;                                          // 2-layer GRU
+let layer = LSTM::new(128, 256, 2)?;                                         // 2-layer LSTM
+let layer = MultiheadAttention::new(512, 8)?;
+let layer = Bilinear::new(128, 64, 32, true)?;
 
-// On a specific device:
+// On a specific device (all modules have on_device() variants):
 let layer = Linear::on_device(784, 128, Device::CUDA(0))?;
+let layer = Conv2d::configure(3, 64, 3).with_padding(1).on_device(Device::CUDA(0)).done()?;
 let layer = LayerNorm::on_device(128, Device::CUDA(0))?;
+let layer = RMSNorm::on_device(128, Device::CUDA(0))?;
+let layer = GroupNorm::on_device(4, 16, Device::CUDA(0))?;
 let layer = BatchNorm::on_device(128, Device::CUDA(0))?;
 let layer = BatchNorm2d::on_device(64, Device::CUDA(0))?;
+let layer = InstanceNorm::on_device(64, true, Device::CUDA(0))?;
 let layer = Embedding::on_device(1000, 128, Device::CUDA(0))?;
 let cell = GRUCell::on_device(128, 256, Device::CUDA(0))?;
 let cell = LSTMCell::on_device(128, 256, Device::CUDA(0))?;
+let layer = GRU::on_device(128, 256, 2, false, Device::CUDA(0))?;
+let layer = LSTM::on_device(128, 256, 2, false, Device::CUDA(0))?;
+let layer = MultiheadAttention::on_device(512, 8, Device::CUDA(0))?;
 ```
 
 ## Activations (as Modules)
@@ -470,15 +634,43 @@ nn.Sigmoid()
 nn.Tanh()
 nn.GELU()
 nn.SiLU()
+nn.LeakyReLU(0.01)
+nn.ELU(alpha=1.0)
+nn.Softplus(beta=1.0)
+nn.Mish()
+nn.SELU()
+nn.Hardswish()
+nn.Hardsigmoid()
+nn.PReLU(num_parameters=1)
+nn.Softmax(dim=-1)
+nn.LogSoftmax(dim=-1)
+nn.Flatten(start_dim=1)
+nn.Identity()
 ```
 
 ```rust
-// flodl
+// flodl — zero-sized types (no allocation)
 ReLU
 Sigmoid
 Tanh
 GELU
 SiLU
+Mish
+SELU
+Hardswish
+Hardsigmoid
+Identity
+
+// Parameterized at construction
+LeakyReLU::new(0.01)
+ELU::new(1.0)
+Softplus::new(1.0, 20.0)         // beta, threshold
+Softmax::new(-1)                  // dim
+LogSoftmax::new(-1)
+Flatten::new(1, -1)               // start_dim, end_dim
+
+// Learnable parameters
+let prelu = PReLU::new(1, Device::CPU)?;
 ```
 
 ### Preprocessing Modules
@@ -561,20 +753,38 @@ Or skip manual structs entirely — use the **graph builder** (see below).
 # PyTorch
 loss = F.mse_loss(pred, target)
 loss = F.cross_entropy(logits, labels)
+loss = F.nll_loss(log_probs, labels)
+loss = F.binary_cross_entropy(probs, target)
 loss = F.binary_cross_entropy_with_logits(pred, target)
 loss = F.l1_loss(pred, target)
 loss = F.smooth_l1_loss(pred, target, beta=1.0)
 loss = F.kl_div(log_probs, targets, reduction='batchmean')
+loss = F.ctc_loss(log_probs, targets, input_lengths, target_lengths)
+loss = F.poisson_nll_loss(pred, target, log_input=True)
+loss = F.triplet_margin_loss(anchor, positive, negative, margin=1.0)
+loss = F.cosine_embedding_loss(x1, x2, labels, margin=0.0)
+loss = F.hinge_embedding_loss(input, labels, margin=1.0)
+loss = F.margin_ranking_loss(x1, x2, labels, margin=0.0)
+# focal_loss — not in PyTorch, popular in object detection
 ```
 
 ```rust
 // flodl — free functions, return Variable (differentiable)
 let loss = mse_loss(&pred, &target)?;
-let loss = cross_entropy_loss(&logits, &labels)?;  // labels: [B] indices or [B,C] one-hot
-let loss = bce_with_logits_loss(&pred, &target)?;
+let loss = cross_entropy_loss(&logits, &labels)?;   // labels: [B] indices or [B,C] one-hot
+let loss = nll_loss(&log_probs, &labels)?;           // after log_softmax
+let loss = bce_loss(&probs, &target)?;               // from probabilities
+let loss = bce_with_logits_loss(&logits, &target)?;  // numerically stable
 let loss = l1_loss(&pred, &target)?;
 let loss = smooth_l1_loss(&pred, &target, 1.0)?;
 let loss = kl_div_loss(&log_probs, &targets)?;
+let loss = ctc_loss(&log_probs, &targets, &input_lengths, &target_lengths, 0)?;
+let loss = poisson_nll_loss(&pred, &target, true)?;
+let loss = focal_loss(&logits, &target, 0.25, 2.0)?;  // alpha, gamma — class imbalance
+let loss = triplet_margin_loss(&anchor, &positive, &negative, 1.0)?;
+let loss = cosine_embedding_loss(&x1, &x2, &labels, 0.0)?;
+let loss = hinge_embedding_loss(&input, &labels, 1.0)?;
+let loss = margin_ranking_loss(&x1, &x2, &labels, 0.0)?;
 ```
 
 ## Optimizers
@@ -584,6 +794,10 @@ let loss = kl_div_loss(&log_probs, &targets)?;
 opt = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
 opt = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+opt = torch.optim.RMSprop(model.parameters(), lr=0.01)
+opt = torch.optim.Adagrad(model.parameters(), lr=0.01)
+opt = torch.optim.RAdam(model.parameters(), lr=0.001)
+opt = torch.optim.NAdam(model.parameters(), lr=0.001)
 
 opt.zero_grad()
 loss.backward()
@@ -595,6 +809,10 @@ opt.step()
 let mut opt = SGD::new(&params, 0.01, 0.9);     // lr, momentum
 let mut opt = Adam::new(&params, 0.001);         // lr
 let mut opt = AdamW::new(&params, 0.001, 0.01);  // lr, weight_decay
+let mut opt = RMSprop::new(&params, 0.01);       // lr (alpha=0.99, eps=1e-8)
+let mut opt = Adagrad::new(&params, 0.01);       // lr
+let mut opt = RAdam::new(&params, 0.001);        // rectified Adam — auto warmup
+let mut opt = NAdam::new(&params, 0.001);        // Nesterov-accelerated Adam
 
 opt.zero_grad();
 loss.backward()?;
@@ -645,6 +863,10 @@ for param in &encoder_params {
 # PyTorch
 scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=30, gamma=0.1)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=100, eta_min=1e-6)
+scheduler = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.95)
+scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[30, 60, 90], gamma=0.1)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=0.01, total_steps=1000)
+scheduler = torch.optim.lr_scheduler.CyclicLR(opt, base_lr=1e-4, max_lr=1e-2, step_size_up=500)
 scheduler.step()
 ```
 
@@ -652,6 +874,10 @@ scheduler.step()
 // flodl — schedulers produce an lr, you apply it
 let sched = StepDecay::new(0.001, 30, 0.1);
 let sched = CosineScheduler::new(0.001, 1e-6, 100);
+let sched = ExponentialLR::new(0.001, 0.95);
+let sched = MultiStepLR::new(0.001, &[30, 60, 90], 0.1);
+let sched = OneCycleLR::new(0.01, 1000);                  // 30% warmup
+let sched = CyclicLR::new(1e-4, 1e-2, 500);               // symmetric triangle
 let lr = sched.lr(step);
 opt.set_lr(lr);
 
@@ -792,15 +1018,29 @@ let x = Tensor::zeros(&[2, 3], opts)?;
 ## Weight Initialization
 
 ```python
-# PyTorch
+# PyTorch — in-place mutation
 nn.init.xavier_uniform_(layer.weight)
 nn.init.xavier_normal_(layer.weight)
+nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+nn.init.kaiming_normal_(layer.weight)
+nn.init.uniform_(layer.weight, -0.1, 0.1)
+nn.init.normal_(layer.weight, 0.0, 0.01)
+nn.init.orthogonal_(layer.weight, gain=1.0)
+nn.init.trunc_normal_(layer.weight, std=0.02)
 ```
 
 ```rust
-// flodl — returns a new Tensor (immutable design)
-let w = xavier_uniform(&[out_features, in_features], in_features, out_features, Device::CPU)?;
-let w = xavier_normal(&[out_features, in_features], in_features, out_features, Device::CPU)?;
+// flodl — returns a new Tensor, then set_data() to apply
+let w = xavier_uniform(&[out, inp], inp, out, device)?;
+let w = xavier_normal(&[out, inp], inp, out, device)?;
+let w = kaiming_uniform(&[out, inp], inp, 0.0, device)?;   // a=0.0 for ReLU
+let w = kaiming_normal(&[out, inp], inp, 0.0, device)?;
+let w = uniform(&[out, inp], -0.1, 0.1, device)?;
+let w = normal(&[out, inp], 0.0, 0.01, device)?;
+let w = orthogonal(&[out, inp], 1.0, device)?;             // 2D only
+let w = trunc_normal(&[out, inp], 0.0, 0.02, -2.0, 2.0, device)?;  // mean, std, a, b
+
+layer.parameters()[0].set_data(&w);
 ```
 
 ## Mixed Precision Training
