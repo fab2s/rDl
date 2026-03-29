@@ -44,7 +44,11 @@ pub mod functional;
 pub use parameter::Parameter;
 pub use buffer::Buffer;
 pub use linear::Linear;
-pub use activation::{Identity, ReLU, Sigmoid, Tanh, GELU, SiLU};
+pub use activation::{
+    Identity, ReLU, Sigmoid, Tanh, GELU, SiLU,
+    LeakyReLU, ELU, Softplus, Mish,
+    Softmax, LogSoftmax, Flatten,
+};
 pub use loss::{mse_loss, cross_entropy_loss, bce_with_logits_loss, l1_loss, smooth_l1_loss, kl_div_loss};
 pub use optim::{Optimizer, Stateful, SGD, SGDBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder};
 pub use checkpoint::{

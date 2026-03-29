@@ -444,6 +444,48 @@ extern "C" char* flodl_silu(FlodlTensor t, FlodlTensor* result) {
     }
 }
 
+extern "C" char* flodl_leaky_relu(FlodlTensor t, double negative_slope,
+                                   FlodlTensor* result) {
+    try {
+        *result = wrap(torch::nn::functional::leaky_relu(
+            unwrap(t),
+            torch::nn::functional::LeakyReLUFuncOptions().negative_slope(negative_slope)));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_elu(FlodlTensor t, double alpha, FlodlTensor* result) {
+    try {
+        *result = wrap(torch::elu(unwrap(t), alpha));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_softplus(FlodlTensor t, double beta, double threshold,
+                                 FlodlTensor* result) {
+    try {
+        *result = wrap(torch::nn::functional::softplus(
+            unwrap(t),
+            torch::nn::functional::SoftplusFuncOptions().beta(beta).threshold(threshold)));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_mish(FlodlTensor t, FlodlTensor* result) {
+    try {
+        *result = wrap(torch::mish(unwrap(t)));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
 // --- Layer normalization ---
 
 extern "C" char* flodl_native_layer_norm(FlodlTensor input, FlodlTensor weight,
@@ -514,6 +556,16 @@ extern "C" char* flodl_triu(FlodlTensor t, int64_t diagonal,
     }
 }
 
+extern "C" char* flodl_tril(FlodlTensor t, int64_t diagonal,
+                            FlodlTensor* result) {
+    try {
+        *result = wrap(torch::tril(unwrap(t), diagonal));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
 extern "C" char* flodl_pow_scalar(FlodlTensor t, double exponent,
                                  FlodlTensor* result) {
     try {
@@ -568,6 +620,44 @@ extern "C" char* flodl_mean_dim(FlodlTensor t, int dim, int keepdim,
                                FlodlTensor* result) {
     try {
         *result = wrap(unwrap(t).mean(dim, keepdim != 0));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_prod(FlodlTensor t, FlodlTensor* result) {
+    try {
+        *result = wrap(unwrap(t).prod());
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_prod_dim(FlodlTensor t, int dim, int keepdim,
+                                FlodlTensor* result) {
+    try {
+        *result = wrap(unwrap(t).prod(dim, keepdim != 0));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_cumsum(FlodlTensor t, int dim, FlodlTensor* result) {
+    try {
+        *result = wrap(unwrap(t).cumsum(dim));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_logsumexp(FlodlTensor t, int dim, int keepdim,
+                                 FlodlTensor* result) {
+    try {
+        *result = wrap(unwrap(t).logsumexp(dim, keepdim != 0));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -850,6 +940,19 @@ extern "C" char* flodl_stack(FlodlTensor* tensors, int count, int dim,
             vec.push_back(unwrap(tensors[i]));
         }
         *result = wrap(torch::stack(vec, dim));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+// --- Masking ---
+
+extern "C" char* flodl_masked_fill(FlodlTensor t, FlodlTensor mask,
+                                    double value, FlodlTensor* result) {
+    try {
+        auto bool_mask = unwrap(mask).to(torch::kBool);
+        *result = wrap(unwrap(t).masked_fill(bool_mask, value));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1539,6 +1642,44 @@ extern "C" char* flodl_full(int64_t* shape, int ndim, double value, int dtype,
             .dtype(to_scalar_type(dtype))
             .device(to_device(device_type, device_index));
         *result = wrap(torch::full(make_shape(shape, ndim), value, options));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_randperm(int64_t n, int dtype, int device_type,
+                                int device_index, FlodlTensor* result) {
+    try {
+        auto options = torch::TensorOptions()
+            .dtype(to_scalar_type(dtype))
+            .device(to_device(device_type, device_index));
+        *result = wrap(torch::randperm(n, options));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+extern "C" char* flodl_multinomial(FlodlTensor probs, int64_t num_samples,
+                                    int replacement, FlodlTensor* result) {
+    try {
+        *result = wrap(torch::multinomial(unwrap(probs), num_samples,
+                                           replacement != 0));
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
+// --- Normalization ---
+
+extern "C" char* flodl_normalize(FlodlTensor t, double p, int dim,
+                                  FlodlTensor* result) {
+    try {
+        *result = wrap(torch::nn::functional::normalize(
+            unwrap(t),
+            torch::nn::functional::NormalizeFuncOptions().p(p).dim(dim)));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());

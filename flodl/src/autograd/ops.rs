@@ -97,6 +97,30 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
+    /// Leaky ReLU: `max(0, x) + negative_slope * min(0, x)`.
+    pub fn leaky_relu(&self, negative_slope: f64) -> Result<Variable> {
+        let result = self.data().leaky_relu(negative_slope)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// ELU: `max(0, x) + min(0, alpha * (exp(x) - 1))`.
+    pub fn elu(&self, alpha: f64) -> Result<Variable> {
+        let result = self.data().elu(alpha)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Softplus: `(1/beta) * log(1 + exp(beta * x))`.
+    pub fn softplus(&self, beta: f64, threshold: f64) -> Result<Variable> {
+        let result = self.data().softplus(beta, threshold)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Mish: `x * tanh(softplus(x))`.
+    pub fn mish(&self) -> Result<Variable> {
+        let result = self.data().mish()?;
+        Ok(Variable::wrap(result))
+    }
+
     // --- Reductions ---
 
     /// Sum of all elements, returning a scalar.
@@ -120,6 +144,30 @@ impl Variable {
     /// Mean along a dimension. If `keepdim`, the reduced dimension is retained with size 1.
     pub fn mean_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
         let result = self.data().mean_dim(dim, keepdim)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Product of all elements, returning a scalar.
+    pub fn prod(&self) -> Result<Variable> {
+        let result = self.data().prod()?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Product along a dimension.
+    pub fn prod_dim(&self, dim: i32, keepdim: bool) -> Result<Variable> {
+        let result = self.data().prod_dim(dim, keepdim)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Cumulative sum along a dimension.
+    pub fn cumsum(&self, dim: i32) -> Result<Variable> {
+        let result = self.data().cumsum(dim)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Log of summed exponentials along a dimension (numerically stable).
+    pub fn logsumexp(&self, dim: i32, keepdim: bool) -> Result<Variable> {
+        let result = self.data().logsumexp(dim, keepdim)?;
         Ok(Variable::wrap(result))
     }
 
@@ -223,6 +271,12 @@ impl Variable {
         Ok(Variable::wrap(result))
     }
 
+    /// Lower triangular part. `diagonal=0` keeps the main diagonal; negative shifts down.
+    pub fn tril(&self, diagonal: i64) -> Result<Variable> {
+        let result = self.data().tril(diagonal)?;
+        Ok(Variable::wrap(result))
+    }
+
     /// Element-wise sine.
     pub fn sin(&self) -> Result<Variable> {
         let result = self.data().sin()?;
@@ -268,6 +322,18 @@ impl Variable {
     /// Clamp all elements to `[min, max]`.
     pub fn clamp(&self, min: f64, max: f64) -> Result<Variable> {
         let result = self.data().clamp(min, max)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// Fill elements where `mask` is true (non-zero) with `value`.
+    pub fn masked_fill(&self, mask: &Tensor, value: f64) -> Result<Variable> {
+        let result = self.data().masked_fill(mask, value)?;
+        Ok(Variable::wrap(result))
+    }
+
+    /// L_p normalize along a dimension.
+    pub fn normalize(&self, p: f64, dim: i32) -> Result<Variable> {
+        let result = self.data().normalize(p, dim)?;
         Ok(Variable::wrap(result))
     }
 

@@ -60,6 +60,8 @@ pub use nn::{
     LoadReport, MigrateReport,
     GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled,
     Identity, ReLU, Sigmoid, Tanh, GELU, SiLU,
+    LeakyReLU, ELU, Softplus, Mish,
+    Softmax, LogSoftmax, Flatten,
     Dropout, Dropout2d, LayerNorm, Embedding, GRUCell, LSTMCell,
     Conv2d, Conv2dBuilder, ConvTranspose2d, BatchNorm, BatchNorm2d, MaxPool2d,
     mse_loss, cross_entropy_loss, bce_with_logits_loss, l1_loss, smooth_l1_loss, kl_div_loss,

@@ -124,6 +124,14 @@ unsafe extern "C" {
     pub fn flodl_log_softmax(t: FlodlTensor, dim: i32, result: *mut FlodlTensor) -> *mut i8;
     pub fn flodl_gelu(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
     pub fn flodl_silu(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
+    pub fn flodl_leaky_relu(
+        t: FlodlTensor, negative_slope: f64, result: *mut FlodlTensor,
+    ) -> *mut i8;
+    pub fn flodl_elu(t: FlodlTensor, alpha: f64, result: *mut FlodlTensor) -> *mut i8;
+    pub fn flodl_softplus(
+        t: FlodlTensor, beta: f64, threshold: f64, result: *mut FlodlTensor,
+    ) -> *mut i8;
+    pub fn flodl_mish(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
 
     // --- Layer normalization ---
 
@@ -140,6 +148,7 @@ unsafe extern "C" {
     pub fn flodl_sqrt(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
     pub fn flodl_abs(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
     pub fn flodl_triu(t: FlodlTensor, diagonal: i64, result: *mut FlodlTensor) -> *mut i8;
+    pub fn flodl_tril(t: FlodlTensor, diagonal: i64, result: *mut FlodlTensor) -> *mut i8;
 
     pub fn flodl_pow_scalar(
         t: FlodlTensor, exponent: f64, result: *mut FlodlTensor,
@@ -159,6 +168,20 @@ unsafe extern "C" {
     ) -> *mut i8;
 
     pub fn flodl_mean_dim(
+        t: FlodlTensor, dim: i32, keepdim: i32, result: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    pub fn flodl_prod(t: FlodlTensor, result: *mut FlodlTensor) -> *mut i8;
+
+    pub fn flodl_prod_dim(
+        t: FlodlTensor, dim: i32, keepdim: i32, result: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    pub fn flodl_cumsum(
+        t: FlodlTensor, dim: i32, result: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    pub fn flodl_logsumexp(
         t: FlodlTensor, dim: i32, keepdim: i32, result: *mut FlodlTensor,
     ) -> *mut i8;
 
@@ -267,6 +290,13 @@ unsafe extern "C" {
 
     pub fn flodl_stack(
         tensors: *mut FlodlTensor, count: i32, dim: i32, result: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    // --- Masking ---
+
+    pub fn flodl_masked_fill(
+        t: FlodlTensor, mask: FlodlTensor, value: f64,
+        result: *mut FlodlTensor,
     ) -> *mut i8;
 
     // --- Conditional ---
@@ -466,6 +496,22 @@ unsafe extern "C" {
         shape: *mut i64, ndim: i32, value: f64, dtype: i32,
         device_type: i32, device_index: i32,
         result: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    pub fn flodl_randperm(
+        n: i64, dtype: i32, device_type: i32, device_index: i32,
+        result: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    pub fn flodl_multinomial(
+        probs: FlodlTensor, num_samples: i64, replacement: i32,
+        result: *mut FlodlTensor,
+    ) -> *mut i8;
+
+    // --- Normalization ---
+
+    pub fn flodl_normalize(
+        t: FlodlTensor, p: f64, dim: i32, result: *mut FlodlTensor,
     ) -> *mut i8;
 
     // --- Shape operations (additional) ---

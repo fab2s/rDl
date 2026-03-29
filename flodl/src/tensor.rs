@@ -637,6 +637,16 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
+    /// Lower triangle of a matrix (or batch of matrices).
+    /// Elements above the `diagonal`-th diagonal are zeroed.
+    /// `diagonal=0` keeps the main diagonal; `diagonal=-1` excludes it.
+    pub fn tril(&self, diagonal: i64) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_tril(self.handle, diagonal, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
     /// Raise every element to a scalar exponent.
     pub fn pow_scalar(&self, exponent: f64) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -652,6 +662,42 @@ impl Tensor {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe {
             ffi::flodl_sum_dim(self.handle, dim, keepdim as i32, &mut handle)
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Product of all elements (scalar result).
+    pub fn prod(&self) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_prod(self.handle, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Product along a dimension.
+    pub fn prod_dim(&self, dim: i32, keepdim: bool) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_prod_dim(self.handle, dim, keepdim as i32, &mut handle)
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Cumulative sum along a dimension.
+    pub fn cumsum(&self, dim: i32) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_cumsum(self.handle, dim, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Log of summed exponentials along a dimension (numerically stable).
+    pub fn logsumexp(&self, dim: i32, keepdim: bool) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_logsumexp(self.handle, dim, keepdim as i32, &mut handle)
         };
         check_err(err)?;
         Ok(Tensor::from_raw(handle))
@@ -807,6 +853,39 @@ impl Tensor {
     pub fn silu(&self) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_silu(self.handle, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Leaky ReLU: `max(0, x) + negative_slope * min(0, x)`.
+    pub fn leaky_relu(&self, negative_slope: f64) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_leaky_relu(self.handle, negative_slope, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// ELU: `max(0, x) + min(0, alpha * (exp(x) - 1))`.
+    pub fn elu(&self, alpha: f64) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_elu(self.handle, alpha, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Softplus: `(1/beta) * log(1 + exp(beta * x))`.
+    /// Reverts to linear when `beta * x > threshold`.
+    pub fn softplus(&self, beta: f64, threshold: f64) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_softplus(self.handle, beta, threshold, &mut handle) };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// Mish: `x * tanh(softplus(x))`.
+    pub fn mish(&self) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe { ffi::flodl_mish(self.handle, &mut handle) };
         check_err(err)?;
         Ok(Tensor::from_raw(handle))
     }
@@ -1273,6 +1352,17 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
+    /// Fill elements where `mask` is true (non-zero) with `value`.
+    /// The mask is broadcast to match the tensor shape.
+    pub fn masked_fill(&self, mask: &Tensor, value: f64) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_masked_fill(self.handle, mask.handle, value, &mut handle)
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
     /// Conditional select: where(condition, self, other).
     pub fn where_cond(condition: &Tensor, x: &Tensor, y: &Tensor) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -1597,6 +1687,40 @@ impl Tensor {
         };
         check_err(err)?;
         Ok(Self::from_raw(handle))
+    }
+
+    /// Random permutation of integers `[0, n)`.
+    pub fn randperm(n: i64, opts: TensorOptions) -> Result<Self> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let (dt, di) = opts.device.to_ffi();
+        let err = unsafe {
+            ffi::flodl_randperm(n, opts.dtype as i32, dt, di, &mut handle)
+        };
+        check_err(err)?;
+        Ok(Self::from_raw(handle))
+    }
+
+    /// Draw samples from a multinomial distribution.
+    /// `self` contains unnormalized probabilities (one row per distribution).
+    pub fn multinomial(&self, num_samples: i64, replacement: bool) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_multinomial(
+                self.handle, num_samples, replacement as i32, &mut handle,
+            )
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
+    }
+
+    /// L_p normalize along a dimension (default: L2, dim=-1).
+    pub fn normalize(&self, p: f64, dim: i32) -> Result<Tensor> {
+        let mut handle: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_normalize(self.handle, p, dim, &mut handle)
+        };
+        check_err(err)?;
+        Ok(Tensor::from_raw(handle))
     }
 
     // --- Shape operations (additional) ---
@@ -3323,5 +3447,129 @@ mod tests {
         assert!(Tensor::foreach_norm(&[], 2.0).unwrap().is_empty());
         Tensor::foreach_lerp_scalar_(&[], &[], 0.5).unwrap();
         Tensor::foreach_sqrt_(&[]).unwrap();
+    }
+
+    // --- Tier 1 parity ops ---
+
+    #[test]
+    fn test_tril() {
+        let t = Tensor::from_f32(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            &[3, 3], test_device(),
+        ).unwrap();
+        let lo = t.tril(0).unwrap().to_f32_vec().unwrap();
+        assert_eq!(lo, vec![1.0, 0.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn test_prod() {
+        let t = Tensor::from_f32(&[2.0, 3.0, 4.0], &[3], test_device()).unwrap();
+        let p = t.prod().unwrap().item().unwrap();
+        assert!((p - 24.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_prod_dim() {
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
+        let p = t.prod_dim(1, false).unwrap().to_f32_vec().unwrap();
+        assert!((p[0] - 2.0).abs() < 1e-4);
+        assert!((p[1] - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_cumsum() {
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
+        let c = t.cumsum(1).unwrap().to_f32_vec().unwrap();
+        assert_eq!(c, vec![1.0, 3.0, 3.0, 7.0]);
+    }
+
+    #[test]
+    fn test_logsumexp() {
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
+        let lse = t.logsumexp(0, false).unwrap().item().unwrap();
+        // log(e^1 + e^2 + e^3) ≈ 3.4076
+        assert!((lse - 3.4076).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_masked_fill() {
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
+        let mask = Tensor::from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2], test_device()).unwrap();
+        let filled = t.masked_fill(&mask, -1e9).unwrap().to_f32_vec().unwrap();
+        assert!(filled[0] < -1e8); // masked
+        assert!((filled[1] - 2.0).abs() < 1e-5); // kept
+        assert!((filled[2] - 3.0).abs() < 1e-5); // kept
+        assert!(filled[3] < -1e8); // masked
+    }
+
+    #[test]
+    fn test_randperm() {
+        let mut opts = test_opts();
+        opts.dtype = DType::Int64;
+        let p = Tensor::randperm(5, opts).unwrap();
+        assert_eq!(p.shape(), vec![5]);
+        // All values 0..5 must be present (it's a permutation).
+        let mut vals = p.to_i64_vec().unwrap();
+        vals.sort();
+        assert_eq!(vals, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_multinomial() {
+        let probs = Tensor::from_f32(&[0.0, 0.0, 1.0], &[3], test_device()).unwrap();
+        let samples = probs.multinomial(2, true).unwrap();
+        // All probability mass on index 2 — both samples must be 2.
+        let vals = samples.to_i64_vec().unwrap();
+        assert_eq!(vals, vec![2, 2]);
+    }
+
+    #[test]
+    fn test_normalize() {
+        let t = Tensor::from_f32(&[3.0, 4.0], &[2], test_device()).unwrap();
+        let n = t.normalize(2.0, 0).unwrap().to_f32_vec().unwrap();
+        // L2 norm is 5, so [0.6, 0.8]
+        assert!((n[0] - 0.6).abs() < 1e-5);
+        assert!((n[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_leaky_relu() {
+        let t = Tensor::from_f32(&[-2.0, -1.0, 0.0, 1.0, 2.0], &[5], test_device()).unwrap();
+        let r = t.leaky_relu(0.1).unwrap().to_f32_vec().unwrap();
+        assert!((r[0] - (-0.2)).abs() < 1e-5);
+        assert!((r[1] - (-0.1)).abs() < 1e-5);
+        assert!((r[2] - 0.0).abs() < 1e-5);
+        assert!((r[3] - 1.0).abs() < 1e-5);
+        assert!((r[4] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_elu() {
+        let t = Tensor::from_f32(&[-1.0, 0.0, 1.0], &[3], test_device()).unwrap();
+        let r = t.elu(1.0).unwrap().to_f32_vec().unwrap();
+        // ELU(-1) = 1*(exp(-1)-1) ≈ -0.6321
+        assert!((r[0] - (-0.6321)).abs() < 1e-3);
+        assert!((r[1] - 0.0).abs() < 1e-5);
+        assert!((r[2] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_softplus() {
+        let t = Tensor::from_f32(&[-1.0, 0.0, 1.0], &[3], test_device()).unwrap();
+        let r = t.softplus(1.0, 20.0).unwrap().to_f32_vec().unwrap();
+        // softplus(0) = ln(2) ≈ 0.6931
+        assert!((r[1] - 0.6931).abs() < 1e-3);
+        // softplus(x) > 0 for all x
+        assert!(r[0] > 0.0);
+    }
+
+    #[test]
+    fn test_mish() {
+        let t = Tensor::from_f32(&[-1.0, 0.0, 1.0], &[3], test_device()).unwrap();
+        let r = t.mish().unwrap().to_f32_vec().unwrap();
+        // mish(0) = 0 * tanh(softplus(0)) = 0
+        assert!((r[1] - 0.0).abs() < 1e-5);
+        // mish(1) ≈ 0.8651
+        assert!((r[2] - 0.8651).abs() < 1e-3);
     }
 }

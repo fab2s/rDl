@@ -76,6 +76,11 @@ char* flodl_softmax(FlodlTensor t, int dim, FlodlTensor* result);
 char* flodl_log_softmax(FlodlTensor t, int dim, FlodlTensor* result);
 char* flodl_gelu(FlodlTensor t, FlodlTensor* result);
 char* flodl_silu(FlodlTensor t, FlodlTensor* result);
+char* flodl_leaky_relu(FlodlTensor t, double negative_slope, FlodlTensor* result);
+char* flodl_elu(FlodlTensor t, double alpha, FlodlTensor* result);
+char* flodl_softplus(FlodlTensor t, double beta, double threshold,
+                    FlodlTensor* result);
+char* flodl_mish(FlodlTensor t, FlodlTensor* result);
 
 // --- Layer normalization ---
 
@@ -90,6 +95,7 @@ char* flodl_sqrt(FlodlTensor t, FlodlTensor* result);
 char* flodl_abs(FlodlTensor t, FlodlTensor* result);
 char* flodl_pow_scalar(FlodlTensor t, double exponent, FlodlTensor* result);
 char* flodl_triu(FlodlTensor t, int64_t diagonal, FlodlTensor* result);
+char* flodl_tril(FlodlTensor t, int64_t diagonal, FlodlTensor* result);
 char* flodl_clamp(FlodlTensor t, double min_val, double max_val,
                 FlodlTensor* result);
 
@@ -99,6 +105,10 @@ char* flodl_sum(FlodlTensor t, FlodlTensor* result);
 char* flodl_mean(FlodlTensor t, FlodlTensor* result);
 char* flodl_sum_dim(FlodlTensor t, int dim, int keepdim, FlodlTensor* result);
 char* flodl_mean_dim(FlodlTensor t, int dim, int keepdim, FlodlTensor* result);
+char* flodl_prod(FlodlTensor t, FlodlTensor* result);
+char* flodl_prod_dim(FlodlTensor t, int dim, int keepdim, FlodlTensor* result);
+char* flodl_cumsum(FlodlTensor t, int dim, FlodlTensor* result);
+char* flodl_logsumexp(FlodlTensor t, int dim, int keepdim, FlodlTensor* result);
 char* flodl_min(FlodlTensor t, FlodlTensor* result);
 char* flodl_max(FlodlTensor t, FlodlTensor* result);
 char* flodl_norm(FlodlTensor t, FlodlTensor* result);
@@ -158,6 +168,10 @@ char* flodl_sort(FlodlTensor t, int dim, int descending,
 
 char* flodl_eye(int64_t n, int dtype, int device_type, int device_index,
                FlodlTensor* result);
+char* flodl_randperm(int64_t n, int dtype, int device_type, int device_index,
+                    FlodlTensor* result);
+char* flodl_multinomial(FlodlTensor probs, int64_t num_samples,
+                       int replacement, FlodlTensor* result);
 char* flodl_full(int64_t* shape, int ndim, double value, int dtype,
                 int device_type, int device_index, FlodlTensor* result);
 
@@ -201,6 +215,11 @@ char* flodl_index_add(FlodlTensor t, int dim, FlodlTensor index,
 char* flodl_cat2(FlodlTensor a, FlodlTensor b, int dim, FlodlTensor* result);
 char* flodl_cat(FlodlTensor* tensors, int count, int dim, FlodlTensor* result);
 char* flodl_stack(FlodlTensor* tensors, int count, int dim, FlodlTensor* result);
+
+// --- Masking ---
+
+char* flodl_masked_fill(FlodlTensor t, FlodlTensor mask, double value,
+                       FlodlTensor* result);
 
 // --- Conditional ---
 
@@ -348,6 +367,10 @@ char* flodl_zero_(FlodlTensor t);
 
 char* flodl_meshgrid(FlodlTensor* tensors, int count,
                     FlodlTensor** results, int* result_count);
+
+// --- Normalization ---
+
+char* flodl_normalize(FlodlTensor t, double p, int dim, FlodlTensor* result);
 
 // --- Pairwise distance ---
 
