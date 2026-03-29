@@ -316,6 +316,7 @@ for (input_t, target_t) in &batches {
 | **LR Scheduling** | `StepDecay`, `CosineScheduler`, `WarmupScheduler` (composable), `PlateauScheduler` |
 | **Mixed Precision** | `Float16`/`BFloat16` dtype casting, `GradScaler` for loss scaling |
 | **Monitor** | Human-readable ETA, CPU/GPU/RAM/VRAM tracking, live web dashboard |
+| **Graph Tree** | Hierarchical subgraph composition, label-path addressing, selective freeze/thaw, subgraph checkpoints, cross-boundary observation |
 
 ### Graph Builder
 
@@ -421,7 +422,7 @@ Every differentiable path is verified against finite-difference gradients:
 - 62 autograd op-level checks (every op + compositions)
 - Module-level checks (every NN module, input + parameter gradients)
 - Exact optimizer step verifications (SGD, Adam, AdamW)
-- 389 library tests, zero clippy warnings — all tests run on both CPU and CUDA
+- 420+ library tests, zero clippy warnings — all tests run on both CPU and CUDA
 
 ## Why Rust for Deep Learning?
 
@@ -583,6 +584,7 @@ Step-by-step guides from basics to advanced, each with code examples:
 7. **[Visualization](https://github.com/fab2s/floDl/blob/main/docs/tutorials/07-visualization.md)** — DOT/SVG output, reading diagrams
 8. **[Utilities](https://github.com/fab2s/floDl/blob/main/docs/tutorials/08-utilities.md)** — checkpoints, clipping, freezing, initialization
 9. **[Training Monitor](https://github.com/fab2s/floDl/blob/main/docs/tutorials/09-monitor.md)** — ETA, resource tracking, live web dashboard
+10. **[Graph Tree](https://github.com/fab2s/floDl/blob/main/docs/tutorials/10-graph-tree.md)** — hierarchical composition, freeze/thaw, subgraph checkpoints
 
 ### Design
 

@@ -240,6 +240,49 @@ epoch,duration_s,loss,cpu_pct,ram_used,gpu_pct,vram_alloc,vram_spill
 ...
 ```
 
+## Hierarchical Models (Graph Tree)
+
+When a graph has labeled children (see [Graph Tree](10-graph-tree.md)),
+`flush()` and `latest_metrics()` are tree-aware. A single flush on the parent
+propagates to all children, and the monitor automatically sees child metrics
+with dotted prefixes:
+
+```rust
+let subscan = FlowBuilder::from(scan_module)
+    .label("subscan")
+    .build()?;
+let letter = FlowBuilder::from(letter_module)
+    .label("letter")
+    .build()?;
+let model = FlowBuilder::from(subscan)
+    .through(letter)
+    .build()?;
+
+let mut monitor = Monitor::new(num_epochs);
+monitor.serve(3000)?;
+
+for epoch in 0..num_epochs {
+    let t = std::time::Instant::now();
+
+    for batch in &batches {
+        // ... forward, backward, step ...
+        model.record_at("subscan.ce", ce_value)?;
+        model.record_at("letter.accuracy", acc)?;
+        model.record_scalar("total_loss", total);
+    }
+
+    model.flush(&[]);  // flushes parent + subscan + letter
+    monitor.log(epoch, t.elapsed(), &model);
+    // Output: epoch 1/100  total_loss=0.42  subscan.ce=0.31  letter.accuracy=0.87  [1.2s ETA 2m]
+}
+```
+
+The dashboard shows each metric as a separate curve. Dotted names group
+naturally in the legend -- you can solo-click `subscan.ce` to focus on it.
+
+If child subgraphs flush on a different cadence, use `flush_local()` to manage
+them independently. See [Independent flush cadences](10-graph-tree.md#independent-flush-cadences).
+
 ## Monitor vs. Graph Observation
 
 floDl has two metric systems that serve different purposes:
@@ -323,6 +366,8 @@ See [`flodl/examples/quickstart/`](../../flodl/examples/quickstart/) for
 a runnable example with the monitor.
 
 ---
+
+Next: [10-Graph Tree](10-graph-tree.md)
 
 Previous tutorials: [08-Utilities](08-utilities.md) |
 [07-Visualization](07-visualization.md) |

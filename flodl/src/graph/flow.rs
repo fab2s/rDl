@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -74,6 +74,10 @@ pub struct FlowBuilder {
     pub(super) tag_groups: HashMap<String, Vec<String>>,
     /// Human-readable label for dashboard display.
     label: Option<String>,
+    /// Tags marked as internal (hidden from parent graph tree resolution).
+    internal_tags: HashSet<String>,
+    /// Print tree structure on build.
+    verbose: bool,
 }
 
 impl Default for FlowBuilder {
@@ -115,6 +119,8 @@ impl FlowBuilder {
             forward_refs: Vec::new(),
             tag_groups: HashMap::new(),
             label: None,
+            internal_tags: HashSet::new(),
+            verbose: false,
         };
 
         let node_ref = fb.add_module(module);
@@ -134,6 +140,19 @@ impl FlowBuilder {
     /// Does not affect the structural hash or `Module::name()`.
     pub fn label(mut self, name: &str) -> Self {
         self.label = Some(name.to_string());
+        self
+    }
+
+    /// Mark a tag as internal (hidden from parent graph tree resolution).
+    /// Internal tags cannot be accessed via `tagged_at()` from a parent graph.
+    pub fn internal(mut self, tag: &str) -> Self {
+        self.internal_tags.insert(tag.to_string());
+        self
+    }
+
+    /// Enable verbose output on build: prints tree structure, tag resolution, param summary.
+    pub fn verbose(mut self, enabled: bool) -> Self {
+        self.verbose = enabled;
         self
     }
 
@@ -551,6 +570,8 @@ impl FlowBuilder {
             self.forward_refs,
             self.tag_groups,
             self.label,
+            self.internal_tags,
+            self.verbose,
         )
     }
 

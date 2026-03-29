@@ -7,7 +7,7 @@
 //! # Features
 //!
 //! - **Layers**: Linear, Conv2d, ConvTranspose2d, LayerNorm, BatchNorm, Dropout, Embedding, GRUCell, LSTMCell, MaxPool2d
-//! - **Activations**: ReLU, Sigmoid, Tanh, GELU, SiLU (zero-sized types)
+//! - **Activations**: ReLU, Sigmoid, Tanh, GELU, SiLU (zero-sized types), GaussianBlur (fixed-sigma preprocessing)
 //! - **Losses**: MSE, CrossEntropy, BCE, L1, SmoothL1, KLDiv
 //! - **Optimizers**: SGD (momentum), Adam, AdamW -- fused Adam/AdamW uses `_fused_adamw_` on CUDA for single-kernel multi-tensor updates
 //! - **Schedulers**: StepDecay, Cosine, Warmup, Plateau
@@ -49,7 +49,8 @@ pub use loss::{mse_loss, cross_entropy_loss, bce_with_logits_loss, l1_loss, smoo
 pub use optim::{Optimizer, Stateful, SGD, SGDBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder};
 pub use checkpoint::{
     save_checkpoint, load_checkpoint, save_checkpoint_file, load_checkpoint_file,
-    LoadReport,
+    migrate_checkpoint, migrate_checkpoint_file, checkpoint_version,
+    LoadReport, MigrateReport,
 };
 pub use amp::{GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled};
 pub use clip::{clip_grad_norm, clip_grad_value};
@@ -64,13 +65,14 @@ pub use conv_transpose2d::ConvTranspose2d;
 pub use batchnorm::{BatchNorm, BatchNorm2d};
 pub use pooling::MaxPool2d;
 pub use init::{xavier_uniform, xavier_normal};
-pub use functional::gaussian_blur_2d;
+pub use functional::{gaussian_blur_2d, GaussianBlur};
 pub use cuda_graph::{CudaGraph, MemPoolId, CaptureMode, cuda_graph_capture, cuda_graph_pool_handle};
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::autograd::Variable;
+use crate::graph::Graph;
 use crate::tensor::Result;
 
 /// The core module trait: forward pass + parameter access.
@@ -167,6 +169,10 @@ pub trait Module {
     /// Override in types that implement `NamedInputModule` to enable
     /// receiving additional named inputs via graph `using()`.
     fn as_named_input(&self) -> Option<&dyn NamedInputModule> { None }
+
+    /// Upcast to [`Graph`] for hierarchical tree composition.
+    /// Override in Graph to enable subgraph nesting with label-path addressing.
+    fn as_graph(&self) -> Option<&Graph> { None }
 
     /// SHA-256 hex hash of module architecture for checkpoint validation.
     /// Override in composite modules (Graph) that compute a deterministic

@@ -481,6 +481,27 @@ GELU
 SiLU
 ```
 
+### Preprocessing Modules
+
+```python
+# PyTorch
+blur = torchvision.transforms.GaussianBlur(kernel_size=7, sigma=1.5)
+# or functional:
+y = torchvision.transforms.functional.gaussian_blur(x, kernel_size=7, sigma=1.5)
+```
+
+```rust
+// flodl — as a Module (for use in FlowBuilder graphs)
+let blur = GaussianBlur::new(1.5);  // kernel size auto-computed from sigma
+let y = blur.forward(&x)?;
+
+// flodl — as a free function
+let y = gaussian_blur_2d(&x, 1.5)?;  // input must be [B, C, H, W]
+```
+
+`GaussianBlur` is stateless (no parameters). Kernel size is `2 * ceil(3 * sigma) + 1`,
+matching OpenCV's default. Runs under `NoGradGuard` -- no autograd graph built.
+
 ## Composite Modules
 
 In PyTorch, `nn.Module.__init__` auto-discovers child modules assigned to `self`.
@@ -697,6 +718,40 @@ let report = model.load_checkpoint("model.fdl")?;
 let mut f = File::open("optimizer.fdl")?;
 optimizer.load_state(&mut f)?;
 ```
+
+### Migrating checkpoints across versions
+
+When parameter naming changes between flodl versions (e.g., tag renames from
+the graph tree release), use `migrate_checkpoint_file()` to remap an old
+checkpoint to match your current model:
+
+```rust
+use flodl::nn::{checkpoint_version, migrate_checkpoint_file};
+
+// Check if migration is needed
+if checkpoint_version("model.fdl")? < 2 {
+    let report = migrate_checkpoint_file(
+        "model.fdl",          // old checkpoint (v1)
+        "model_v2.fdl",       // migrated output (v2)
+        &model.named_parameters(),
+        &model.named_buffers(),
+    )?;
+    println!("{}", report);
+    // unchanged (1):
+    //   shared/weight
+    // remapped (2):
+    //   linear_0/weight -> encoder/weight
+    //   linear_0/bias -> encoder/bias
+}
+
+// Load the migrated checkpoint normally
+model.load_checkpoint("model_v2.fdl")?;
+```
+
+The migration matches entries by exact name first, then by shape+dtype in
+positional order. `MigrateReport::is_complete()` returns `true` when nothing
+was dropped or missing. Only works for the same model architecture -- if you
+changed the architecture, retrain.
 
 ## Device Placement
 
@@ -986,6 +1041,117 @@ model.svg(Some("model.svg"))?;      // render to SVG
 
 The graph implements `Module`, so it works with optimizers, checkpointing, and everything else.
 
+## Graph Tree (Hierarchical Composition)
+
+PyTorch uses `nn.Module` nesting and `named_modules()` for hierarchical access.
+flodl's graph tree provides label-path addressing for the same patterns — freeze
+by path, per-subgraph optimizer groups, subgraph checkpoint loading, and
+cross-boundary observation.
+
+### Labeling subgraphs
+
+```python
+# PyTorch — child modules are auto-discovered
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = Encoder()
+        self.decoder = Decoder()
+```
+
+```rust
+// flodl — label graphs for tree features
+let encoder = FlowBuilder::from(scan_module)
+    .through(read_module)
+    .label("encoder")
+    .build()?;
+
+let model = FlowBuilder::from(encoder)  // child "encoder" registered
+    .through(decoder)
+    .build()?;
+```
+
+### Selective freeze/thaw by path
+
+```python
+# PyTorch
+for param in model.encoder.parameters():
+    param.requires_grad = False
+# Thaw a sub-part:
+for param in model.encoder.scan.parameters():
+    param.requires_grad = True
+```
+
+```rust
+// flodl — declarative, by label path
+model.freeze("encoder")?;
+model.thaw("encoder.scan")?;
+assert!(model.is_frozen("encoder.read")?);  // read stays frozen
+```
+
+### Per-subgraph optimizer groups
+
+```python
+# PyTorch
+optimizer = torch.optim.Adam([
+    {'params': model.encoder.scan.parameters(), 'lr': 1e-4},
+    {'params': model.meta.parameters(), 'lr': 1e-3},
+])
+```
+
+```rust
+// flodl
+let mut optimizer = Adam::with_groups()
+    .group(&model.parameters_at("encoder.scan")?, 0.0001)
+    .group(&model.parameters_at("meta")?, 0.001)
+    .build();
+```
+
+### Subgraph checkpoint loading
+
+```python
+# PyTorch — load weights into a submodule
+state = torch.load("encoder_v1.pt")
+model.encoder.load_state_dict(state)
+```
+
+```rust
+// flodl — loads using the child's own namespace and hash validation
+let report = model.load_subgraph_checkpoint("encoder", "encoder_v1.fdl.gz")?;
+```
+
+### Cross-boundary observation
+
+```python
+# PyTorch — manual: register hooks or store intermediates in forward()
+```
+
+```rust
+// flodl — read tags and metrics across graph boundaries
+model.forward(&input)?;
+let hidden = model.tagged_at("encoder.hidden")?;  // Option<Variable>
+
+// Record and track metrics in children
+model.record_at("encoder.loss", loss_value)?;
+model.flush(&[]);  // flushes entire tree automatically
+
+let trend = model.trend_at("encoder.loss")?;
+```
+
+### Training mode propagation
+
+```python
+# PyTorch
+model.encoder.eval()  # BatchNorm uses running stats
+```
+
+```rust
+// flodl — by label path
+model.set_training_at("encoder", false)?;
+```
+
+See [Graph Tree tutorial](tutorials/10-graph-tree.md) for the full API reference.
+
 ## Training Monitor (replaces TensorBoard)
 
 PyTorch researchers typically use TensorBoard, Weights & Biases, or MLflow for
@@ -1092,6 +1258,8 @@ to query them manually during training.
 | `model.train()` | `module.train()` | |
 | `model.eval()` | `module.eval()` | |
 | `torch.save(...)` / `torch.load(...)` | `model.save_checkpoint("m.fdl")?` / `model.load_checkpoint("m.fdl")?` | Named `.fdl` format with `LoadReport` + structural hash validation |
+| *(no built-in)* | `migrate_checkpoint_file(src, dst, &params, &bufs)?` | Remap parameter names across versions by shape+dtype matching |
+| *(no built-in)* | `checkpoint_version(path)?` | Peek at checkpoint version (1=0.1.x, 2=0.2.0+) |
 | `param.requires_grad = False` | `param.freeze()?` | Also: `unfreeze()`, `is_frozen()` |
 | `Adam([{"params":..., "lr":...}])` | `Adam::with_groups().group(&p, lr).build()` | Per-group LR |
 | `torch.cuda.memory_reserved()` | `cuda_allocated_bytes()?` | Bytes reserved by caching allocator |

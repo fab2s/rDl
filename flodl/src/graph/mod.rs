@@ -1,14 +1,22 @@
-//! Computation graph: fluent builder, parallel execution, observation, profiling, and visualization.
+//! Computation graph: fluent builder, parallel execution, observation, profiling,
+//! visualization, and hierarchical composition.
 //!
 //! Build graphs with [`FlowBuilder`], execute via the [`Module`] trait.
+//! Label subgraphs for tree features: selective freeze/thaw, subgraph
+//! checkpoints, cross-boundary observation, and per-subgraph optimizer groups.
 //!
 //! ```ignore
-//! let g = FlowBuilder::from(Linear::new(4, 8)?)
+//! let encoder = FlowBuilder::from(Linear::new(4, 8)?)
 //!     .through(GELU)
+//!     .label("encoder")
+//!     .build()?;
+//!
+//! let model = FlowBuilder::from(encoder)
 //!     .through(Linear::new(8, 2)?)
 //!     .build()?;
 //!
-//! let y = g.forward(&x)?;
+//! let y = model.forward(&x)?;
+//! model.freeze("encoder")?;  // freeze by label path
 //! ```
 
 pub mod node;
@@ -27,6 +35,8 @@ pub mod halt;
 pub mod reshape;
 pub mod state;
 pub mod snapshot;
+pub mod tree;
+pub mod verbose;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -52,6 +62,7 @@ pub use halt::{ThresholdHalt, LearnedHalt};
 pub use reshape::Reshape;
 pub use state::StateAdd;
 pub use observe::Reduce;
+pub use tree::PathKind;
 pub use snapshot::ModelSnapshot;
 
 /// Merge operation for combining split branches.
@@ -144,6 +155,10 @@ pub struct Graph {
     // Identity: label + structural hash
     label: Option<String>,
     structural_hash_cache: OnceCell<String>,
+    // Graph tree: hierarchical composition
+    children: HashMap<String, usize>,
+    composed: Cell<bool>,
+    internal_tags: HashSet<String>,
     // Pre-computed execution plan (built once, used every forward call)
     routes_from: Vec<Vec<Route>>,
     input_routes: Vec<InputRoute>,
@@ -165,6 +180,8 @@ impl Graph {
         forward_refs: Vec<ForwardRefSpec>,
         tag_groups: HashMap<String, Vec<String>>,
         label: Option<String>,
+        mut internal_tags: HashSet<String>,
+        verbose: bool,
     ) -> Result<Self> {
         // Set up forward-reference state buffers and wire state read nodes
         let mut state = Vec::with_capacity(forward_refs.len());
@@ -243,6 +260,50 @@ impl Graph {
             }
         }
 
+        // Detect child subgraphs: labeled Graphs become tree children
+        let mut children: HashMap<String, usize> = HashMap::new();
+        for (idx, node) in nodes.iter().enumerate() {
+            if let Some(ref module) = node.module {
+                if let Some(child_graph) = module.as_graph() {
+                    if let Some(child_label) = child_graph.label() {
+                        if child_label.contains('.') {
+                            return Err(TensorError::new(&format!(
+                                "child graph label {:?} contains a dot — \
+                                 dots are reserved for path separators",
+                                child_label
+                            )));
+                        }
+                        if children.contains_key(child_label) {
+                            return Err(TensorError::new(&format!(
+                                "duplicate child graph label {:?} at the same tree level",
+                                child_label
+                            )));
+                        }
+                        // Validate: label doesn't shadow a tag on a different node
+                        if let Some(&(tag_ni, _)) = tag_names_map.get(child_label) {
+                            if tag_ni != idx {
+                                return Err(TensorError::new(&format!(
+                                    "child graph label {:?} collides with a tag \
+                                     on a different node",
+                                    child_label
+                                )));
+                            }
+                        }
+                        children.insert(child_label.to_string(), idx);
+                        child_graph.composed.set(true);
+                    }
+                    // Unlabeled graphs: not registered, no tree features, no error
+                }
+            }
+        }
+
+        // Auto-internal inference: underscore-prefixed tags
+        for name in tag_names_map.keys() {
+            if name.starts_with('_') {
+                internal_tags.insert(name.clone());
+            }
+        }
+
         // Build state writer lookup: node_idx → [(state_entry_idx, port_idx)]
         // Also resolve writer_ni on each state entry for DOT rendering.
         let mut state_writers: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -312,7 +373,7 @@ impl Graph {
             node_input_count.iter().map(|&c| vec![None; c]).collect(),
         );
 
-        Ok(Graph {
+        let graph = Ok(Graph {
             nodes,
             node_index,
             levels,
@@ -341,13 +402,24 @@ impl Graph {
             epoch_count: Cell::new(0),
             label,
             structural_hash_cache: OnceCell::new(),
+            children,
+            composed: Cell::new(false),
+            internal_tags,
             routes_from,
             input_routes,
             output_node_idx,
             output_port_idx,
             node_input_count,
             exec_slots,
-        })
+        });
+
+        if verbose {
+            if let Ok(ref g) = graph {
+                eprintln!("{}", g.tree_summary());
+            }
+        }
+
+        graph
     }
 
     fn forward_impl(&self, graph_inputs: &[Variable]) -> Result<Variable> {
@@ -418,24 +490,29 @@ impl Graph {
                 let inputs: Vec<Variable> = (0..input_count)
                     .map(|i| {
                         match slots[ni][i].as_ref() {
-                            Some(v) => v.clone(),
+                            Some(v) => Ok(v.clone()),
                             None if i > 0 => {
                                 // Zero fill for unconnected ref ports (forward refs)
-                                let first = slots[ni][0]
-                                    .as_ref()
-                                    .expect("missing primary input");
-                                Variable::new(
-                                    Tensor::zeros_like(&first.data()).unwrap(),
+                                let first = slots[ni][0].as_ref().ok_or_else(|| {
+                                    TensorError::new(&format!(
+                                        "node '{}': ref port {} has no data and primary input \
+                                         is also missing — check that all inputs are connected",
+                                        node.id, i
+                                    ))
+                                })?;
+                                Ok(Variable::new(
+                                    Tensor::zeros_like(&first.data())?,
                                     false,
-                                )
+                                ))
                             }
-                            _ => panic!(
-                                "missing input port {} for node '{}'",
-                                i, node.id
-                            ),
+                            _ => Err(TensorError::new(&format!(
+                                "node '{}': missing primary input (port {}) — check that all \
+                                 inputs to this node are connected in the graph builder",
+                                node.id, i
+                            ))),
                         }
                     })
-                    .collect();
+                    .collect::<Result<Vec<Variable>>>()?;
 
                 // Release input slots early (frees Rc references)
                 for slot in slots[ni].iter_mut() {
@@ -905,6 +982,8 @@ impl Graph {
 
 impl Module for Graph {
     fn name(&self) -> &str { "graph" }
+
+    fn as_graph(&self) -> Option<&Graph> { Some(self) }
 
     fn structural_hash(&self) -> Option<String> {
         Some(self.structural_hash().to_string())

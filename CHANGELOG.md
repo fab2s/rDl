@@ -5,7 +5,36 @@ All notable changes to floDl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-03-29
+
+### Added
+
+#### Graph Tree (hierarchical composition)
+- **Label-path addressing**: Dot-separated paths (`"encoder.scan.hidden"`) for addressing subgraphs and tags across graph boundaries. Strict dot semantics -- dots always mean subgraph boundaries, no fuzzy resolution.
+- **Tree registration**: Labeled graphs nested via `FlowBuilder` are automatically detected as child subgraphs. `tree_children()`, `child_graph()`, `subgraph()` for navigation. `is_composed()` flag on child graphs.
+- **Selective freeze/thaw**: `freeze("encoder.read")`, `thaw("encoder.scan")`, `is_frozen("encoder")` -- declarative training phase control by label path.
+- **Path-based parameter collection**: `parameters_at()`, `named_parameters_at()`, `named_buffers_at()` for per-subgraph optimizer groups. Target namespace used for checkpoint compatibility.
+- **Subgraph checkpoint loading**: `load_subgraph_checkpoint("encoder", "encoder_v1.fdl.gz")` -- loads a checkpoint into a specific subgraph using the child's own namespace and structural hash validation.
+- **Cross-boundary observation**: `tagged_at()` (null/nil semantics), `collect_at()`, `record_at()`, `trend_at()` -- read tagged outputs and metrics across graph boundaries.
+- **Tree-aware flush and metrics**: `flush()` automatically recurses into labeled child subgraphs. `latest_metrics()` collects from the entire tree with dotted prefixes (`"encoder.loss"`). `Monitor::log()` sees the whole tree with zero extra code. `flush_local()` and `latest_metrics_local()` for independent per-subgraph observation cadences.
+- **Internal tags**: Tags prefixed with `_` are auto-internal (hidden from parent resolution). Explicit `.internal("tag")` on FlowBuilder. Cross-boundary resolution rejects internal tags.
+- **Training mode propagation**: `set_training_at("encoder", false)` for selective eval mode on subgraphs (BatchNorm running stats).
+- **Verbose build output**: `.verbose(true)` on FlowBuilder prints tree structure, tag resolution, and parameter summary. `tree_summary()`, `param_summary()` methods.
+- **Path validation**: `validate_path()` returns `PathKind::Subgraph` or `PathKind::Tag` for build-time wiring checks.
+- **Module trait**: Added `as_graph()` method (default `None`, overridden in Graph) for subgraph detection.
+- **Zero forward-path impact**: All tree metadata is build-time/query-time only. The pre-computed Vec routing in `forward_impl()` is untouched.
+
+#### Modules
+- **`GaussianBlur`**: Stateless `Module` wrapper around `gaussian_blur_2d()` for use in `FlowBuilder` graphs. Fixed sigma, no parameters. Kernel size auto-computed from sigma (`2 * ceil(3 * sigma) + 1`).
+
+#### Checkpoint Migration
+- **`migrate_checkpoint()`** / **`migrate_checkpoint_file()`**: Automatically remap parameter names from an older checkpoint to match a model's current naming. Matches by exact name first, then by shape+dtype in positional order. Handles params and buffers, supports `.gz` compression. Returns a `MigrateReport` with `unchanged`, `remapped`, `dropped`, `missing` fields and a `Display` impl for human-readable output.
+- **`checkpoint_version()`**: Peek at a checkpoint file's version without loading it. Returns `1` for flodl 0.1.x, `2` for 0.2.0+.
+- **`MigrateReport`**: Full accounting of a migration — `is_complete()` returns true when nothing was dropped or missing.
+
+### Changed
+- **Breaking**: Checkpoint format version bumped to v2. Checkpoints saved with 0.2.0+ write version 2; `load_checkpoint` accepts both v1 and v2 (binary layout is identical, only naming conventions differ). v1 checkpoints can be migrated with `migrate_checkpoint_file()`.
+- **Breaking**: Restructuring a graph with `.label()` or renaming tags changes the parameter names that feed into `structural_hash()` — the hash algorithm is unchanged, but its inputs differ. Checkpoints saved before restructuring will fail architecture validation on load. Use `migrate_checkpoint_file()` to remap parameter names, or retrain.
 
 ## [0.1.5] - 2026-03-25
 
