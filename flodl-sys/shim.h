@@ -462,6 +462,18 @@ char* flodl_gru(FlodlTensor input, FlodlTensor h_0,
                 int64_t num_layers, bool batch_first, bool flatten,
                 FlodlTensor* output, FlodlTensor* h_n);
 
+// Cached RNN params — zero per-forward overhead (matches PyTorch's single-call pattern)
+char* flodl_rnn_params_create(const FlodlTensor* params, int64_t num_params,
+                              int64_t mode, int64_t num_layers, bool batch_first,
+                              bool flatten, void** out);
+void  flodl_rnn_params_free(void* rp);
+char* flodl_lstm_cached(FlodlTensor input, FlodlTensor h_0, FlodlTensor c_0,
+                        void* rp, int64_t num_layers, bool batch_first,
+                        FlodlTensor* output, FlodlTensor* h_n, FlodlTensor* c_n);
+char* flodl_gru_cached(FlodlTensor input, FlodlTensor h_0,
+                       void* rp, int64_t num_layers, bool batch_first,
+                       FlodlTensor* output, FlodlTensor* h_n);
+
 // --- Device ---
 
 char* flodl_to_device(FlodlTensor t, int device_type, int device_index,

@@ -1,7 +1,7 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
 use crate::autograd::Variable;
-use crate::tensor::{Device, DType, Result, Tensor, TensorOptions};
+use crate::tensor::{Device, DType, Result, RnnParams, Tensor, TensorOptions};
 
 use super::grucell::GRUCell;
 use super::parameter::Parameter;
@@ -24,9 +24,8 @@ pub struct GRU {
     hidden_size: i64,
     num_layers: usize,
     batch_first: bool,
-    /// Cached param tensors after cuDNN flatten (avoids per-forward collection + FFI).
-    flat_params: RefCell<Vec<Tensor>>,
-    params_flattened: Cell<bool>,
+    /// Cached cuDNN params — lives on C++ side, zero per-forward overhead.
+    rnn_params: RefCell<Option<RnnParams>>,
 }
 
 impl GRU {
@@ -54,8 +53,7 @@ impl GRU {
             hidden_size,
             num_layers,
             batch_first,
-            flat_params: RefCell::new(Vec::new()),
-            params_flattened: Cell::new(false),
+            rnn_params: RefCell::new(None),
         })
     }
 
@@ -93,20 +91,20 @@ impl GRU {
             None => Tensor::zeros(&[nl, batch, hs], opts)?,
         };
 
-        // Cache params after first cuDNN flatten — avoids per-forward collection + FFI.
-        let flatten = !self.params_flattened.get();
-        if flatten {
-            let params: Vec<Tensor> = self.cells.iter()
-                .flat_map(|cell| cell.parameters().into_iter().map(|p| p.variable.data()))
-                .collect();
-            *self.flat_params.borrow_mut() = params;
-            self.params_flattened.set(true);
+        // Lazily create C++ cached params on first forward (with cuDNN flatten).
+        // Subsequent forwards pass the opaque handle directly — zero overhead.
+        {
+            let mut cache = self.rnn_params.borrow_mut();
+            if cache.is_none() {
+                let params: Vec<Tensor> = self.cells.iter()
+                    .flat_map(|cell| cell.parameters().into_iter().map(|p| p.variable.data()))
+                    .collect();
+                *cache = Some(RnnParams::new(&params, 3, nl, self.batch_first, true)?);
+            }
         }
-        let cached = self.flat_params.borrow();
-
-        // Fused at::gru — single cuDNN kernel call for the full sequence
-        let (output, h_n) = input.data().gru_seq(
-            &h0, &cached, nl, self.batch_first, flatten,
+        let cache = self.rnn_params.borrow();
+        let (output, h_n) = input.data().gru_seq_cached(
+            &h0, cache.as_ref().unwrap(), nl, self.batch_first,
         )?;
 
         Ok((Variable::wrap(output), Variable::wrap(h_n)))
