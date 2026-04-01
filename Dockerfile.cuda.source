@@ -10,7 +10,7 @@
 # `make build-libtorch` auto-detects this from your installed GPUs.
 
 # ---- Stage 1: build libtorch from PyTorch source ----
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -59,7 +59,7 @@ ENV USE_NCCL=1
 ENV USE_DISTRIBUTED=1
 ENV BUILD_SHARED_LIBS=ON
 ENV CMAKE_BUILD_TYPE=Release
-ENV MAX_JOBS=4
+ENV MAX_JOBS=6
 ENV BUILD_PYTHON=OFF
 ENV BUILD_TEST=OFF
 ENV BUILD_CAFFE2=OFF
@@ -75,7 +75,7 @@ RUN mkdir -p /usr/local/libtorch && \
     cp -a /pytorch/torch/share /usr/local/libtorch/share 2>/dev/null || true
 
 # ---- Stage 2: runtime image (same as Dockerfile.cuda) ----
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
