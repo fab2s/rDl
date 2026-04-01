@@ -27,10 +27,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps needed by PyTorch build system
+# NOTE: do NOT install cmake via pip — pip cmake 4.x is too new for some
+# PyTorch submodules. Use the system cmake from apt instead.
 RUN pip3 install --break-system-packages \
     typing_extensions \
     pyyaml \
-    cmake \
     filelock \
     jinja2 \
     networkx \
@@ -58,21 +59,20 @@ ENV USE_NCCL=1
 ENV USE_DISTRIBUTED=1
 ENV BUILD_SHARED_LIBS=ON
 ENV CMAKE_BUILD_TYPE=Release
-ENV MAX_JOBS=""
+ENV MAX_JOBS=4
+ENV BUILD_PYTHON=OFF
+ENV BUILD_TEST=OFF
+ENV BUILD_CAFFE2=OFF
 
-# Build libtorch C++ library
-RUN mkdir build && cd build && \
-    cmake .. -GNinja \
-        -DBUILD_SHARED_LIBS=ON \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=/usr/local/libtorch \
-        -DUSE_CUDA=ON \
-        -DUSE_CUDNN=ON \
-        -DUSE_NCCL=ON \
-        -DTORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
-        -DBUILD_PYTHON=OFF \
-        -DBUILD_TEST=OFF \
-    && ninja install -j${MAX_JOBS:-$(nproc)}
+# Build libtorch C++ library using PyTorch's own build script.
+# Output lands in /pytorch/torch/{lib,include,share}.
+RUN python3 tools/build_libtorch.py
+
+# Package into the standard libtorch directory layout
+RUN mkdir -p /usr/local/libtorch && \
+    cp -a /pytorch/torch/lib /usr/local/libtorch/lib && \
+    cp -a /pytorch/torch/include /usr/local/libtorch/include && \
+    cp -a /pytorch/torch/share /usr/local/libtorch/share 2>/dev/null || true
 
 # ---- Stage 2: runtime image (same as Dockerfile.cuda) ----
 FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
