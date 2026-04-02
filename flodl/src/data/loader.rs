@@ -1005,9 +1005,16 @@ impl<'a> DistributedEpochIterator<'a> {
         let bs = loader.batch_size;
         let num_batches = if loader.drop_last { n / bs } else { n.div_ceil(bs) };
 
-        // Set up streaming receivers for streaming backends
+        // Open one persistent channel per streaming backend for the entire epoch.
         let streaming_rx: Vec<Option<std::sync::mpsc::Receiver<Result<super::prefetch::PrefetchedBatch>>>> =
-            loader.backends.iter().map(|_| None).collect();
+            loader.backends.iter().map(|backend| {
+                match backend {
+                    DeviceBackend::Streaming { worker, .. } => {
+                        Some(worker.start_distributed_epoch())
+                    }
+                    DeviceBackend::Resident { .. } => None,
+                }
+            }).collect();
 
         DistributedEpochIterator {
             loader,
@@ -1077,28 +1084,9 @@ impl Iterator for DistributedEpochIterator<'_> {
                     per_rank_shards.push(shard_tensors);
                 }
                 DeviceBackend::Streaming { worker, device: _ } => {
-                    // Send shard indices to the worker, receive on-device batch
-                    // Set up the channel if this is the first batch
-                    if self.streaming_rx[rank].is_none() {
-                        let rx = worker.start_epoch(
-                            shard_indices.to_vec(),
-                            shard_len,
-                            false, // don't drop_last per-shard
-                        );
-                        self.streaming_rx[rank] = Some(rx);
-                    } else {
-                        // For subsequent batches, we need per-batch loading.
-                        // For now, use a fresh start_epoch per batch (simple but correct).
-                        // Step 4 will add LoadBatch for efficient per-batch streaming.
-                        let rx = worker.start_epoch(
-                            shard_indices.to_vec(),
-                            shard_len,
-                            false,
-                        );
-                        self.streaming_rx[rank] = Some(rx);
-                    }
+                    // Send shard indices; result arrives on persistent epoch channel.
+                    worker.load_batch(shard_indices.to_vec());
 
-                    // Receive the batch
                     let rx = self.streaming_rx[rank].as_ref().unwrap();
                     match rx.recv() {
                         Ok(Ok(batch)) => {
@@ -1117,8 +1105,6 @@ impl Iterator for DistributedEpochIterator<'_> {
                             )));
                         }
                     }
-                    // Clear for next batch
-                    self.streaming_rx[rank] = None;
                 }
             }
         }

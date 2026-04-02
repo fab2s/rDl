@@ -191,6 +191,10 @@ pub(crate) struct DataLoaderBinding {
     /// Names of batch fields that are targets (for loss), not consumed by forward.
     #[allow(dead_code)]
     pub target_names: Vec<String>,
+    /// Maps graph input index → shard/batch tensor position.
+    /// `shard_input_map[i]` is the index into `per_rank_shards[rank]` or
+    /// `Batch` that provides `self.inputs[i]`.
+    pub shard_input_map: Vec<usize>,
     /// Chunk ratios for distributed training (updated by auto-balancer).
     /// Stored here so the epoch iterator can read them without borrowing DistributedState.
     pub chunk_ratios: Vec<f64>,
@@ -1383,6 +1387,27 @@ impl Graph {
             }
         }
 
+        // Build shard_input_map: graph input index → loader tensor position.
+        // self.inputs[0] is the entry (forward_input), self.inputs[1..] are .input() ports.
+        let mut shard_input_map: Vec<usize> = Vec::with_capacity(self.inputs.len());
+        for port in &self.inputs {
+            let lookup_name = if port.name == node::DEFAULT_INPUT {
+                forward_input
+            } else {
+                &port.name
+            };
+            match loader_names.iter().position(|n| n == lookup_name) {
+                Some(idx) => shard_input_map.push(idx),
+                None => {
+                    return Err(TensorError::new(&format!(
+                        "set_data_loader: graph input '{}' not found in loader names [{}]",
+                        lookup_name,
+                        loader_names.join(", ")
+                    )));
+                }
+            }
+        }
+
         // Get chunk_ratios
         let chunk_ratios = {
             let dist = self.distributed.borrow();
@@ -1396,6 +1421,7 @@ impl Graph {
             forward_input: forward_input.to_string(),
             graph_inputs,
             target_names,
+            shard_input_map,
             chunk_ratios,
         });
 
@@ -1546,12 +1572,14 @@ impl Graph {
         use crate::nn::cuda_event::{CudaEvent, CudaEventFlags};
         use crate::tensor::set_current_cuda_device;
 
-        // Take per-rank shards from the DataLoader
-        let per_rank_shards = {
+        // Take per-rank shards and input mapping from the DataLoader
+        let (per_rank_shards, shard_input_map) = {
             let binding = self.data_binding.borrow();
             let binding = binding.as_ref().unwrap();
-            binding.loader.take_shards()
-                .expect("forward_distributed_presharded: no shards pending")
+            let shards = binding.loader.take_shards()
+                .expect("forward_distributed_presharded: no shards pending");
+            let map = binding.shard_input_map.clone();
+            (shards, map)
         };
 
         let (n, devices, gather_device) = {
@@ -1588,17 +1616,23 @@ impl Graph {
             let start = CudaEvent::new(CudaEventFlags::Default)?;
             start.record()?;
 
-            // Position 0 is the forward input, already on this rank's device
-            let shard_input = Variable::new(shard_data[0].clone(), false);
+            // Build full input vector: map graph inputs to shard positions
+            let graph_inputs: Vec<Variable> = shard_input_map.iter()
+                .map(|&idx| Variable::new(shard_data[idx].clone(), false))
+                .collect();
 
             if rank == 0 {
-                let out = self.forward_impl(std::slice::from_ref(&shard_input))?;
+                let out = self.forward_impl(&graph_inputs)?;
                 outputs.push(out);
             } else {
                 let out = {
                     let dist = self.distributed.borrow();
                     let dist = dist.as_ref().unwrap();
-                    dist.replicas[rank - 1].forward(&shard_input)?
+                    let replica = &dist.replicas[rank - 1];
+                    match replica.as_graph() {
+                        Some(g) => g.forward_impl(&graph_inputs)?,
+                        None => replica.forward(&graph_inputs[0])?,
+                    }
                 };
                 // Gather output to gather device
                 let out_gathered = if out.data().device() != gather_device {
@@ -1643,7 +1677,7 @@ impl Graph {
     /// ```
     pub fn forward_batch(&self, batch: &crate::data::Batch) -> Result<Variable> {
         // Scope the borrow so it is released before calling methods that re-borrow.
-        let (has_shards, forward_input_name) = {
+        let (has_shards, forward_input_name, shard_input_map) = {
             let guard = self.data_binding.borrow();
             let binding = guard.as_ref()
                 .expect("call set_data_loader before forward_batch");
@@ -1651,29 +1685,32 @@ impl Graph {
             let has_shards = self.distributed.borrow().is_some()
                 && binding.loader.has_shards();
             let name = binding.forward_input.clone();
-            (has_shards, name)
+            let map = binding.shard_input_map.clone();
+            (has_shards, name, map)
         };
 
         // Check if presharded data is available
         if has_shards {
-            // Set auxiliary graph inputs from the per-rank shards
-            // (handled internally by forward_distributed_presharded)
             return self.forward_distributed_presharded();
         }
 
-        let input = if batch.has(&forward_input_name) {
-            Variable::new(batch[forward_input_name.as_str()].clone(), false)
-        } else {
+        // Build full input vector from batch using shard_input_map
+        let batch_names = batch.names();
+        let graph_inputs: Vec<Variable> = shard_input_map.iter()
+            .map(|&idx| Variable::new(batch[batch_names[idx].as_str()].clone(), false))
+            .collect();
+
+        if graph_inputs.is_empty() {
             return Err(TensorError::new(&format!(
                 "forward_batch: batch missing forward input '{}'",
                 forward_input_name,
             )));
-        };
+        }
 
         if self.distributed.borrow().is_some() {
-            self.forward_distributed_scatter(&input)
+            self.forward_distributed_scatter(&graph_inputs[0])
         } else {
-            self.forward_impl(std::slice::from_ref(&input))
+            self.forward_impl(&graph_inputs)
         }
     }
 }

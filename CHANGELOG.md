@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`Graph::epoch(epoch)`**: Returns `GraphEpochIterator` that produces per-rank shards and user-facing Batch. When distributed: each backend produces on-device data, shards stored for presharded forward. When single-GPU: delegates to DataLoader.
 - **`Graph::forward_batch(&batch)`**: Batch-aware forward. Extracts named inputs, handles DDP presharding transparently. Coexists with `Module::forward(&Variable)`.
 - **Presharded forward path**: `forward_distributed_presharded()` consumes per-rank shards from DataLoader via `.take_shards()`. Each replica forwards its local shard (zero cross-device input transfer). Outputs gathered to gather device. CudaEvent timing for auto-balancer.
+- **Multi-input auto-wiring**: `set_data_loader()` precomputes `shard_input_map` matching graph `.input()` port names to batch tensor positions. `forward_distributed_presharded()` passes all inputs (primary + auxiliary) to each replica via `as_graph().forward_impl()`. Single-GPU `forward_batch()` also builds the full input vector. Enables multi-input models (FBRL with case/origin alongside image) in distributed training.
+- **Efficient distributed streaming**: `StartDistributedEpoch` + `LoadBatch` worker commands. One channel per epoch instead of per-batch channel creation. Flat state machine in `worker_loop` (no nested loops). `PrefetchWorker::start_distributed_epoch()` opens the channel once, `load_batch()` sends indices per batch.
 - **Gather device selection**: Prefers resident backend with most free VRAM. Falls back to CPU if all backends are streaming (targets fetched from dataset). No GPU 0 priority.
 - **Auto-balancing integration**: Epoch iterator reads chunk_ratios fresh per batch. Shard sizes adapt as ratios change every 50 steps. Mixed resident/streaming backends handle dynamic ratios correctly.
 - Training loop identical for 1 or N GPUs. `distribute()` + `set_data_loader()` are the only differences.
@@ -92,8 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 #### Test Infrastructure
 - **15 tests un-ignored**: `cuda_event` (3), `cuda_stream` (4), DDP cross-device autograd (2) tests now run in the normal `make cuda-test` flow. They have proper mutex serialization and early-return guards.
 - **NCCL/DDP/Graph tests remain `#[ignore]`**: NCCL communicator init corrupts concurrent CUBLAS operations. Must run single-threaded.
-- **`make cuda-test-all`** (new): Two-pass target -- parallel tests + single-threaded NCCL/DDP/Graph tests.
-- **`make cuda-test-nccl`** (new): Convenience target for NCCL/DDP/Graph tests only.
+- **Process-isolated test targets**: NCCL tests run in their own cargo process to prevent CUBLAS context poisoning. Fixes SIGABRT in `test_manual_seed_reproducible` when run after NCCL init.
+  - **`make cuda-test-all`**: Three-pass target -- parallel + NCCL (isolated) + remaining serial.
+  - **`make cuda-test-nccl`**: NCCL/DDP tests only (isolated processes).
+  - **`make cuda-test-serial`** (new): Remaining serial tests (CUDA Graphs, manual_seed, probes).
 
 #### Build Targets
 - **`make setup`**: Auto-detect hardware, download CPU libtorch + CUDA libtorch (or build from source), build Docker image. One command from zero to ready.

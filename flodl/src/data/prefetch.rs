@@ -32,6 +32,17 @@ pub(crate) enum WorkerCmd {
         /// Per-epoch batch sender. Dropped when the epoch is done or cancelled.
         batch_tx: mpsc::SyncSender<Result<PrefetchedBatch>>,
     },
+    /// Open a distributed epoch: install the batch sender, then wait for
+    /// `LoadBatch` commands. The channel stays open until the next
+    /// `StartEpoch`/`StartDistributedEpoch`/`Stop`.
+    StartDistributedEpoch {
+        batch_tx: mpsc::SyncSender<Result<PrefetchedBatch>>,
+    },
+    /// Load a single batch (distributed mode). Worker sends the result on
+    /// the channel from the preceding `StartDistributedEpoch`.
+    LoadBatch {
+        indices: Vec<usize>,
+    },
     /// Shut down the worker.
     Stop,
 }
@@ -93,6 +104,23 @@ impl PrefetchWorker {
 
         batch_rx
     }
+
+    /// Open a distributed epoch: create one channel that persists across
+    /// all batches. Follow with [`load_batch()`] calls per batch.
+    pub fn start_distributed_epoch(&self) -> mpsc::Receiver<Result<PrefetchedBatch>> {
+        let (batch_tx, batch_rx) =
+            mpsc::sync_channel::<Result<PrefetchedBatch>>(self.prefetch_depth);
+
+        let _ = self.cmd_tx.send(WorkerCmd::StartDistributedEpoch { batch_tx });
+
+        batch_rx
+    }
+
+    /// Send a single batch of indices for loading (distributed mode).
+    /// The result arrives on the receiver from [`start_distributed_epoch()`].
+    pub fn load_batch(&self, indices: Vec<usize>) {
+        let _ = self.cmd_tx.send(WorkerCmd::LoadBatch { indices });
+    }
 }
 
 impl Drop for PrefetchWorker {
@@ -121,6 +149,9 @@ fn worker_loop(
         None
     };
 
+    // Distributed epoch channel, kept alive across LoadBatch commands.
+    let mut dist_tx: Option<mpsc::SyncSender<Result<PrefetchedBatch>>> = None;
+
     for cmd in &cmd_rx {
         match cmd {
             WorkerCmd::StartEpoch {
@@ -129,6 +160,8 @@ fn worker_loop(
                 drop_last,
                 batch_tx,
             } => {
+                dist_tx = None; // close any distributed channel
+
                 let n = indices.len();
                 let mut start = 0;
 
@@ -156,6 +189,23 @@ fn worker_loop(
                     }
                 }
                 // batch_tx is dropped here, closing the epoch's channel.
+            }
+            WorkerCmd::StartDistributedEpoch { batch_tx } => {
+                dist_tx = Some(batch_tx);
+            }
+            WorkerCmd::LoadBatch { indices } => {
+                if let Some(ref tx) = dist_tx {
+                    let result = fetch_and_transfer(
+                        &*dataset,
+                        &indices,
+                        device,
+                        #[cfg(feature = "cuda")]
+                        copy_stream.as_ref(),
+                    );
+                    if tx.send(result).is_err() {
+                        dist_tx = None; // consumer dropped
+                    }
+                }
             }
             WorkerCmd::Stop => break,
         }

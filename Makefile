@@ -7,7 +7,7 @@
 #   make setup        # detect hardware, download libtorch, build Docker image
 #   make test         # run CPU tests
 #   make cuda-test    # run CUDA tests (parallel)
-#   make cuda-test-all  # full suite including NCCL/DDP/Graph (serial)
+#   make cuda-test-all  # full suite: parallel + NCCL (isolated) + serial
 
 COMPOSE   = docker compose
 
@@ -45,7 +45,7 @@ RUN_GPU   = $(COMPOSE) run --rm cuda
 RUN_BENCH = $(COMPOSE) run --rm bench
 
 .PHONY: build test test-release check clippy doc shell clean \
-        cuda-build cuda-test cuda-test-nccl cuda-test-graph cuda-test-all \
+        cuda-build cuda-test cuda-test-nccl cuda-test-serial cuda-test-graph cuda-test-all \
         cuda-clippy cuda-shell \
         image cuda-image \
         test-all setup build-libtorch \
@@ -136,16 +136,21 @@ cuda-build: cuda-image _require-libtorch-cuda
 cuda-test: cuda-image _require-libtorch-cuda
 	$(RUN_GPU) cargo test --features cuda -- --nocapture
 
-# Run NCCL/DDP/Graph tests (need exclusive GPU, single-threaded)
+# Run NCCL/DDP tests (NCCL init poisons CUBLAS -- each group in isolated process)
 cuda-test-nccl: cuda-image _require-libtorch-cuda
-	$(RUN_GPU) cargo test --features cuda -- --nocapture --ignored --test-threads=1
+	$(RUN_GPU) cargo test --features cuda -- --nocapture --ignored --test-threads=1 nccl
+	$(RUN_GPU) cargo test --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute
+
+# Run remaining serial tests (Graphs, manual_seed, etc.) -- separate process, no NCCL poison
+cuda-test-serial: cuda-image _require-libtorch-cuda
+	$(RUN_GPU) cargo test --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute
 
 # Run CUDA Graph tests only (need exclusive GPU, single-threaded)
 cuda-test-graph: cuda-image _require-libtorch-cuda
 	$(RUN_GPU) cargo test --features cuda -- --nocapture --ignored --test-threads=1 cuda_graph
 
-# Full CUDA test suite: parallel + single-threaded NCCL/DDP/Graph
-cuda-test-all: cuda-test cuda-test-nccl
+# Full CUDA test suite: parallel + NCCL (isolated) + remaining serial
+cuda-test-all: cuda-test cuda-test-nccl cuda-test-serial
 
 # Lint with CUDA feature
 cuda-clippy: cuda-image _require-libtorch-cuda

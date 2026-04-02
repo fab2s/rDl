@@ -39,7 +39,7 @@ pub mod data;
 /// Shorthand for building `Vec<Box<dyn Module>>` from a list of modules.
 /// Use with `split`, `gate`, and `switch` to avoid manual `Box::new()` wrapping.
 ///
-/// ```ignore
+/// ```text
 /// .split(modules![read_head(H), read_head(H)])
 /// .gate(router, modules![Linear::new(H, H)?, Linear::new(H, H)?])
 /// ```

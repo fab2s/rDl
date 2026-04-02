@@ -188,7 +188,7 @@ impl FlowBuilder {
     /// Use this when multiple modules consume the same tensor independently
     /// (e.g. classification heads that read the same latent).
     ///
-    /// ```ignore
+    /// ```text
     /// .through(encoder).tag("latent")
     /// .fork(letter_head).tag("letter_logits")
     /// .fork(case_head).tag("case_logits")
@@ -401,7 +401,7 @@ impl FlowBuilder {
     /// Tags may be backward refs (already tagged) or forward refs (tagged later —
     /// resolved automatically via state buffers).
     ///
-    /// ```ignore
+    /// ```text
     /// .through(cross_attn).using(&["memory", "context"])
     /// ```
     pub fn using(mut self, refs: &[&str]) -> Self {
@@ -436,7 +436,7 @@ impl FlowBuilder {
     /// Fork the stream into parallel branches, one module per branch.
     /// All branches receive the same input. Follow with `merge` to recombine.
     ///
-    /// ```ignore
+    /// ```text
     /// .split(modules![Linear::new(H, H)?, Linear::new(H, H)?])
     /// .merge(MergeOp::Add)
     /// ```
