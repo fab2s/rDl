@@ -63,6 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 #### `Ddp::auto()` — One-Liner DDP Setup
 - **`Ddp::auto(&model, builder, optimizer)`**: Single call to auto-detect GPUs, distribute the model, set per-replica optimizers, and enable training mode. No-op distribute for single GPU/CPU (still sets optimizer + training). Training loop identical for 1 or N GPUs.
+- **`Ddp::auto_with(&model, builder, optimizer, config)`**: Same as `auto()` but accepts a `DdpConfig` for explicit El Che configuration (speed hints, overhead target, max anchor).
+- **`Ddp::is_heterogeneous()`**: Detects mixed GPU models. `auto()` auto-enables El Che when heterogeneous GPUs are detected.
 - **Hardware diagnostics**: Always prints detected hardware to stderr on call:
   - `ddp: 2 GPUs (heterogeneous) | RTX 5060 Ti (16.0 GB) | GTX 1060 (6.0 GB)`
   - `ddp: 1 GPU | RTX 5060 Ti (16.0 GB) | single-device mode`
@@ -92,6 +94,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 #### NCCL Device Safety
 - **Device save/restore**: All `NcclComms` methods (`new`, `all_reduce`, `broadcast`, and stream variants) now save and restore the current CUDA device around FFI calls. Prevents NCCL operations from leaking device context changes to callers.
 - **Shared `NCCL_LOCK`**: Single `pub(crate)` mutex in `ddp` module, used by both `nccl::tests` and `ddp::tests` to serialize NCCL communicator operations.
+
+#### El Che — Heterogeneous DDP
+- **`ElChe`**: Cadence strategy for mixed-GPU training. Slow device anchors the sync cadence, fast devices range ahead processing more batches per sync. Named after Che Guevara's marching principle: "the column marches at the slowest one's pace."
+  - `ElChe::new(world_size, anchor)` with builder pattern.
+  - `with_speed_ratio(slow_rank, ratio)`: Seed initial batch distribution from known speed differential. Self-corrects after first `report_timing()`.
+  - `with_overhead_target(f64)`: Default 0.10 (10%). Auto-tunes anchor upward to keep AllReduce overhead below target.
+  - `with_max_anchor(usize)`: Gradient staleness cap. Prevents unbounded accumulation.
+  - `report_timing(&wall_ms, sync_ms)`: Discovers true speed ratios from CudaEvent measurements, recomputes batch counts, auto-tunes anchor.
+  - `batch_counts() -> &[usize]`: Per-device batch counts for the current cadence step.
+  - `clamp_total(max) -> Vec<usize>`: Proportional clamping for epoch-end alignment.
+- **`DdpConfig`**: Configuration struct for `Ddp::auto_with()`.
+  - `speed_hint(slow_rank, ratio)`: Initial speed estimate (optional, self-corrects).
+  - `overhead_target(f64)`: AllReduce overhead ceiling.
+  - `max_anchor(Option<usize>)`: `None` = auto (default), `Some(0)` = disable El Che (traditional DDP), `Some(n)` = fixed cap.
+- **`Graph::step()` El Che branch**: Normalizes accumulated gradients by `1/count[rank]` (mean per device), weighted AllReduce by `count[rank]/total` (proportional contribution), reports timing to ElChe for adaptation. Existing scatter and single-GPU paths unchanged.
+- **`Graph::has_el_che()`** / **`Graph::configure_el_che()`**: Query and configure El Che state.
+- **`weighted_all_reduce_gradients()`**: Scales each replica's gradient by batch contribution before AllReduce Sum. Produces the mathematically correct mean gradient regardless of per-device batch counts.
+
+#### El Che Forward Path
+- **`forward_distributed_el_che()`**: Multi-batch per-device forward. Each device processes `batch_counts[rank]` complete batches independently. Gradients accumulate naturally via libtorch autograd across all forward passes. CudaEvent timing per rank.
+- **Tagged output gathering**: After each forward pass, tagged outputs (`Graph::tag()`) are captured from each device and concatenated across all batches and all devices. Custom loss functions work transparently on gathered intermediates: `model.tagged("scan_locations")` returns the catted value from all devices.
+- **El Che data routing**: `DistributedEpochIterator` pulls `sum(batch_counts)` complete batches per iteration (not shards). Routes whole batches to each device via `load_batch_on_device()` (supports both Resident index_select and Streaming prefetch worker). Proportional clamping near epoch boundaries.
+- **Epoch-end flush**: `ActiveGraphEpochIterator::drop()` detects accumulated un-synced gradients (forward without step) and forces a final `step()` to prevent silent gradient loss.
+- **`Graph::epoch()`** seeds initial batch counts from `ElChe::batch_counts()`. **`Graph::step()`** feeds updated counts back to the loader after `report_timing()`.
+- Training loop is identical for homogeneous and heterogeneous GPU setups. `Ddp::auto()` detects heterogeneous hardware and enables El Che automatically.
+
+#### Adaptive Data Pipeline
+- **VRAM-aware prefetch depth**: `prefetch_depth_from_vram()` computes channel depth from free VRAM, per-sample bytes, and batch size. No manual tuning needed.
+- **Bootstrap prefetch**: Initial depth of 4 batches during DataLoader construction. Real depth computed at `epoch(0)` after model is loaded and VRAM usage is stable.
+- **Per-epoch VRAM probing**: `epoch(N)` re-probes free VRAM and fills `(1 - margin)` of available space. Adapts to VRAM fragmentation and activation memory changes across epochs.
+- **`DataLoaderBuilder::vram_margin(f64)`**: Default 0.10 (10% coordination margin). Clamped to [0.01, 0.50]. User sets based on model activation overhead.
+- **Manual override**: `.prefetch(n)` or `set_prefetch_depth()` disables automatic adaptation (`user_set_depth` flag).
+- **`auto_resize()`**: Manual trigger for VRAM-based resize between epochs.
 
 ### Changed
 

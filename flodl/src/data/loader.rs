@@ -44,15 +44,24 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
     }
 }
 
-/// Auto-detect prefetch depth for streaming mode.
+/// Bootstrap prefetch depth: small buffer for the period between
+/// `build()` and the first `epoch()` call. The real depth is computed
+/// at `epoch()` time when free VRAM reflects actual model allocation.
+const BOOTSTRAP_PREFETCH: usize = 4;
+
+/// Compute prefetch depth from free VRAM and margin.
 ///
-/// The cap at 4 is conservative for local storage. For network/cloud
-/// storage (NFS, S3-FUSE), use `.prefetch(n)` to override.
-#[allow(dead_code)] // Phase 3
-fn auto_prefetch_depth(
+/// `margin` is the fraction to keep free (default 0.10 = 10%). The
+/// margin covers activation memory, gradients, and CUDA allocator
+/// overhead.
+///
+/// Called at each `epoch()` boundary. By that point the model, optimizer,
+/// and any other allocations are done, so free VRAM is the real budget.
+fn prefetch_depth_from_vram(
     per_sample_bytes: usize,
     batch_size: usize,
     device: Device,
+    margin: f64,
 ) -> usize {
     if !device.is_cuda() {
         return 2; // CPU: just double-buffer
@@ -68,9 +77,8 @@ fn auto_prefetch_depth(
         .map(|(free, _)| free)
         .unwrap_or(0) as usize;
 
-    // Use at most 10% of free VRAM for prefetch buffer
-    let budget = free / 10;
-    (budget / batch_bytes).clamp(2, 4)
+    let budget = (free as f64 * (1.0 - margin)) as usize;
+    (budget / batch_bytes).max(2)
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +97,7 @@ pub struct DataLoaderBuilder {
     drop_last: bool,
     force_streaming: bool,
     names: Option<Vec<String>>,
+    vram_margin: f64,
 }
 
 impl DataLoaderBuilder {
@@ -103,6 +112,7 @@ impl DataLoaderBuilder {
             drop_last: true,
             force_streaming: false,
             names: None,
+            vram_margin: 0.10,
         }
     }
 
@@ -154,13 +164,28 @@ impl DataLoaderBuilder {
 
     /// Override auto-detected prefetch depth (streaming mode only).
     ///
-    /// The default auto-detection caps at 4 batches, which is sufficient
-    /// for local storage. For high-latency scenarios (cloud/NFS/S3-FUSE),
-    /// increase this to hide network round-trip times.
+    /// Auto-detection fills `(1 - margin)` of free VRAM at build time.
+    /// Use this to set a specific depth instead. Disables automatic
+    /// per-epoch adaptation.
     ///
     /// Set to 0 for synchronous loading (no background thread).
     pub fn prefetch(mut self, depth: usize) -> Self {
         self.prefetch_depth = Some(depth);
+        self
+    }
+
+    /// VRAM safety margin for prefetch buffer (streaming mode).
+    ///
+    /// Default: 0.10 (10%). At each `epoch()` call, the loader probes
+    /// free VRAM and fills `(1 - margin)` of it with prefetch batches.
+    /// The margin covers activation memory, gradients, and CUDA allocator
+    /// overhead during training.
+    ///
+    /// The real VRAM budget is computed at `epoch()` time (not `build()`),
+    /// so the model can be loaded in any order. The worker fills the
+    /// channel progressively.
+    pub fn vram_margin(mut self, margin: f64) -> Self {
+        self.vram_margin = margin.clamp(0.01, 0.50);
         self
     }
 
@@ -233,6 +258,7 @@ impl DataLoaderBuilder {
             drop_last,
             force_streaming,
             names,
+            vram_margin,
         } = self;
 
         let n = dataset.len();
@@ -272,10 +298,11 @@ impl DataLoaderBuilder {
             Box::new(RandomSampler::new(n, seed))
         });
 
-        let streaming_depth = prefetch_depth.unwrap_or_else(|| {
-            auto_prefetch_depth(per_sample_bytes, batch_size, device)
-        });
-
+        let user_set_depth = prefetch_depth.is_some();
+        // Bootstrap depth: small buffer to start. The real depth is
+        // computed at epoch() time when free VRAM reflects the actual
+        // model allocation. User override skips adaptive sizing.
+        let streaming_depth = prefetch_depth.unwrap_or(BOOTSTRAP_PREFETCH);
         if use_resident {
             match build_resident(Arc::clone(&dataset), batch_size, device, sampler, drop_last, names.clone()) {
                 Ok(loader) => Ok(loader),
@@ -288,12 +315,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(n))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_margin, user_set_depth, names)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_margin, user_set_depth, names)
         }
     }
 }
@@ -340,6 +367,7 @@ fn build_resident(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_streaming(
     dataset: Arc<dyn BatchDataSet>,
     batch_size: usize,
@@ -347,6 +375,9 @@ fn build_streaming(
     sampler: Box<dyn Sampler>,
     drop_last: bool,
     prefetch_depth: usize,
+    per_sample_bytes: usize,
+    vram_margin: f64,
+    user_set_depth: bool,
     names: Vec<String>,
 ) -> Result<DataLoader> {
     let worker = PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth);
@@ -360,6 +391,9 @@ fn build_streaming(
             drop_last,
             worker,
             names,
+            per_sample_bytes,
+            vram_margin,
+            user_set_depth,
         }),
     })
 }
@@ -511,6 +545,81 @@ impl DataLoader {
         matches!(&self.inner, LoaderInner::Distributed(_))
     }
 
+    /// Current prefetch depth (streaming mode). Returns 0 for resident loaders.
+    pub fn prefetch_depth(&self) -> usize {
+        match &self.inner {
+            LoaderInner::Resident(_) => 0,
+            LoaderInner::Streaming(l) => l.worker.prefetch_depth(),
+            LoaderInner::Distributed(l) => {
+                l.backends.iter().filter_map(|b| match b {
+                    DeviceBackend::Streaming { worker, .. } => Some(worker.prefetch_depth()),
+                    _ => None,
+                }).max().unwrap_or(0)
+            }
+        }
+    }
+
+    /// Set prefetch depth for streaming backends. Takes effect on the next epoch.
+    ///
+    /// Disables automatic resize (the loader won't override your setting).
+    /// No-op for resident loaders (the entire dataset is already in VRAM).
+    pub fn set_prefetch_depth(&mut self, depth: usize) {
+        match &mut self.inner {
+            LoaderInner::Resident(_) => {}
+            LoaderInner::Streaming(l) => {
+                l.worker.set_prefetch_depth(depth);
+                l.user_set_depth = true;
+            }
+            LoaderInner::Distributed(l) => {
+                for backend in &mut l.backends {
+                    if let DeviceBackend::Streaming { worker, .. } = backend {
+                        worker.set_prefetch_depth(depth);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Measure free VRAM and resize prefetch buffers to fill available space.
+    ///
+    /// **This happens automatically** at every epoch boundary (epoch 1+).
+    /// The loader re-probes free VRAM each epoch and fills 90% of it.
+    /// You only need to call this manually if you want to resize at a
+    /// different point (e.g., mid-epoch during an AllReduce window).
+    ///
+    /// Calling this (or [`set_prefetch_depth`](DataLoader::set_prefetch_depth))
+    /// disables automatic adaptation -- the loader assumes you're managing
+    /// depth yourself.
+    ///
+    /// The data is static across epochs, so a deeper buffer means more of
+    /// the dataset stays in VRAM and fewer H2D transfers are needed. If the
+    /// buffer covers the entire epoch, performance converges to resident mode.
+    ///
+    /// Returns the new prefetch depth (0 for resident loaders).
+    pub fn auto_resize(&mut self) -> usize {
+        match &mut self.inner {
+            LoaderInner::Resident(_) => 0,
+            LoaderInner::Streaming(l) => {
+                let depth = prefetch_depth_from_vram(l.per_sample_bytes, l.batch_size, l.device, l.vram_margin);
+                l.worker.set_prefetch_depth(depth);
+                l.user_set_depth = true;
+                depth
+            }
+            LoaderInner::Distributed(l) => {
+                let bs = l.batch_size;
+                let mut max_depth = 0;
+                for backend in &mut l.backends {
+                    if let DeviceBackend::Streaming { worker, device, per_sample_bytes } = backend {
+                        let depth = prefetch_depth_from_vram(*per_sample_bytes, bs, *device, 0.10);
+                        worker.set_prefetch_depth(depth);
+                        max_depth = max_depth.max(depth);
+                    }
+                }
+                max_depth
+            }
+        }
+    }
+
     /// Get the shared dataset Arc (for upgrade_distributed to load onto devices).
     pub(crate) fn dataset_arc(&self) -> Result<Arc<dyn BatchDataSet>> {
         match &self.inner {
@@ -539,12 +648,7 @@ impl DataLoader {
             }
         };
 
-        let per_sample_bytes: usize = {
-            let sample = dataset.get_batch(&[0])?;
-            sample.iter().map(|t| t.nbytes()).sum()
-        };
-
-        let prefetch_depth = auto_prefetch_depth(per_sample_bytes, batch_size, devices[0]);
+        let prefetch_depth = BOOTSTRAP_PREFETCH;
         let (backends, gather_device, gather_resident_idx) =
             build_distributed_backends(&dataset, devices, prefetch_depth)?;
 
@@ -560,6 +664,8 @@ impl DataLoader {
             drop_last,
             names,
             pending_shards: std::cell::Cell::new(None),
+            el_che_counts: std::cell::Cell::new(None),
+            pending_el_che_batches: std::cell::Cell::new(None),
             gather_device,
             gather_resident_idx,
             seed,
@@ -580,6 +686,29 @@ impl DataLoader {
     pub(crate) fn has_shards(&self) -> bool {
         match &self.inner {
             LoaderInner::Distributed(l) => l.has_shards(),
+            _ => false,
+        }
+    }
+
+    /// Set El Che per-device batch counts (called by Graph::step).
+    pub(crate) fn set_el_che_counts(&self, counts: Vec<usize>) {
+        if let LoaderInner::Distributed(l) = &self.inner {
+            l.set_el_che_counts(counts);
+        }
+    }
+
+    /// Consume per-device El Che batches (for forward_distributed_el_che).
+    pub(crate) fn take_el_che_batches(&self) -> Option<Vec<Vec<Vec<Tensor>>>> {
+        match &self.inner {
+            LoaderInner::Distributed(l) => l.take_el_che_batches(),
+            _ => None,
+        }
+    }
+
+    /// Whether El Che batches are pending.
+    pub(crate) fn has_el_che_batches(&self) -> bool {
+        match &self.inner {
+            LoaderInner::Distributed(l) => l.has_el_che_batches(),
             _ => false,
         }
     }
@@ -666,10 +795,27 @@ pub(crate) struct StreamingLoader {
     drop_last: bool,
     worker: PrefetchWorker,
     names: Vec<String>,
+    /// Per-sample bytes (for adaptive resize depth calculation).
+    per_sample_bytes: usize,
+    /// VRAM safety margin for adaptive prefetch (fraction to keep free).
+    vram_margin: f64,
+    /// True when the user explicitly set depth (`.prefetch()` or `set_prefetch_depth()`).
+    /// Skips automatic adaptation so we don't override the user's choice.
+    user_set_depth: bool,
 }
 
 impl StreamingLoader {
     fn epoch(&mut self, epoch: usize) -> EpochIterator<'_> {
+        // Probe free VRAM and size the prefetch buffer to fill (1 - margin).
+        // At epoch 0 this is the real signal: model is loaded, VRAM is known.
+        // At epoch N>0: re-probe in case conditions changed.
+        if !self.user_set_depth {
+            let depth = prefetch_depth_from_vram(
+                self.per_sample_bytes, self.batch_size, self.device, self.vram_margin,
+            );
+            self.worker.set_prefetch_depth(depth);
+        }
+
         let indices = self.sampler.indices(epoch);
         let n = indices.len();
         let bs = self.batch_size;
@@ -831,14 +977,15 @@ pub(crate) enum DeviceBackend {
     Streaming {
         worker: PrefetchWorker,
         device: Device,
+        /// Per-sample bytes (for adaptive resize depth calculation).
+        per_sample_bytes: usize,
     },
 }
 
 impl DeviceBackend {
     fn device(&self) -> Device {
         match self {
-            DeviceBackend::Resident { device, .. } => *device,
-            DeviceBackend::Streaming { device, .. } => *device,
+            DeviceBackend::Resident { device, .. } | DeviceBackend::Streaming { device, .. } => *device,
         }
     }
 
@@ -867,6 +1014,14 @@ pub(crate) struct DistributedLoader {
     /// `pending_shards[rank]` = `Vec<Tensor>` (all tensor positions) on `devices[rank]`.
     /// Set by `DistributedEpochIterator::next()`, consumed by `Graph::forward_distributed_presharded()`.
     pub pending_shards: std::cell::Cell<Option<Vec<Vec<Tensor>>>>,
+    /// El Che: per-device batch counts for the current cadence step.
+    /// Set by `Graph::step()` after `ElChe::report_timing()`, read by `DistributedEpochIterator::next()`.
+    /// `None` means El Che is inactive (standard sharding path).
+    pub el_che_counts: std::cell::Cell<Option<Vec<usize>>>,
+    /// El Che: per-device complete batches from the last epoch iterator advance.
+    /// `[rank][batch_idx][tensor_position]` -- each batch is a complete, unsharded batch on that device.
+    /// Set by `DistributedEpochIterator::next()`, consumed by `Graph::forward_distributed_el_che()`.
+    pub pending_el_che_batches: std::cell::Cell<Option<Vec<Vec<Vec<Tensor>>>>>,
     /// Device for the user-facing batch (loss computation).
     pub gather_device: Device,
     /// If gather_device is a resident backend, its index. None if gather is CPU.
@@ -888,6 +1043,37 @@ impl DistributedLoader {
         let val = self.pending_shards.take();
         let has = val.is_some();
         self.pending_shards.set(val);
+        has
+    }
+
+    /// Set El Che per-device batch counts (called by Graph::step after report_timing).
+    pub fn set_el_che_counts(&self, counts: Vec<usize>) {
+        self.el_che_counts.set(Some(counts));
+    }
+
+    /// Take El Che batch counts (consumed by the epoch iterator each iteration).
+    pub fn take_el_che_counts(&self) -> Option<Vec<usize>> {
+        self.el_che_counts.take()
+    }
+
+    /// Peek whether El Che counts are set.
+    pub fn has_el_che_counts(&self) -> bool {
+        let val = self.el_che_counts.take();
+        let has = val.is_some();
+        self.el_che_counts.set(val);
+        has
+    }
+
+    /// Consume per-device El Che batches (for forward_distributed_el_che).
+    pub fn take_el_che_batches(&self) -> Option<Vec<Vec<Vec<Tensor>>>> {
+        self.pending_el_che_batches.take()
+    }
+
+    /// Whether El Che batches are pending.
+    pub fn has_el_che_batches(&self) -> bool {
+        let val = self.pending_el_che_batches.take();
+        let has = val.is_some();
+        self.pending_el_che_batches.set(val);
         has
     }
 }
@@ -932,7 +1118,11 @@ fn build_distributed_backends(
         }
         // Streaming fallback
         let worker = PrefetchWorker::new(Arc::clone(dataset), dev, prefetch_depth);
-        backends.push(DeviceBackend::Streaming { worker, device: dev });
+        backends.push(DeviceBackend::Streaming {
+            worker,
+            device: dev,
+            per_sample_bytes,
+        });
     }
 
     // Select gather device: prefer resident backend with most free VRAM
@@ -1034,6 +1224,13 @@ impl Iterator for DistributedEpochIterator<'_> {
         if self.remaining == 0 {
             return None;
         }
+
+        // El Che path: pull complete batches per device
+        if self.loader.has_el_che_counts() {
+            return self.next_el_che();
+        }
+
+        // Standard sharding path
         self.remaining -= 1;
 
         let bs = self.loader.batch_size;
@@ -1083,7 +1280,7 @@ impl Iterator for DistributedEpochIterator<'_> {
                     }
                     per_rank_shards.push(shard_tensors);
                 }
-                DeviceBackend::Streaming { worker, device: _ } => {
+                DeviceBackend::Streaming { worker, .. } => {
                     // Send shard indices; result arrives on persistent epoch channel.
                     worker.load_batch(shard_indices.to_vec());
 
@@ -1131,6 +1328,160 @@ impl Iterator for DistributedEpochIterator<'_> {
 impl ExactSizeIterator for DistributedEpochIterator<'_> {}
 
 impl DistributedEpochIterator<'_> {
+    /// El Che iteration: pull complete batches per device, not shards.
+    ///
+    /// Each device gets `counts[rank]` complete batches of `batch_size` samples.
+    /// Data is loaded to each device independently. The user-facing Batch
+    /// contains all targets concatenated (for loss computation on gathered output).
+    fn next_el_che(&mut self) -> Option<Result<Batch>> {
+        let counts = self.loader.take_el_che_counts().unwrap_or_default();
+        let n_devices = counts.len();
+        let total_batches: usize = counts.iter().sum();
+        if total_batches == 0 {
+            self.remaining = 0;
+            return None;
+        }
+
+        // Every rank must process at least 1 batch per sync point.
+        // If fewer batches remain than devices, end the epoch.
+        if self.remaining < n_devices {
+            self.remaining = 0;
+            return None;
+        }
+
+        // Clamp if near epoch end, ensuring minimum 1 per rank
+        let actual_counts = if total_batches > self.remaining {
+            // Scale proportionally to fit remaining batches
+            let scale = self.remaining as f64 / total_batches as f64;
+            let mut clamped: Vec<usize> = counts.iter()
+                .map(|&c| ((c as f64 * scale).floor() as usize).max(1))
+                .collect();
+            // Trim if we overshot remaining (from the .max(1) floors)
+            let mut clamped_total: usize = clamped.iter().sum();
+            while clamped_total > self.remaining {
+                // Reduce the largest count
+                if let Some(max_idx) = clamped.iter().enumerate()
+                    .filter(|&(_, &c)| c > 1)
+                    .max_by_key(|&(_, &c)| c)
+                    .map(|(i, _)| i)
+                {
+                    clamped[max_idx] -= 1;
+                    clamped_total -= 1;
+                } else {
+                    break; // all at 1, can't reduce further
+                }
+            }
+            // Distribute any remaining deficit
+            let mut deficit = self.remaining.saturating_sub(clamped_total);
+            for c in &mut clamped {
+                if deficit == 0 { break; }
+                *c += 1;
+                deficit -= 1;
+            }
+            clamped
+        } else {
+            counts
+        };
+
+        let actual_total: usize = actual_counts.iter().sum();
+        if actual_total == 0 {
+            self.remaining = 0;
+            return None;
+        }
+
+        let bs = self.loader.batch_size;
+        let n = self.permutation.len();
+
+        // Pull total_batches * batch_size samples from the permutation
+        let total_samples = actual_total * bs;
+        let avail = n - self.cursor;
+        let take_samples = total_samples.min(avail);
+        let all_indices: Vec<usize> = self.permutation[self.cursor..self.cursor + take_samples].to_vec();
+        self.cursor += take_samples;
+
+        // Route complete batches to each device
+        let mut per_device_batches: Vec<Vec<Vec<Tensor>>> = Vec::with_capacity(actual_counts.len());
+        let mut sample_offset = 0usize;
+
+        for (rank, &count) in actual_counts.iter().enumerate() {
+            let backend = &self.loader.backends[rank];
+            let mut device_batches: Vec<Vec<Tensor>> = Vec::with_capacity(count);
+
+            for _ in 0..count {
+                let batch_end = (sample_offset + bs).min(all_indices.len());
+                if batch_end <= sample_offset {
+                    break;
+                }
+                let batch_indices = &all_indices[sample_offset..batch_end];
+                sample_offset = batch_end;
+
+                match self.load_batch_on_device(backend, batch_indices, rank) {
+                    Ok(tensors) => device_batches.push(tensors),
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+
+            per_device_batches.push(device_batches);
+        }
+
+        self.remaining = self.remaining.saturating_sub(actual_total);
+
+        // Build gathered user batch with all targets concatenated
+        let user_batch = match self.build_gather_batch(&all_indices[..take_samples.min(all_indices.len())], &[]) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Store per-device batches for forward_distributed_el_che()
+        self.loader.pending_el_che_batches.set(Some(per_device_batches));
+
+        // Re-seed counts for next iteration (step() will overwrite with updated counts)
+        self.loader.el_che_counts.set(Some(actual_counts));
+
+        Some(Ok(user_batch))
+    }
+
+    /// Load a single batch on a specific device backend.
+    fn load_batch_on_device(
+        &self,
+        backend: &DeviceBackend,
+        batch_indices: &[usize],
+        rank: usize,
+    ) -> Result<Vec<Tensor>> {
+        match backend {
+            DeviceBackend::Resident { gpu_data, device } => {
+                let idx_i64: Vec<i64> = batch_indices.iter().map(|&i| i as i64).collect();
+                let idx_tensor = Tensor::from_i64(
+                    &idx_i64,
+                    &[idx_i64.len() as i64],
+                    *device,
+                )?;
+                let mut tensors = Vec::with_capacity(gpu_data.len());
+                for t in gpu_data {
+                    tensors.push(t.index_select(0, &idx_tensor)?);
+                }
+                Ok(tensors)
+            }
+            DeviceBackend::Streaming { worker, .. } => {
+                worker.load_batch(batch_indices.to_vec());
+                let rx = self.streaming_rx[rank].as_ref().unwrap();
+                match rx.recv() {
+                    Ok(Ok(batch)) => {
+                        #[cfg(feature = "cuda")]
+                        if let Some(ref event) = batch.ready_event {
+                            event.synchronize()?;
+                        }
+                        Ok(batch.tensors)
+                    }
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(TensorError::new(
+                        "DataLoader: streaming worker stopped unexpectedly",
+                    )),
+                }
+            }
+        }
+    }
+
     /// Build the user-facing Batch on the gather device.
     fn build_gather_batch(
         &self,
@@ -1928,5 +2279,200 @@ mod tests {
         );
         let out = model.forward(&x).unwrap();
         assert_eq!(out.shape(), &[3, 2]);
+    }
+
+    // -- Adaptive prefetch tests ----------------------------------------------
+
+    #[test]
+    fn test_prefetch_depth_from_vram_cpu() {
+        // CPU always returns 2 (double-buffer)
+        let depth = prefetch_depth_from_vram(100, 32, Device::CPU, 0.10);
+        assert_eq!(depth, 2);
+    }
+
+    #[test]
+    fn test_prefetch_depth_from_vram_zero_batch() {
+        let depth = prefetch_depth_from_vram(0, 32, Device::CPU, 0.10);
+        assert_eq!(depth, 2);
+    }
+
+    #[test]
+    fn test_prefetch_depth_from_vram_zero_bytes() {
+        let depth = prefetch_depth_from_vram(100, 0, Device::CPU, 0.10);
+        assert_eq!(depth, 2);
+    }
+
+    #[test]
+    fn test_streaming_prefetch_depth_and_resize() {
+        let data = SequentialData { n: 100 };
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(10)
+            .streaming()
+            .build()
+            .unwrap();
+
+        // Should be in streaming mode
+        assert!(!loader.is_resident());
+
+        // Initial depth should be at least 2
+        let initial = loader.prefetch_depth();
+        assert!(initial >= 2, "initial depth should be >= 2, got {initial}");
+
+        // Manual set
+        loader.set_prefetch_depth(42);
+        assert_eq!(loader.prefetch_depth(), 42);
+
+        // Reset to something sensible
+        loader.set_prefetch_depth(4);
+        assert_eq!(loader.prefetch_depth(), 4);
+    }
+
+    #[test]
+    fn test_resident_prefetch_depth_is_zero() {
+        let data = SequentialData { n: 20 };
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(5)
+            .build()
+            .unwrap();
+
+        // CPU defaults to resident
+        assert!(loader.is_resident());
+        assert_eq!(loader.prefetch_depth(), 0);
+
+        // set/auto_resize are no-ops for resident
+        loader.set_prefetch_depth(100);
+        assert_eq!(loader.prefetch_depth(), 0);
+
+        let depth = loader.auto_resize();
+        assert_eq!(depth, 0);
+    }
+
+    #[test]
+    fn test_streaming_auto_resize_cpu() {
+        let data = SequentialData { n: 100 };
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(10)
+            .streaming()
+            .build()
+            .unwrap();
+
+        // On CPU, auto_resize returns 2 (just double-buffer)
+        let depth = loader.auto_resize();
+        assert_eq!(depth, 2);
+    }
+
+    #[test]
+    fn test_streaming_epoch_after_resize() {
+        // Verify that changing prefetch depth doesn't break iteration
+        let data = SequentialData { n: 50 };
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(10)
+            .streaming()
+            .build()
+            .unwrap();
+
+        loader.set_prefetch_depth(8);
+
+        let mut count = 0;
+        for batch in loader.epoch(0) {
+            let b = batch.unwrap();
+            assert_eq!(b[0].shape(), &[10, 1]);
+            count += 1;
+        }
+        assert_eq!(count, 5);
+
+        // Change depth between epochs
+        loader.set_prefetch_depth(2);
+        count = 0;
+        for batch in loader.epoch(1) {
+            batch.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_vram_margin_builder() {
+        let data = SequentialData { n: 100 };
+        let loader = DataLoader::from_dataset(data)
+            .batch_size(10)
+            .vram_margin(0.05) // 5% margin
+            .streaming()
+            .build()
+            .unwrap();
+
+        assert!(!loader.is_resident());
+        assert!(loader.prefetch_depth() >= 2);
+    }
+
+    #[test]
+    fn test_vram_margin_clamped() {
+        let data = SequentialData { n: 100 };
+        // Extreme values get clamped to [0.01, 0.50]
+        let loader = DataLoader::from_dataset(data)
+            .batch_size(10)
+            .vram_margin(0.001) // below min, clamped to 0.01
+            .streaming()
+            .build()
+            .unwrap();
+
+        assert!(!loader.is_resident());
+    }
+
+    // -- El Che data routing tests (CPU) --------------------------------------
+
+    #[test]
+    fn test_el_che_counts_cell_roundtrip() {
+        // Verify Cell<Option<Vec>> semantics for el_che_counts
+        let cell: std::cell::Cell<Option<Vec<usize>>> = std::cell::Cell::new(None);
+        assert!(cell.take().is_none());
+
+        cell.set(Some(vec![10, 23]));
+        let val = cell.take();
+        assert_eq!(val, Some(vec![10, 23]));
+        // After take, cell is None
+        assert!(cell.take().is_none());
+    }
+
+    #[test]
+    fn test_el_che_batches_cell_roundtrip() {
+        // Verify Cell semantics for pending_el_che_batches
+        let cell: std::cell::Cell<Option<Vec<Vec<Vec<Tensor>>>>> = std::cell::Cell::new(None);
+        assert!(cell.take().is_none());
+
+        let t = Tensor::zeros(&[2, 3], Default::default()).unwrap();
+        let batches = vec![vec![vec![t.clone()]], vec![vec![t]]];
+        cell.set(Some(batches));
+        let val = cell.take();
+        assert!(val.is_some());
+        let batches = val.unwrap();
+        assert_eq!(batches.len(), 2); // 2 ranks
+        assert_eq!(batches[0].len(), 1); // 1 batch on rank 0
+        assert_eq!(batches[1].len(), 1); // 1 batch on rank 1
+    }
+
+    #[test]
+    fn test_el_che_clamping_proportional() {
+        // Test the clamping logic in next_el_che
+        let counts = vec![10usize, 23];
+        let total: usize = counts.iter().sum(); // 33
+        let remaining = 20usize;
+
+        // Scale proportionally
+        let scale = remaining as f64 / total as f64;
+        let mut clamped: Vec<usize> = counts.iter()
+            .map(|&c| (c as f64 * scale).floor() as usize)
+            .collect();
+        let clamped_total: usize = clamped.iter().sum();
+        let mut deficit = remaining.saturating_sub(clamped_total);
+        for c in &mut clamped {
+            if deficit == 0 { break; }
+            *c += 1;
+            deficit -= 1;
+        }
+        let final_total: usize = clamped.iter().sum();
+        assert_eq!(final_total, remaining);
+        // Proportions roughly preserved
+        assert!(clamped[0] < clamped[1], "fast device should still get more");
     }
 }

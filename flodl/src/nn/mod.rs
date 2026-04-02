@@ -109,7 +109,7 @@ pub use cuda_graph::{CudaGraph, MemPoolId, CaptureMode, cuda_graph_capture, cuda
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NcclComms, ReduceOp};
-pub use ddp::Ddp;
+pub use ddp::{Ddp, DdpConfig, ElChe};
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

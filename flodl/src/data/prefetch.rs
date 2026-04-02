@@ -121,6 +121,17 @@ impl PrefetchWorker {
     pub fn load_batch(&self, indices: Vec<usize>) {
         let _ = self.cmd_tx.send(WorkerCmd::LoadBatch { indices });
     }
+
+    /// Current prefetch depth (channel capacity for next epoch).
+    pub fn prefetch_depth(&self) -> usize {
+        self.prefetch_depth
+    }
+
+    /// Update prefetch depth. Takes effect on the next epoch (the channel
+    /// is recreated with the new capacity in `start_epoch()`).
+    pub fn set_prefetch_depth(&mut self, depth: usize) {
+        self.prefetch_depth = depth.max(1);
+    }
 }
 
 impl Drop for PrefetchWorker {

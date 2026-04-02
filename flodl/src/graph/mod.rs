@@ -1179,6 +1179,9 @@ impl Graph {
             step_count: 0,
             calibration_steps: crate::nn::ddp::DEFAULT_CALIBRATION_STEPS,
             rebalance_interval: crate::nn::ddp::DEFAULT_REBALANCE_INTERVAL,
+            el_che: None,
+            last_el_che_counts: Vec::new(),
+            last_el_che_sync: None,
         };
 
         // Broadcast params from rank 0 to all replicas
@@ -1254,24 +1257,135 @@ impl Graph {
     pub fn step(&self) -> Result<()> {
         let mut dist = self.distributed.borrow_mut();
         if let Some(ref mut state) = *dist {
-            // Gradient sync: weighted AllReduce when shards are unequal
-            if state.is_balanced() {
-                state.all_reduce_gradients()?;
+            if state.el_che.is_some() {
+                // El Che path: weighted AllReduce by actual per-device batch counts.
+                // Gradients were accumulated in forward_distributed_el_che().
+                use crate::nn::cuda_event::CudaEvent;
+                use crate::nn::nccl::ReduceOp;
+
+                let counts = state.last_el_che_counts.clone();
+                let total: usize = counts.iter().sum();
+
+                if total > 0 {
+                    // Compute wall time since last sync (= compute time for this cadence step)
+                    let compute_ms = state.last_el_che_sync
+                        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+
+                    // Normalize accumulated gradients: each rank accumulated
+                    // counts[rank] backward passes, scale by 1/count so the
+                    // optimizer sees the mean gradient regardless of batch count.
+                    for group in &state.param_groups {
+                        if group[0].grad().is_none() {
+                            continue;
+                        }
+                        for (rank, var) in group.iter().enumerate() {
+                            if counts[rank] > 1 {
+                                if let Some(g) = var.grad() {
+                                    let _ = g.mul_scalar_(1.0 / counts[rank] as f64);
+                                }
+                            }
+                        }
+                    }
+
+                    // Weighted AllReduce: scale by batch contribution, then Sum.
+                    // Ranks with 0 batches (epoch-end clamping) have no gradients;
+                    // zero them so AllReduce still produces the correct mean.
+                    let sync_start = std::time::Instant::now();
+                    for group in &state.param_groups {
+                        if group[0].grad().is_none() && counts[0] > 0 {
+                            continue;
+                        }
+                        let grads: Vec<Tensor> = group
+                            .iter()
+                            .enumerate()
+                            .map(|(rank, v)| {
+                                let weight = counts[rank] as f64 / total as f64;
+                                match v.grad() {
+                                    Some(g) => {
+                                        g.mul_scalar_(weight).ok();
+                                        g
+                                    }
+                                    None => {
+                                        // No gradient on this rank (0 batches). Use zeros.
+                                        let data = v.data();
+                                        let opts = crate::tensor::TensorOptions {
+                                            dtype: data.dtype(),
+                                            device: data.device(),
+                                        };
+                                        Tensor::zeros(&data.shape(), opts)
+                                            .expect("failed to create zero gradient")
+                                    }
+                                }
+                            })
+                            .collect();
+                        let refs: Vec<&Tensor> = grads.iter().collect();
+                        state.comms.all_reduce(&refs, ReduceOp::Sum)?;
+                    }
+                    state.sync_buffers()?;
+                    let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
+
+                    for opt in &mut state.optimizers {
+                        opt.step()?;
+                    }
+                    for opt in &state.optimizers {
+                        opt.zero_grad();
+                    }
+
+                    // Report timing to El Che for ratio + anchor adaptation.
+                    // Use per-device wall times from CudaEvents if available,
+                    // otherwise estimate from total wall time.
+                    let wall_ms: Vec<f64> = if let Some(ref timing) = state.last_timing {
+                        timing.iter().map(|(start, end)| {
+                            CudaEvent::elapsed_time(start, end).unwrap_or(0.0) as f64
+                        }).collect()
+                    } else {
+                        vec![compute_ms; state.devices.len()]
+                    };
+
+                    let updated_counts = if let Some(ref mut el_che) = state.el_che {
+                        if !wall_ms.is_empty() {
+                            el_che.report_timing(&wall_ms, sync_ms);
+                        }
+                        Some(el_che.batch_counts().to_vec())
+                    } else {
+                        None
+                    };
+
+                    state.last_timing = None;
+                    state.last_el_che_sync = Some(std::time::Instant::now());
+
+                    // Must drop the distributed borrow before accessing data_binding
+                    drop(dist);
+
+                    // Feed updated batch counts back to the loader for the next iteration
+                    if let Some(counts) = updated_counts {
+                        let binding = self.data_binding.borrow();
+                        if let Some(ref b) = *binding {
+                            b.loader.set_el_che_counts(counts);
+                        }
+                    }
+                }
             } else {
-                let batch_size: i64 = state.last_shard_sizes.iter().sum();
-                state.weighted_all_reduce_gradients(batch_size)?;
-            }
-            state.sync_buffers()?;
+                // Standard DDP path: per-batch scatter + AllReduce
+                if state.is_balanced() {
+                    state.all_reduce_gradients()?;
+                } else {
+                    let batch_size: i64 = state.last_shard_sizes.iter().sum();
+                    state.weighted_all_reduce_gradients(batch_size)?;
+                }
+                state.sync_buffers()?;
 
-            for opt in &mut state.optimizers {
-                opt.step()?;
-            }
-            for opt in &state.optimizers {
-                opt.zero_grad();
-            }
+                for opt in &mut state.optimizers {
+                    opt.step()?;
+                }
+                for opt in &state.optimizers {
+                    opt.zero_grad();
+                }
 
-            // Update throughput tracking and potentially rebalance
-            state.update_balance()?;
+                // Update throughput tracking and potentially rebalance
+                state.update_balance()?;
+            }
         } else {
             // Single GPU
             let mut opt = self.optimizer.borrow_mut();
@@ -1294,6 +1408,25 @@ impl Graph {
     /// Whether this graph is running in distributed mode.
     pub fn is_distributed(&self) -> bool {
         self.distributed.borrow().is_some()
+    }
+
+    /// Whether El Che cadence is active (heterogeneous DDP).
+    pub fn has_el_che(&self) -> bool {
+        self.distributed
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.el_che.is_some())
+    }
+
+    /// Configure El Che cadence for distributed training.
+    ///
+    /// Called by [`Ddp::auto_with`] after [`distribute`](Graph::distribute).
+    /// No-op if not in distributed mode.
+    pub(crate) fn configure_el_che(&self, config: &crate::nn::ddp::DdpConfig) {
+        let mut dist = self.distributed.borrow_mut();
+        if let Some(ref mut state) = *dist {
+            state.configure_el_che(config);
+        }
     }
 
     /// Current batch distribution ratios across devices.
@@ -1485,12 +1618,17 @@ impl Graph {
     /// }
     /// ```
     pub fn epoch(&self, epoch: usize) -> GraphEpochIterator<'_> {
-        // Update chunk_ratios from distributed state
+        // Update chunk_ratios and seed El Che counts from distributed state
         {
             let dist = self.distributed.borrow();
             let mut binding = self.data_binding.borrow_mut();
             if let (Some(d), Some(ref mut b)) = (dist.as_ref(), binding.as_mut()) {
                 b.chunk_ratios = d.chunk_ratios.clone();
+
+                // Seed El Che batch counts for the epoch iterator
+                if let Some(ref el_che) = d.el_che {
+                    b.loader.set_el_che_counts(el_che.batch_counts().to_vec());
+                }
             }
         }
 
@@ -1707,10 +1845,158 @@ impl Graph {
         Variable::cat_many(&refs, 0)
     }
 
+    /// El Che distributed forward: multiple complete batches per device.
+    ///
+    /// Each device processes its batch_counts[rank] batches independently.
+    /// Gradients accumulate naturally via libtorch autograd across all
+    /// forward passes. Tagged outputs are gathered across all batches and
+    /// all devices.
+    ///
+    /// Called by `forward_batch()` when El Che batches are pending.
+    fn forward_distributed_el_che(&self) -> Result<Variable> {
+        use crate::nn::cuda_event::{CudaEvent, CudaEventFlags};
+        use crate::tensor::set_current_cuda_device;
+
+        // Take per-device batches and input mapping
+        let (per_device_batches, shard_input_map) = {
+            let binding = self.data_binding.borrow();
+            let binding = binding.as_ref().unwrap();
+            let batches = binding.loader.take_el_che_batches()
+                .expect("forward_distributed_el_che: no El Che batches pending");
+            let map = binding.shard_input_map.clone();
+            (batches, map)
+        };
+
+        let (n, devices, gather_device) = {
+            let dist = self.distributed.borrow();
+            let dist = dist.as_ref().unwrap();
+            let n = dist.devices.len();
+            let devices = dist.devices.clone();
+            let gather_device = self.data_binding.borrow()
+                .as_ref()
+                .map(|b| b.loader.device())
+                .unwrap_or(devices[0]);
+            (n, devices, gather_device)
+        };
+
+        let has_tags = !self.tag_capture.is_empty();
+        let mut all_outputs: Vec<Variable> = Vec::new();
+        let mut gathered_tags: HashMap<String, Vec<Variable>> = HashMap::new();
+        let mut timing: Vec<(CudaEvent, CudaEvent)> = Vec::with_capacity(n);
+        let mut batch_counts: Vec<usize> = Vec::with_capacity(n);
+
+        for (rank, device_batches) in per_device_batches.iter().enumerate() {
+            batch_counts.push(device_batches.len());
+
+            if device_batches.is_empty() {
+                continue;
+            }
+
+            let device_idx = match devices[rank] {
+                crate::tensor::Device::CUDA(i) => i,
+                _ => 0,
+            };
+            set_current_cuda_device(device_idx);
+            let start = CudaEvent::new(CudaEventFlags::Default)?;
+            start.record()?;
+
+            for batch_tensors in device_batches {
+                // Build input vector from shard_input_map
+                let graph_inputs: Vec<Variable> = shard_input_map.iter()
+                    .map(|&idx| Variable::new(batch_tensors[idx].clone(), false))
+                    .collect();
+
+                let out = if rank == 0 {
+                    self.forward_impl(&graph_inputs)?
+                } else {
+                    let dist = self.distributed.borrow();
+                    let dist = dist.as_ref().unwrap();
+                    let replica = &dist.replicas[rank - 1];
+                    match replica.as_graph() {
+                        Some(g) => g.forward_impl(&graph_inputs)?,
+                        None => replica.forward(&graph_inputs[0])?,
+                    }
+                };
+
+                // Move output to gather device (preserves autograd chain via libtorch)
+                let out_gathered = if out.data().device() != gather_device {
+                    out.to_device(gather_device)?
+                } else {
+                    out
+                };
+                all_outputs.push(out_gathered);
+
+                // Capture tagged outputs from this forward pass
+                if has_tags {
+                    if rank == 0 {
+                        let tagged = self.tagged_outputs.borrow();
+                        for (name, var) in tagged.iter() {
+                            let moved = if var.data().device() != gather_device {
+                                var.to_device(gather_device)?
+                            } else {
+                                var.clone()
+                            };
+                            gathered_tags.entry(name.clone()).or_default().push(moved);
+                        }
+                    } else {
+                        let dist = self.distributed.borrow();
+                        let dist = dist.as_ref().unwrap();
+                        if let Some(g) = dist.replicas[rank - 1].as_graph() {
+                            let tagged = g.tagged_outputs.borrow();
+                            for (name, var) in tagged.iter() {
+                                let moved = if var.data().device() != gather_device {
+                                    var.to_device(gather_device)?
+                                } else {
+                                    var.clone()
+                                };
+                                gathered_tags.entry(name.clone()).or_default().push(moved);
+                            }
+                        }
+                    }
+                }
+            }
+
+            set_current_cuda_device(device_idx);
+            let end = CudaEvent::new(CudaEventFlags::Default)?;
+            end.record()?;
+            timing.push((start, end));
+        }
+
+        // Store batch counts and timing for step()
+        {
+            let mut dist = self.distributed.borrow_mut();
+            let dist = dist.as_mut().unwrap();
+            dist.last_el_che_counts = batch_counts;
+            dist.last_timing = Some(timing);
+        }
+
+        // Set gathered tagged outputs on the main graph (catted across all batches/devices)
+        if has_tags && !gathered_tags.is_empty() {
+            let mut tagged = self.tagged_outputs.borrow_mut();
+            tagged.clear();
+            for (name, vars) in &gathered_tags {
+                if vars.len() == 1 {
+                    tagged.insert(name.clone(), vars[0].clone());
+                } else {
+                    let refs: Vec<&Variable> = vars.iter().collect();
+                    tagged.insert(name.clone(), Variable::cat_many(&refs, 0)?);
+                }
+            }
+        }
+
+        // Cat all outputs across devices
+        if all_outputs.len() == 1 {
+            return Ok(all_outputs.into_iter().next().unwrap());
+        }
+
+        let refs: Vec<&Variable> = all_outputs.iter().collect();
+        Variable::cat_many(&refs, 0)
+    }
+
     /// Batch-aware forward pass.
     ///
     /// Extracts the primary input and auxiliary graph inputs from the named
-    /// Batch, handles DDP presharding transparently.
+    /// Batch, handles DDP presharding and El Che transparently.
     ///
     /// ```ignore
     /// let out = model.forward_batch(&b)?;
@@ -1718,19 +2004,25 @@ impl Graph {
     /// ```
     pub fn forward_batch(&self, batch: &crate::data::Batch) -> Result<Variable> {
         // Scope the borrow so it is released before calling methods that re-borrow.
-        let (has_shards, forward_input_name, shard_input_map) = {
+        let (has_shards, has_el_che_batches, forward_input_name, shard_input_map) = {
             let guard = self.data_binding.borrow();
             let binding = guard.as_ref()
                 .expect("call set_data_loader before forward_batch");
 
-            let has_shards = self.distributed.borrow().is_some()
-                && binding.loader.has_shards();
+            let is_dist = self.distributed.borrow().is_some();
+            let has_shards = is_dist && binding.loader.has_shards();
+            let has_el_che = is_dist && binding.loader.has_el_che_batches();
             let name = binding.forward_input.clone();
             let map = binding.shard_input_map.clone();
-            (has_shards, name, map)
+            (has_shards, has_el_che, name, map)
         };
 
-        // Check if presharded data is available
+        // El Che path: multi-batch per device
+        if has_el_che_batches {
+            return self.forward_distributed_el_che();
+        }
+
+        // Standard presharded path
         if has_shards {
             return self.forward_distributed_presharded();
         }
@@ -1861,6 +2153,23 @@ impl Iterator for ActiveGraphEpochIterator<'_> {
 }
 
 impl ExactSizeIterator for ActiveGraphEpochIterator<'_> {}
+
+impl Drop for ActiveGraphEpochIterator<'_> {
+    fn drop(&mut self) {
+        // El Che epoch-end flush: if forward_distributed_el_che() was called
+        // but step() hasn't been called yet, gradients are accumulated and
+        // un-synced. Force a step() to prevent silent gradient loss.
+        if self.graph.has_el_che() {
+            let needs_flush = self.graph.distributed.borrow()
+                .as_ref()
+                .is_some_and(|d| d.last_timing.is_some());
+
+            if needs_flush {
+                let _ = self.graph.step();
+            }
+        }
+    }
+}
 
 /// Current time as seconds since epoch (monotonic approximation for ETA).
 fn instant_secs() -> f64 {

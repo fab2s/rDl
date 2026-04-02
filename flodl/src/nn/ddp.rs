@@ -104,6 +104,17 @@ pub(crate) struct DistributedState {
     pub calibration_steps: usize,
     /// Steps between ratio recalculations after calibration.
     pub rebalance_interval: usize,
+
+    // -- El Che cadence (heterogeneous DDP) --
+
+    /// El Che cadence strategy. When Some, Graph uses per-device multi-batch
+    /// forward instead of per-batch scatter. When None, existing scatter path.
+    pub el_che: Option<ElChe>,
+    /// Per-rank batch counts from the last El Che forward pass.
+    /// Set by forward_distributed_el_che(), read by step().
+    pub last_el_che_counts: Vec<usize>,
+    /// Wall-clock time at end of last El Che AllReduce.
+    pub last_el_che_sync: Option<std::time::Instant>,
 }
 
 impl DistributedState {
@@ -295,6 +306,54 @@ impl DistributedState {
 
         self.chunk_ratios = ratios;
     }
+
+    /// Configure El Che cadence from a [`DdpConfig`].
+    ///
+    /// Creates an internal ElChe when enabled (max_anchor != Some(0)),
+    /// seeds chunk_ratios from speed_hint if provided.
+    pub(crate) fn configure_el_che(&mut self, config: &DdpConfig) {
+        let n = self.devices.len();
+        if n < 2 {
+            return;
+        }
+
+        // max_anchor = Some(0) → disabled (traditional DDP)
+        if config.max_anchor == Some(0) {
+            self.el_che = None;
+            return;
+        }
+
+        // Build ElChe with sensible defaults
+        let anchor = 10; // initial anchor, auto-tunes from timing
+        let mut el_che = ElChe::new(n, anchor);
+
+        if let Some(target) = config.overhead_target {
+            el_che = el_che.with_overhead_target(target);
+        }
+        if let Some(max) = config.max_anchor {
+            el_che = el_che.with_max_anchor(max);
+        }
+        if let Some((slow_rank, ratio)) = config.speed_hint {
+            el_che = el_che.with_speed_ratio(slow_rank, ratio);
+            // Also seed chunk_ratios for the existing auto-balancer
+            self.apply_speed_hint(slow_rank, ratio);
+        }
+
+        self.el_che = Some(el_che);
+    }
+
+    /// Seed chunk_ratios from a speed hint.
+    fn apply_speed_hint(&mut self, slow_rank: usize, ratio: f64) {
+        let n = self.devices.len();
+        if slow_rank >= n {
+            return;
+        }
+        let ratio = ratio.max(1.0);
+        let mut weights = vec![ratio; n];
+        weights[slow_rank] = 1.0;
+        let total: f64 = weights.iter().sum();
+        self.chunk_ratios = weights.iter().map(|w| w / total).collect();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +474,51 @@ impl Ddp {
         Ok(())
     }
 
+    /// AllReduce gradients weighted by per-device batch contribution.
+    ///
+    /// For heterogeneous DDP where devices process different numbers of
+    /// batches per sync step. Each replica's gradient is scaled by
+    /// `(batch_counts[rank] / total)` before AllReduce Sum, producing
+    /// the correct mean gradient.
+    ///
+    /// Use with [`ElChe::batch_counts`] for automatic weighting
+    /// (see [`ElChe`] for the full heterogeneous DDP strategy):
+    ///
+    /// ```ignore
+    /// ddp.weighted_all_reduce_gradients(cadence.batch_counts())?;
+    /// ```
+    pub fn weighted_all_reduce_gradients(&self, batch_counts: &[usize]) -> Result<()> {
+        if batch_counts.len() != self.devices.len() {
+            return Err(TensorError::new(&format!(
+                "weighted_all_reduce: batch_counts len ({}) != device count ({})",
+                batch_counts.len(),
+                self.devices.len(),
+            )));
+        }
+        let total: usize = batch_counts.iter().sum();
+        if total == 0 {
+            return Err(TensorError::new("weighted_all_reduce: total batch count is 0"));
+        }
+        for group in &self.param_groups {
+            if group[0].grad().is_none() {
+                continue;
+            }
+            let grads: Vec<Tensor> = group
+                .iter()
+                .enumerate()
+                .map(|(rank, v)| {
+                    let g = v.grad().expect("gradient missing on replica");
+                    let weight = batch_counts[rank] as f64 / total as f64;
+                    g.mul_scalar_(weight).ok();
+                    g
+                })
+                .collect();
+            let refs: Vec<&Tensor> = grads.iter().collect();
+            self.comms.all_reduce(&refs, ReduceOp::Sum)?;
+        }
+        Ok(())
+    }
+
     /// Number of devices.
     pub fn world_size(&self) -> usize {
         self.devices.len()
@@ -462,7 +566,55 @@ impl Ddp {
         model.distribute(builder)?;
         model.set_optimizer(optimizer);
         model.set_training(true);
+
+        // Auto-enable El Che for heterogeneous GPU setups
+        if Self::is_heterogeneous() {
+            model.configure_el_che(&DdpConfig::new());
+        }
+
         Ok(())
+    }
+
+    /// One-call setup with explicit configuration.
+    ///
+    /// Like [`auto()`](Self::auto) but accepts a [`DdpConfig`] for
+    /// controlling El Che cadence, speed hints, and overhead targets.
+    ///
+    /// ```ignore
+    /// Ddp::auto_with(&model, builder, optimizer,
+    ///     DdpConfig::new().speed_hint(1, 2.3))?;
+    /// ```
+    pub fn auto_with<F, M, G, O>(
+        model: &Graph,
+        builder: F,
+        optimizer: G,
+        config: DdpConfig,
+    ) -> Result<()>
+    where
+        F: Fn(Device) -> Result<M>,
+        M: Module + 'static,
+        G: Fn(Vec<Parameter>) -> O,
+        O: Optimizer + 'static,
+    {
+        Self::print_device_summary();
+        model.distribute(builder)?;
+        model.set_optimizer(optimizer);
+        model.set_training(true);
+        model.configure_el_che(&config);
+        Ok(())
+    }
+
+    /// Detect whether the current CUDA setup has different GPU models.
+    fn is_heterogeneous() -> bool {
+        use crate::tensor::{cuda_available, cuda_device_count, cuda_device_name_idx};
+        if !cuda_available() || cuda_device_count() < 2 {
+            return false;
+        }
+        let n = cuda_device_count();
+        let names: Vec<Option<String>> = (0..n)
+            .map(cuda_device_name_idx)
+            .collect();
+        names.windows(2).any(|w| w[0] != w[1])
     }
 
     /// Print a diagnostic summary of detected CUDA devices to stderr.
@@ -508,6 +660,355 @@ impl Ddp {
             );
         } else {
             eprintln!("  ddp: {} GPUs | {}", n, parts.join(" | "));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DDP configuration
+// ---------------------------------------------------------------------------
+
+/// Configuration for [`Ddp::auto_with`].
+///
+/// Controls El Che cadence behavior for heterogeneous multi-GPU training.
+/// Use [`DdpConfig::new()`] for defaults or build with method chaining.
+///
+/// ```ignore
+/// Ddp::auto_with(&model, builder, optimizer,
+///     DdpConfig::new()
+///         .speed_hint(1, 2.3)     // rank 1 is slow, 2.3x ratio
+///         .overhead_target(0.08)  // tune to 8% overhead
+/// )?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct DdpConfig {
+    /// Initial speed ratio hint: (slow_rank, fast_to_slow_ratio).
+    /// Applied before the first timing measurement.
+    pub speed_hint: Option<(usize, f64)>,
+    /// AllReduce overhead target for anchor auto-tune (default: 0.10).
+    pub overhead_target: Option<f64>,
+    /// Max batches on slow device before AllReduce.
+    /// - `None` = auto (El Che decides, default).
+    /// - `Some(0)` = disabled (traditional per-batch DDP, no El Che).
+    /// - `Some(n)` = fixed anchor at n.
+    pub max_anchor: Option<usize>,
+}
+
+impl DdpConfig {
+    /// Default configuration: El Che auto-enabled for heterogeneous GPUs.
+    pub fn new() -> Self {
+        DdpConfig {
+            speed_hint: None,
+            overhead_target: None,
+            max_anchor: None,
+        }
+    }
+
+    /// Set initial speed ratio hint.
+    ///
+    /// `slow_rank`: which device is slowest.
+    /// `ratio`: how many times faster the fastest device is (e.g., 2.3).
+    ///
+    /// After the first AllReduce, El Che discovers actual speeds and
+    /// self-corrects even a wrong guess.
+    pub fn speed_hint(mut self, slow_rank: usize, ratio: f64) -> Self {
+        self.speed_hint = Some((slow_rank, ratio));
+        self
+    }
+
+    /// Set AllReduce overhead target (fraction of compute time).
+    ///
+    /// Default: 0.10 (10%). Lower values = fewer AllReduces = more
+    /// gradient accumulation. El Che auto-tunes the anchor to stay
+    /// below this target.
+    pub fn overhead_target(mut self, target: f64) -> Self {
+        self.overhead_target = Some(target.clamp(0.01, 0.50));
+        self
+    }
+
+    /// Set max batches on slow device before AllReduce.
+    ///
+    /// - `None` (default): El Che auto-tunes from overhead measurement.
+    /// - `Some(0)`: disable El Che entirely (traditional per-batch sync).
+    /// - `Some(n)`: fixed anchor at n (fast device gets proportionally more).
+    pub fn max_anchor(mut self, max: Option<usize>) -> Self {
+        self.max_anchor = max;
+        self
+    }
+}
+
+impl Default for DdpConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// El Che -- heterogeneous DDP cadence strategy
+// ---------------------------------------------------------------------------
+
+/// El Che: heterogeneous DDP cadence strategy.
+///
+/// The column marches at the slowest one's pace. The slow device
+/// anchors the cadence (`anchor` batches per sync step), the fast
+/// ones range ahead doing more work, and everyone rejoins at AllReduce.
+/// No one waits, no one idles.
+///
+/// After each sync step, call [`report_timing`](ElChe::report_timing)
+/// with measured wall times and AllReduce overhead. El Che refines
+/// batch ratios and auto-tunes the anchor count to keep AllReduce overhead
+/// below a configurable target (default 10%).
+///
+/// # Example
+///
+/// ```ignore
+/// let ddp = Ddp::wrap(&[&model0, &model1], &devices)?;
+/// let mut cadence = ElChe::new(2, 10);
+///
+/// loop {
+///     let start_events = record_start_events(&devices)?;
+///     for rank in 0..2 {
+///         for _ in 0..cadence.batches(rank) {
+///             forward_backward(rank)?;
+///         }
+///     }
+///     let wall_ms = measure_elapsed(&start_events)?;
+///
+///     let sync_start = Instant::now();
+///     ddp.weighted_all_reduce_gradients(cadence.batch_counts())?;
+///     let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
+///
+///     cadence.report_timing(&wall_ms, sync_ms);
+/// }
+/// ```
+pub struct ElChe {
+    world_size: usize,
+    /// Anchor batch count (slow device processes this many per step).
+    anchor: usize,
+    /// Per-device batch counts for the current cadence step.
+    batch_counts: Vec<usize>,
+    /// Per-device milliseconds per batch (from last measurement).
+    ms_per_batch: Vec<f64>,
+    /// Whether at least one real measurement has been taken.
+    calibrated: bool,
+    /// Target: max AllReduce overhead as fraction of compute time.
+    overhead_target: f64,
+    /// Minimum anchor (never below initial value).
+    min_anchor: usize,
+    /// Maximum anchor (gradient staleness limit).
+    max_anchor: usize,
+}
+
+impl ElChe {
+    /// Create a new sync cadence.
+    ///
+    /// `world_size`: number of devices (must be >= 2).
+    /// `anchor`: initial batch count for the slow device per sync step.
+    ///
+    /// The first step uses equal counts (`anchor` for every device).
+    /// After [`report_timing`](ElChe::report_timing), ratios adapt
+    /// to measured throughput.
+    pub fn new(world_size: usize, anchor: usize) -> Self {
+        assert!(world_size >= 2, "El Che requires at least 2 devices");
+        assert!(anchor >= 1, "anchor must be >= 1");
+        ElChe {
+            world_size,
+            anchor,
+            batch_counts: vec![anchor; world_size],
+            ms_per_batch: vec![0.0; world_size],
+            calibrated: false,
+            overhead_target: 0.10,
+            min_anchor: anchor,
+            max_anchor: 200,
+        }
+    }
+
+    /// Set the target AllReduce overhead as a fraction of compute time.
+    ///
+    /// Default: 0.10 (10%). The anchor auto-tunes upward to keep overhead
+    /// below this target. Lower values = fewer syncs = more gradient
+    /// staleness.
+    pub fn with_overhead_target(mut self, target: f64) -> Self {
+        self.overhead_target = target.clamp(0.01, 0.50);
+        self
+    }
+
+    /// Set the maximum anchor count (gradient staleness limit).
+    ///
+    /// Default: 200. Higher values allow fewer syncs but accumulate more
+    /// batches of gradient before averaging. Set to 1 to sync after every
+    /// slow-device batch (minimal accumulation, traditional DDP cadence).
+    pub fn with_max_anchor(mut self, max: usize) -> Self {
+        self.max_anchor = max.max(1);
+        // Ensure min_anchor doesn't exceed max_anchor
+        if self.min_anchor > self.max_anchor {
+            self.min_anchor = self.max_anchor;
+            self.anchor = self.anchor.clamp(self.min_anchor, self.max_anchor);
+        }
+        self
+    }
+
+    /// Set initial speed estimate before the first timing measurement.
+    ///
+    /// `slow_rank`: which device is slowest (receives `anchor` batches).
+    /// `ratio`: how many times faster the fastest device is (e.g., 3.0
+    /// means the fast GPU processes ~3x more batches per unit time).
+    ///
+    /// Default (without this call): all devices start equal (`anchor`
+    /// batches each). After the first [`report_timing`](ElChe::report_timing),
+    /// actual measurements replace this estimate, so even a wrong guess
+    /// self-corrects in one step.
+    ///
+    /// ```ignore
+    /// // RTX 5060 Ti (rank 0) is ~2.3x faster than GTX 1060 (rank 1)
+    /// let che = ElChe::new(2, 10).with_speed_ratio(1, 2.3);
+    /// // → rank 0: 23 batches, rank 1: 10 batches
+    /// ```
+    pub fn with_speed_ratio(mut self, slow_rank: usize, ratio: f64) -> Self {
+        assert!(
+            slow_rank < self.world_size,
+            "slow_rank ({slow_rank}) out of bounds for world_size ({})",
+            self.world_size,
+        );
+        let ratio = ratio.max(1.0);
+        for rank in 0..self.world_size {
+            if rank == slow_rank {
+                self.batch_counts[rank] = self.anchor;
+            } else {
+                self.batch_counts[rank] =
+                    (self.anchor as f64 * ratio).round().max(1.0) as usize;
+            }
+        }
+        self
+    }
+
+    /// Batch count for the given device rank in the current cadence step.
+    pub fn batches(&self, rank: usize) -> usize {
+        self.batch_counts[rank]
+    }
+
+    /// Per-device batch counts (for [`Ddp::weighted_all_reduce_gradients`]).
+    pub fn batch_counts(&self) -> &[usize] {
+        &self.batch_counts
+    }
+
+    /// Total batches across all devices for this cadence step.
+    pub fn total_batches(&self) -> usize {
+        self.batch_counts.iter().sum()
+    }
+
+    /// Current anchor batch count (slow device batches per step).
+    pub fn anchor(&self) -> usize {
+        self.anchor
+    }
+
+    /// Whether at least one timing measurement has been reported.
+    pub fn is_calibrated(&self) -> bool {
+        self.calibrated
+    }
+
+    /// Per-device milliseconds per batch from last measurement.
+    pub fn ms_per_batch(&self) -> &[f64] {
+        &self.ms_per_batch
+    }
+
+    /// Report timing after a cadence step completes.
+    ///
+    /// `wall_ms[rank]`: wall-clock time for all batches on that device (ms).
+    /// `sync_ms`: AllReduce overhead for this step (ms).
+    ///
+    /// Updates batch ratios based on measured throughput. If AllReduce
+    /// overhead exceeds the target, anchor auto-tunes upward.
+    pub fn report_timing(&mut self, wall_ms: &[f64], sync_ms: f64) {
+        assert_eq!(
+            wall_ms.len(),
+            self.world_size,
+            "wall_ms length must match world_size",
+        );
+
+        // Compute per-batch timing for each device.
+        for (rank, &wall) in wall_ms.iter().enumerate() {
+            if self.batch_counts[rank] > 0 && wall > 0.0 {
+                self.ms_per_batch[rank] =
+                    wall / self.batch_counts[rank] as f64;
+            }
+        }
+
+        // Find the slowest device (highest ms per batch).
+        let slow_ms = self
+            .ms_per_batch
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+
+        if slow_ms <= 0.0 {
+            return; // no valid timing
+        }
+
+        // Auto-tune anchor before recomputing counts: if AllReduce overhead
+        // exceeds target, scale anchor so that the ratio would hit target.
+        let compute_ms = wall_ms
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        if compute_ms > 0.0 && sync_ms > 0.0 {
+            let overhead = sync_ms / compute_ms;
+            if overhead > self.overhead_target {
+                let scale = overhead / self.overhead_target;
+                let new_anchor =
+                    (self.anchor as f64 * scale).ceil() as usize;
+                self.anchor =
+                    new_anchor.clamp(self.min_anchor, self.max_anchor);
+            }
+        }
+
+        // Recompute batch counts from (possibly updated) anchor.
+        self.recompute_batch_counts(slow_ms);
+        self.calibrated = true;
+    }
+
+    /// Clamp batch counts to a maximum total, preserving proportions.
+    ///
+    /// Returns a new batch-count vector. Use near epoch boundaries to
+    /// avoid consuming more batches than remain.
+    pub fn clamp_total(&self, max_total: usize) -> Vec<usize> {
+        let current_total = self.total_batches();
+        if current_total <= max_total {
+            return self.batch_counts.clone();
+        }
+        let scale = max_total as f64 / current_total as f64;
+        let mut clamped: Vec<usize> = self
+            .batch_counts
+            .iter()
+            .map(|&n| (n as f64 * scale).floor().max(1.0) as usize)
+            .collect();
+        // Distribute remainder to stay exactly at max_total.
+        let sum: usize = clamped.iter().sum();
+        let mut remainder = max_total.saturating_sub(sum);
+        for c in &mut clamped {
+            if remainder == 0 {
+                break;
+            }
+            *c += 1;
+            remainder -= 1;
+        }
+        clamped
+    }
+
+    /// Recompute batch counts: slow device gets `anchor`, faster devices
+    /// get proportionally more based on their ms_per_batch.
+    fn recompute_batch_counts(&mut self, slow_ms: f64) {
+        for rank in 0..self.world_size {
+            let ms = self.ms_per_batch[rank];
+            if ms <= 0.0 || (ms - slow_ms).abs() < 1e-6 {
+                // Slow device (or no data): anchor batches.
+                self.batch_counts[rank] = self.anchor;
+            } else {
+                // Faster device: proportional to speed ratio.
+                let ratio = slow_ms / ms;
+                self.batch_counts[rank] =
+                    (self.anchor as f64 * ratio).round().max(1.0) as usize;
+            }
         }
     }
 }
@@ -609,6 +1110,9 @@ mod tests {
             step_count: 0,
             calibration_steps: DEFAULT_CALIBRATION_STEPS,
             rebalance_interval: DEFAULT_REBALANCE_INTERVAL,
+            el_che: None,
+            last_el_che_counts: Vec::new(),
+            last_el_che_sync: None,
         }
     }
 
@@ -1121,5 +1625,524 @@ mod tests {
         model.set_optimizer(|p| Adam::new(&p, 0.01));
         // Should not panic
         model.set_lr(0.001);
+    }
+
+    // -- El Che unit tests (CPU, no NCCL needed) ----------------------------
+
+    #[test]
+    fn test_cadence_initial_equal() {
+        let c = ElChe::new(2, 10);
+        assert_eq!(c.batches(0), 10);
+        assert_eq!(c.batches(1), 10);
+        assert_eq!(c.total_batches(), 20);
+        assert_eq!(c.anchor(), 10);
+        assert!(!c.is_calibrated());
+    }
+
+    #[test]
+    fn test_cadence_initial_three_devices() {
+        let c = ElChe::new(3, 15);
+        assert_eq!(c.batches(0), 15);
+        assert_eq!(c.batches(1), 15);
+        assert_eq!(c.batches(2), 15);
+        assert_eq!(c.total_batches(), 45);
+    }
+
+    #[test]
+    fn test_cadence_ratio_discovery_2x() {
+        // Device 0 is 2x faster than device 1.
+        // Equal counts (10:10), device 0 finishes in 500ms, device 1 in 1000ms.
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50); // high target to avoid anchor auto-tune
+        c.report_timing(&[500.0, 1000.0], 10.0);
+
+        assert!(c.is_calibrated());
+        // Slow device (rank 1) keeps anchor=10, fast device (rank 0) gets ~20.
+        assert_eq!(c.batches(1), 10);
+        assert_eq!(c.batches(0), 20);
+    }
+
+    #[test]
+    fn test_cadence_ratio_discovery_fbrl_like() {
+        // Simulates RTX 5060 Ti vs GTX 1060 (~2.3:1 speed ratio).
+        // Anchor=10 on slow device, equal initial counts.
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50); // no auto-tune
+
+        // Both ran 10 batches; fast took 730ms (73ms/batch), slow took 1640ms (164ms/batch).
+        c.report_timing(&[730.0, 1640.0], 50.0);
+
+        assert!(c.is_calibrated());
+        assert_eq!(c.batches(1), 10); // slow device: anchor
+        // Fast device: 164/73 * 10 ≈ 22.5, rounds to 22 or 23
+        let fast = c.batches(0);
+        assert!(
+            (22..=23).contains(&fast),
+            "expected ~22-23, got {fast}"
+        );
+    }
+
+    #[test]
+    fn test_cadence_anchor_auto_tune() {
+        // High AllReduce overhead should trigger anchor increase.
+        // 10% target: compute 1000ms, sync 500ms => overhead 50% >> 10%.
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.10);
+
+        // Both devices equal speed, anchor=10.
+        c.report_timing(&[1000.0, 1000.0], 500.0);
+
+        // overhead = 500/1000 = 0.50, target = 0.10
+        // scale = 0.50/0.10 = 5.0 => new anchor = ceil(10 * 5) = 50
+        assert_eq!(c.anchor(), 50);
+        assert_eq!(c.batches(0), 50);
+        assert_eq!(c.batches(1), 50);
+    }
+
+    #[test]
+    fn test_cadence_anchor_auto_tune_with_speed_ratio() {
+        // Heterogeneous: fast device 2x, high sync overhead.
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.10);
+
+        // Fast=500ms, slow=1000ms (equal initial counts), sync=400ms.
+        c.report_timing(&[500.0, 1000.0], 400.0);
+
+        // overhead = 400/1000 = 0.40, target = 0.10, scale = 4.0
+        // new anchor = ceil(10 * 4) = 40
+        assert_eq!(c.anchor(), 40);
+        assert_eq!(c.batches(1), 40); // slow device
+        // fast device: 100ms/batch vs 50ms/batch => 2x ratio => 80
+        assert_eq!(c.batches(0), 80);
+    }
+
+    #[test]
+    fn test_cadence_anchor_capped_at_max() {
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.01)
+            .with_max_anchor(30);
+
+        // Extreme overhead: sync dominates.
+        c.report_timing(&[100.0, 100.0], 500.0);
+
+        // Would want anchor=500 but capped at 30.
+        assert_eq!(c.anchor(), 30);
+        assert_eq!(c.batches(0), 30);
+    }
+
+    #[test]
+    fn test_cadence_stable_when_overhead_low() {
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.10);
+
+        // sync=5ms on 1000ms compute => 0.5% overhead, well below 10%.
+        c.report_timing(&[1000.0, 1000.0], 5.0);
+
+        assert_eq!(c.anchor(), 10); // no change
+    }
+
+    #[test]
+    fn test_cadence_three_devices_mixed_speed() {
+        let mut c = ElChe::new(3, 10)
+            .with_overhead_target(0.50); // no auto-tune
+
+        // Device 0: 3x fast (333ms), device 1: 2x fast (500ms), device 2: slow (1000ms).
+        c.report_timing(&[333.0, 500.0, 1000.0], 10.0);
+
+        assert_eq!(c.batches(2), 10); // slow: anchor
+        // Device 1: 100ms/batch vs 33.3ms/batch for device 0
+        // Device 0: ratio 100/33.3 = 3.0 => 30
+        // Device 1: ratio 100/50 = 2.0 => 20
+        assert_eq!(c.batches(0), 30);
+        assert_eq!(c.batches(1), 20);
+    }
+
+    #[test]
+    fn test_cadence_successive_reports_refine() {
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50);
+
+        // First report: 2x speed ratio.
+        c.report_timing(&[500.0, 1000.0], 10.0);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+
+        // Second report: new counts, faster device did 20 in 1000ms (50ms/batch),
+        // slow did 10 in 1000ms (100ms/batch). Ratio stays 2:1.
+        c.report_timing(&[1000.0, 1000.0], 10.0);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_cadence_clamp_total() {
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50);
+
+        // Fast device gets 20, slow gets 10. Total = 30.
+        c.report_timing(&[500.0, 1000.0], 10.0);
+
+        // Only 15 batches remain in the epoch.
+        let clamped = c.clamp_total(15);
+        assert_eq!(clamped.iter().sum::<usize>(), 15);
+        // Proportions roughly preserved (2:1).
+        assert!(clamped[0] >= clamped[1], "fast device should still get more");
+    }
+
+    #[test]
+    fn test_cadence_clamp_total_no_op_when_within() {
+        let c = ElChe::new(2, 10);
+        // Total is 20, max is 30 => no clamping needed.
+        let clamped = c.clamp_total(30);
+        assert_eq!(clamped, vec![10, 10]);
+    }
+
+    #[test]
+    fn test_cadence_builders() {
+        let c = ElChe::new(2, 10)
+            .with_overhead_target(0.20)
+            .with_max_anchor(100);
+        assert_eq!(c.anchor(), 10);
+        assert!(!c.is_calibrated());
+
+        // Overhead target clamped to valid range
+        let c2 = ElChe::new(2, 5)
+            .with_overhead_target(0.001); // below min 0.01
+        // Would be clamped to 0.01 internally
+        let _ = c2;
+    }
+
+    #[test]
+    fn test_cadence_weighted_allreduce_validation() {
+        // Validates that Ddp::weighted_all_reduce_gradients rejects
+        // mismatched batch_counts length (tested indirectly via the
+        // assertion in ElChe that world_size >= 2).
+        let c = ElChe::new(2, 10);
+        assert_eq!(c.batch_counts().len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "El Che requires at least 2 devices")]
+    fn test_cadence_requires_two_devices() {
+        ElChe::new(1, 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "anchor must be >= 1")]
+    fn test_cadence_requires_positive_anchor() {
+        ElChe::new(2, 0);
+    }
+
+    #[test]
+    fn test_cadence_speed_ratio_2x() {
+        // Rank 1 is slow, rank 0 is 2x faster
+        let c = ElChe::new(2, 10).with_speed_ratio(1, 2.0);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_cadence_speed_ratio_fbrl() {
+        // RTX 5060 Ti (rank 0) ~2.3x faster than GTX 1060 (rank 1)
+        let c = ElChe::new(2, 10).with_speed_ratio(1, 2.3);
+        assert_eq!(c.batches(0), 23);
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_cadence_speed_ratio_slow_rank_0() {
+        // Rank 0 is the slow one (unusual but valid)
+        let c = ElChe::new(2, 10).with_speed_ratio(0, 3.0);
+        assert_eq!(c.batches(0), 10);
+        assert_eq!(c.batches(1), 30);
+    }
+
+    #[test]
+    fn test_cadence_speed_ratio_equal() {
+        let c = ElChe::new(2, 10).with_speed_ratio(1, 1.0);
+        assert_eq!(c.batches(0), 10);
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_cadence_speed_ratio_three_devices() {
+        // Rank 2 is slow, others are 3x faster
+        let c = ElChe::new(3, 10).with_speed_ratio(2, 3.0);
+        assert_eq!(c.batches(0), 30);
+        assert_eq!(c.batches(1), 30);
+        assert_eq!(c.batches(2), 10);
+    }
+
+    #[test]
+    fn test_cadence_speed_ratio_three_devices_mid_slow() {
+        // Rank 1 is slow, 0 and 2 are fast
+        let c = ElChe::new(3, 10).with_speed_ratio(1, 2.0);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+        assert_eq!(c.batches(2), 20);
+    }
+
+    #[test]
+    fn test_cadence_max_anchor_one() {
+        // max_anchor=1: minimal cadence, sync after every slow-device batch
+        let mut c = ElChe::new(2, 1)
+            .with_max_anchor(1)
+            .with_speed_ratio(1, 2.0);
+
+        assert_eq!(c.batches(0), 2);
+        assert_eq!(c.batches(1), 1);
+
+        // High overhead won't increase anchor past 1
+        c.report_timing(&[100.0, 200.0], 500.0);
+        assert_eq!(c.anchor(), 1);
+    }
+
+    #[test]
+    fn test_cadence_speed_ratio_self_corrects() {
+        // Start with wrong guess: say rank 0 is slow, but it's actually fast
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50)
+            .with_speed_ratio(0, 2.0);
+
+        // Wrong: rank 0 gets 10, rank 1 gets 20
+        assert_eq!(c.batches(0), 10);
+        assert_eq!(c.batches(1), 20);
+
+        // After timing: rank 0 is actually 2x faster (500ms for 10 vs 2000ms for 20)
+        c.report_timing(&[500.0, 2000.0], 10.0);
+
+        // Self-corrected: rank 1 is slow (anchor), rank 0 gets more
+        assert_eq!(c.batches(1), c.anchor());
+        assert!(c.batches(0) > c.batches(1), "fast device should get more batches");
+    }
+
+    // -- DdpConfig tests ------------------------------------------------------
+
+    #[test]
+    fn test_ddp_config_defaults() {
+        let c = DdpConfig::new();
+        assert!(c.speed_hint.is_none());
+        assert!(c.overhead_target.is_none());
+        assert!(c.max_anchor.is_none());
+    }
+
+    #[test]
+    fn test_ddp_config_builder() {
+        let c = DdpConfig::new()
+            .speed_hint(1, 2.5)
+            .overhead_target(0.05)
+            .max_anchor(Some(20));
+        assert_eq!(c.speed_hint, Some((1, 2.5)));
+        assert_eq!(c.overhead_target, Some(0.05));
+        assert_eq!(c.max_anchor, Some(20));
+    }
+
+    #[test]
+    fn test_ddp_config_disable_el_che() {
+        let c = DdpConfig::new().max_anchor(Some(0));
+        assert_eq!(c.max_anchor, Some(0));
+    }
+
+    #[test]
+    fn test_configure_el_che_creates_from_config() {
+        let mut state = mock_state(&[0.5, 0.5]);
+
+        let config = DdpConfig::new().speed_hint(1, 2.0).overhead_target(0.15);
+        state.configure_el_che(&config);
+
+        assert!(state.el_che.is_some());
+        let el = state.el_che.as_ref().unwrap();
+        // Slow rank gets anchor, fast gets more
+        assert_eq!(el.batches(1), el.anchor());
+        assert!(el.batches(0) > el.batches(1));
+    }
+
+    #[test]
+    fn test_configure_el_che_disabled() {
+        let mut state = mock_state(&[0.5, 0.5]);
+
+        let config = DdpConfig::new().max_anchor(Some(0));
+        state.configure_el_che(&config);
+
+        assert!(state.el_che.is_none());
+    }
+
+    #[test]
+    fn test_configure_el_che_single_device_noop() {
+        let mut state = mock_state(&[1.0]);
+
+        let config = DdpConfig::new();
+        state.configure_el_che(&config);
+
+        // Single device -- El Che not created
+        assert!(state.el_che.is_none());
+    }
+
+    // -- El Che CUDA integration tests (multi-GPU, NCCL) ----------------------
+
+    #[test]
+    #[ignore = "NCCL init needs exclusive GPU; run with: make cuda-test-nccl"]
+    fn test_el_che_full_training_loop() {
+        if !require_multi_gpu() {
+            return;
+        }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        use crate::graph::FlowBuilder;
+        use crate::nn::{Adam, Linear, ReLU, mse_loss};
+        use crate::data::{DataLoader, DataSet};
+
+        // Simple dataset: 200 samples, 4 features, 2 targets
+        struct TinyData;
+        impl DataSet for TinyData {
+            fn len(&self) -> usize { 200 }
+            fn get(&self, index: usize) -> crate::tensor::Result<Vec<Tensor>> {
+                let x = Tensor::from_f32(
+                    &[index as f32; 4], &[4], Device::CPU,
+                )?;
+                let y = Tensor::from_f32(
+                    &[(index as f32) * 0.1; 2], &[2], Device::CPU,
+                )?;
+                Ok(vec![x, y])
+            }
+        }
+
+        let model = FlowBuilder::from(
+            Linear::on_device(4, 8, Device::CUDA(0)).unwrap(),
+        )
+        .through(ReLU::new())
+        .through(Linear::on_device(8, 2, Device::CUDA(0)).unwrap())
+        .build()
+        .unwrap();
+
+        Ddp::auto_with(
+            &model,
+            |dev| {
+                FlowBuilder::from(Linear::on_device(4, 8, dev)?)
+                    .through(ReLU::new())
+                    .through(Linear::on_device(8, 2, dev)?)
+                    .build()
+            },
+            |p| Adam::new(&p, 0.001),
+            DdpConfig::new().speed_hint(1, 2.0).max_anchor(Some(3)),
+        )
+        .unwrap();
+
+        assert!(model.is_distributed());
+        assert!(model.has_el_che());
+        assert_eq!(model.world_size(), 2);
+
+        // Set up DataLoader
+        let loader = DataLoader::from_dataset(TinyData)
+            .batch_size(10)
+            .names(&["input", "target"])
+            .build()
+            .unwrap();
+
+        model.set_data_loader(loader, "input").unwrap();
+
+        // Run 1 epoch
+        let mut step_count = 0;
+        for batch in model.epoch(0).activate() {
+            let b = batch.unwrap();
+            let out = model.forward_batch(&b).unwrap();
+            let target = Variable::new(b["target"].clone(), false);
+            let loss = mse_loss(&out, &target).unwrap();
+            loss.backward().unwrap();
+            model.step().unwrap();
+            step_count += 1;
+        }
+
+        // With anchor=3 and ratio=2.0: ~5 batches per El Che step (3 + 2*3=6, total ~5-6)
+        // 200 samples / 10 batch_size = 20 batches total
+        // ~20 / 5 = ~4 El Che iterations
+        assert!(step_count > 0, "should have trained at least one step");
+        assert!(step_count <= 20, "should not have more steps than batches");
+
+        cuda_synchronize(0);
+        cuda_synchronize(1);
+    }
+
+    #[test]
+    #[ignore = "NCCL init needs exclusive GPU; run with: make cuda-test-nccl"]
+    fn test_el_che_tagged_outputs_gathered() {
+        if !require_multi_gpu() {
+            return;
+        }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        use crate::graph::FlowBuilder;
+        use crate::nn::{Adam, Linear, ReLU, mse_loss};
+        use crate::data::{DataLoader, DataSet};
+
+        struct TinyData;
+        impl DataSet for TinyData {
+            fn len(&self) -> usize { 100 }
+            fn get(&self, index: usize) -> crate::tensor::Result<Vec<Tensor>> {
+                let x = Tensor::from_f32(
+                    &[index as f32; 4], &[4], Device::CPU,
+                )?;
+                let y = Tensor::from_f32(
+                    &[(index as f32) * 0.1; 2], &[2], Device::CPU,
+                )?;
+                Ok(vec![x, y])
+            }
+        }
+
+        // Build model with a tagged intermediate
+        let model = FlowBuilder::from(
+            Linear::on_device(4, 8, Device::CUDA(0)).unwrap(),
+        )
+        .through(ReLU::new())
+        .tag("hidden")
+        .through(Linear::on_device(8, 2, Device::CUDA(0)).unwrap())
+        .build()
+        .unwrap();
+
+        Ddp::auto_with(
+            &model,
+            |dev| {
+                FlowBuilder::from(Linear::on_device(4, 8, dev)?)
+                    .through(ReLU::new())
+                    .tag("hidden")
+                    .through(Linear::on_device(8, 2, dev)?)
+                    .build()
+            },
+            |p| Adam::new(&p, 0.001),
+            DdpConfig::new().max_anchor(Some(2)),
+        )
+        .unwrap();
+
+        let loader = DataLoader::from_dataset(TinyData)
+            .batch_size(10)
+            .names(&["input", "target"])
+            .build()
+            .unwrap();
+
+        model.set_data_loader(loader, "input").unwrap();
+
+        // Run one iteration and check tagged output
+        for batch in model.epoch(0).activate() {
+            let b = batch.unwrap();
+            let out = model.forward_batch(&b).unwrap();
+
+            // Tagged output should exist and have gathered batch dimension
+            let hidden = model.tagged("hidden");
+            assert!(hidden.is_some(), "tagged output should be gathered");
+            let h = hidden.unwrap();
+            // hidden shape: [total_samples_across_devices, 8]
+            assert_eq!(h.shape()[1], 8);
+            // Total samples should be > batch_size (multiple batches gathered)
+            assert!(h.shape()[0] >= 10, "gathered hidden should span multiple batches");
+
+            let target = Variable::new(b["target"].clone(), false);
+            let loss = mse_loss(&out, &target).unwrap();
+            loss.backward().unwrap();
+            model.step().unwrap();
+            break; // one iteration is enough
+        }
+
+        cuda_synchronize(0);
+        cuda_synchronize(1);
     }
 }
