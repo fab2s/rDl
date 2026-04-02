@@ -48,8 +48,31 @@ use hmac_sha256::Hash as Sha256;
 
 use node::*;
 use crate::autograd::Variable;
+use crate::data::Batch;
 use crate::nn::{Buffer, Module, Parameter};
 use crate::tensor::{Result, Tensor, TensorError};
+
+/// Context passed to the per-batch loss closure during El Che distributed
+/// training. All fields carry live autograd graphs, so the returned loss
+/// scalar can be backpropagated immediately.
+///
+/// ```ignore
+/// model.set_loss_fn(|ctx: &LossContext| {
+///     let cls  = cross_entropy_loss(&ctx.tags["head"], &ctx.batch["label"])?;
+///     let rec  = mse_loss(&ctx.tags["recon"], &ctx.batch["image"])?;
+///     Ok(cls + rec)
+/// });
+/// ```
+pub struct LossContext<'a> {
+    /// Forward output (live autograd).
+    pub output: &'a Variable,
+    /// The per-device batch with all named fields (inputs + targets).
+    pub batch: &'a Batch,
+    /// Tagged outputs from this forward pass (live autograd).
+    pub tags: &'a HashMap<String, Variable>,
+    /// Loop traces keyed by tag name (live autograd).
+    pub traces: &'a HashMap<String, Vec<Variable>>,
+}
 
 pub use flow::FlowBuilder;
 pub use loop_node::LoopBuilder;
@@ -173,6 +196,9 @@ pub struct Graph {
     optimizer: RefCell<Option<Box<dyn crate::nn::Optimizer>>>,
     // DataLoader binding for resident DDP (set by set_data_loader(), None by default)
     data_binding: RefCell<Option<DataLoaderBinding>>,
+    // Per-batch loss closure for El Che (set by set_loss_fn(), None = legacy gather path)
+    #[allow(clippy::type_complexity)]
+    loss_fn: RefCell<Option<Box<dyn Fn(&LossContext) -> Result<Variable>>>>,
 }
 
 /// Binding between a [`DataLoader`] and a [`Graph`] for integrated training.
@@ -198,6 +224,9 @@ pub(crate) struct DataLoaderBinding {
     /// Chunk ratios for distributed training (updated by auto-balancer).
     /// Stored here so the epoch iterator can read them without borrowing DistributedState.
     pub chunk_ratios: Vec<f64>,
+    /// Batch field names (from loader) for reconstructing Batch objects in
+    /// forward_distributed_el_che's per-batch backward path.
+    pub batch_names: Vec<String>,
 }
 
 impl Graph {
@@ -445,6 +474,7 @@ impl Graph {
             distributed: RefCell::new(None),
             optimizer: RefCell::new(None),
             data_binding: RefCell::new(None),
+            loss_fn: RefCell::new(None),
         });
 
         if verbose {
@@ -1591,6 +1621,7 @@ impl Graph {
         };
 
         *self.data_binding.borrow_mut() = Some(DataLoaderBinding {
+            batch_names: loader_names.clone(),
             loader,
             forward_input: forward_input.to_string(),
             graph_inputs,
@@ -1600,6 +1631,44 @@ impl Graph {
         });
 
         Ok(())
+    }
+
+    /// Register a per-batch loss function for El Che distributed training.
+    ///
+    /// When set, `forward_distributed_el_che` runs forward + loss + backward
+    /// per batch internally, keeping only ONE forward graph in VRAM at a time.
+    /// Without this, all forward graphs are held simultaneously (VRAM scales
+    /// with anchor * devices), which caps the practical anchor at 1.
+    ///
+    /// The closure receives a [`LossContext`] with live autograd on all fields.
+    /// It must return a scalar loss `Variable`.
+    ///
+    /// `forward_batch()` returns detached gathered outputs when a loss function
+    /// is registered. Tags and traces on the graph are gathered (detached) for
+    /// metrics. Calling `.backward()` on the returned Variable is a no-op.
+    ///
+    /// ```ignore
+    /// model.set_loss_fn(|ctx: &LossContext| {
+    ///     let cls  = cross_entropy_loss(&ctx.tags["head"], &ctx.batch["label"])?;
+    ///     let rec  = mse_loss(&ctx.tags["recon"], &ctx.batch["image"])?;
+    ///     Ok(cls + rec)
+    /// });
+    ///
+    /// for batch in model.epoch(epoch).activate() {
+    ///     let _metrics = model.forward_batch(&batch?)?;
+    ///     model.step()?;
+    /// }
+    /// ```
+    pub fn set_loss_fn<F>(&self, f: F)
+    where
+        F: Fn(&LossContext) -> Result<Variable> + 'static,
+    {
+        *self.loss_fn.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Whether a per-batch loss function is registered.
+    pub fn has_loss_fn(&self) -> bool {
+        self.loss_fn.borrow().is_some()
     }
 
     /// Get an epoch iterator for integrated training.
@@ -1845,136 +1914,450 @@ impl Graph {
         Variable::cat_many(&refs, 0)
     }
 
+    /// Gather tagged outputs and loop traces from a graph into accumulators.
+    /// Used by forward_distributed_el_che for both the main graph and replicas.
+    fn gather_tags_and_traces(
+        g: &Graph,
+        gather_device: crate::tensor::Device,
+        has_tags: bool,
+        has_traces: bool,
+        gathered_tags: &mut HashMap<String, Vec<Variable>>,
+        gathered_traces: &mut HashMap<(String, usize), Vec<Variable>>,
+    ) -> Result<()> {
+        if has_tags {
+            let tagged = g.tagged_outputs.borrow();
+            for (name, var) in tagged.iter() {
+                let moved = if var.data().device() != gather_device {
+                    var.to_device(gather_device)?
+                } else {
+                    var.clone()
+                };
+                gathered_tags.entry(name.clone()).or_default().push(moved);
+            }
+        }
+        if has_traces {
+            for tag_name in g.tag_names() {
+                if let Some(step_traces) = g.traces(&tag_name) {
+                    for (step_idx, trace_var) in step_traces.iter().enumerate() {
+                        let moved = if trace_var.data().device() != gather_device {
+                            trace_var.to_device(gather_device)?
+                        } else {
+                            trace_var.clone()
+                        };
+                        gathered_traces
+                            .entry((tag_name.clone(), step_idx))
+                            .or_default()
+                            .push(moved);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// El Che distributed forward: multiple complete batches per device.
     ///
     /// Each device processes its batch_counts[rank] batches independently.
-    /// Gradients accumulate naturally via libtorch autograd across all
-    /// forward passes. Tagged outputs are gathered across all batches and
-    /// all devices.
+    /// Tagged outputs are gathered across all batches and all devices.
+    ///
+    /// **Per-batch backward** (when `set_loss_fn` is registered): each batch
+    /// runs forward -> loss -> backward immediately, freeing the forward graph.
+    /// Only ONE activation graph is alive at any time, regardless of anchor.
+    /// Gradients accumulate across batches. Returns detached gathered outputs.
+    ///
+    /// **Legacy path** (no loss_fn): all forward graphs are held in VRAM
+    /// simultaneously. The user calls backward on the gathered output.
     ///
     /// Called by `forward_batch()` when El Che batches are pending.
     fn forward_distributed_el_che(&self) -> Result<Variable> {
-        use crate::nn::cuda_event::{CudaEvent, CudaEventFlags};
-        use crate::tensor::set_current_cuda_device;
-
-        // Take per-device batches and input mapping
-        let (per_device_batches, shard_input_map) = {
+        // Take per-device batches, input mapping, and batch field names
+        let (per_device_batches, shard_input_map, batch_names) = {
             let binding = self.data_binding.borrow();
             let binding = binding.as_ref().unwrap();
             let batches = binding.loader.take_el_che_batches()
                 .expect("forward_distributed_el_che: no El Che batches pending");
             let map = binding.shard_input_map.clone();
-            (batches, map)
+            let names = binding.batch_names.clone();
+            (batches, map, names)
         };
 
-        let (n, devices, gather_device) = {
-            let dist = self.distributed.borrow();
-            let dist = dist.as_ref().unwrap();
-            let n = dist.devices.len();
-            let devices = dist.devices.clone();
-            let gather_device = self.data_binding.borrow()
-                .as_ref()
-                .map(|b| b.loader.device())
-                .unwrap_or(devices[0]);
-            (n, devices, gather_device)
+        // Take loss_fn out of RefCell to avoid borrow conflicts with &self
+        let loss_fn = self.loss_fn.borrow_mut().take();
+
+        let result = if loss_fn.is_some() {
+            self.el_che_per_batch_backward(
+                &per_device_batches,
+                &shard_input_map,
+                &batch_names,
+                loss_fn.as_deref().unwrap(),
+            )
+        } else {
+            self.el_che_legacy_forward(
+                &per_device_batches,
+                &shard_input_map,
+            )
         };
 
+        // Put loss_fn back
+        *self.loss_fn.borrow_mut() = loss_fn;
+
+        result
+    }
+
+    /// Per-batch backward El Che path: forward -> loss -> backward per batch.
+    ///
+    /// Only one forward graph alive at a time. Gradients accumulate across
+    /// batches. Returns detached gathered outputs for metrics.
+    ///
+    /// Round-robin submission: batches are interleaved across devices
+    /// (batch 0 on each device, then batch 1, ...) so GPU streams overlap
+    /// and VRAM peaks are distributed evenly.
+    fn el_che_per_batch_backward(
+        &self,
+        per_device_batches: &[Vec<Vec<Tensor>>],
+        shard_input_map: &[usize],
+        batch_names: &[String],
+        loss_fn: &dyn Fn(&LossContext) -> Result<Variable>,
+    ) -> Result<Variable> {
+        use crate::nn::cuda_event::CudaEventFlags;
+        use crate::tensor::set_current_cuda_device;
+
+        let (_n, devices, gather_device) = self.el_che_read_config()?;
         let has_tags = !self.tag_capture.is_empty();
+        let has_traces = self.nodes.iter().any(|nd| nd.trace_buf.is_some());
+        let device_indices = Self::cuda_device_indices(&devices);
+
+        let batch_counts: Vec<usize> = per_device_batches.iter()
+            .map(|b| b.len()).collect();
+        let max_batches = batch_counts.iter().copied().max().unwrap_or(0);
+
         let mut all_outputs: Vec<Variable> = Vec::new();
         let mut gathered_tags: HashMap<String, Vec<Variable>> = HashMap::new();
-        let mut timing: Vec<(CudaEvent, CudaEvent)> = Vec::with_capacity(n);
-        let mut batch_counts: Vec<usize> = Vec::with_capacity(n);
+        let mut gathered_traces: HashMap<(String, usize), Vec<Variable>> = HashMap::new();
 
-        for (rank, device_batches) in per_device_batches.iter().enumerate() {
-            batch_counts.push(device_batches.len());
+        // Record start events on all device streams
+        let timing_starts = Self::record_events_all(&device_indices, CudaEventFlags::Default)?;
 
-            if device_batches.is_empty() {
-                continue;
-            }
+        // Round-robin: one batch per device at a time
+        for batch_idx in 0..max_batches {
+            for (rank, device_batches) in per_device_batches.iter().enumerate() {
+                if batch_idx >= device_batches.len() {
+                    continue;
+                }
+                let batch_tensors = &device_batches[batch_idx];
+                set_current_cuda_device(device_indices[rank]);
 
-            let device_idx = match devices[rank] {
-                crate::tensor::Device::CUDA(i) => i,
-                _ => 0,
-            };
-            set_current_cuda_device(device_idx);
-            let start = CudaEvent::new(CudaEventFlags::Default)?;
-            start.record()?;
-
-            for batch_tensors in device_batches {
-                // Build input vector from shard_input_map
                 let graph_inputs: Vec<Variable> = shard_input_map.iter()
                     .map(|&idx| Variable::new(batch_tensors[idx].clone(), false))
                     .collect();
 
-                let out = if rank == 0 {
-                    self.forward_impl(&graph_inputs)?
-                } else {
-                    let dist = self.distributed.borrow();
-                    let dist = dist.as_ref().unwrap();
-                    let replica = &dist.replicas[rank - 1];
-                    match replica.as_graph() {
-                        Some(g) => g.forward_impl(&graph_inputs)?,
-                        None => replica.forward(&graph_inputs[0])?,
-                    }
-                };
+                // Forward
+                let out = self.el_che_forward_on_rank(rank, &graph_inputs)?;
 
-                // Move output to gather device (preserves autograd chain via libtorch)
-                let out_gathered = if out.data().device() != gather_device {
-                    out.to_device(gather_device)?
-                } else {
-                    out
-                };
-                all_outputs.push(out_gathered);
+                // Snapshot tags and traces (live autograd) for the loss closure
+                let tags = self.el_che_snapshot_tags(rank, has_tags)?;
+                let traces = self.el_che_snapshot_traces(rank, has_traces);
 
-                // Capture tagged outputs from this forward pass
-                if has_tags {
+                // Reconstruct Batch with all fields (inputs + targets)
+                let batch = Batch::new(batch_tensors.clone(), batch_names.to_vec());
+
+                // Call loss closure and backward (frees forward graph)
+                let ctx = LossContext {
+                    output: &out,
+                    batch: &batch,
+                    tags: &tags,
+                    traces: &traces,
+                };
+                let loss = loss_fn(&ctx)?;
+                loss.backward()?;
+
+                // Gather detached output for metrics
+                let detached = out.detach();
+                all_outputs.push(Self::move_to(detached, gather_device)?);
+
+                if has_tags || has_traces {
+                    Self::gather_detached_tags(
+                        &tags, gather_device, &mut gathered_tags,
+                    )?;
+                    Self::gather_detached_traces(
+                        &traces, gather_device, &mut gathered_traces,
+                    )?;
+                }
+            }
+        }
+
+        // Record end events on all device streams
+        let timing_ends = Self::record_events_all(&device_indices, CudaEventFlags::Default)?;
+        let timing = Self::zip_timing(timing_starts, timing_ends);
+
+        self.el_che_store_timing(batch_counts, timing);
+        self.el_che_set_gathered_tags(has_tags, &gathered_tags)?;
+        self.el_che_set_gathered_traces(&gathered_traces)?;
+        Self::cat_outputs(all_outputs)
+    }
+
+    /// Legacy El Che path: all forward graphs held simultaneously.
+    /// User calls backward on the gathered output.
+    ///
+    /// Round-robin submission for GPU stream overlap.
+    fn el_che_legacy_forward(
+        &self,
+        per_device_batches: &[Vec<Vec<Tensor>>],
+        shard_input_map: &[usize],
+    ) -> Result<Variable> {
+        use crate::nn::cuda_event::CudaEventFlags;
+        use crate::tensor::set_current_cuda_device;
+
+        let (_n, devices, gather_device) = self.el_che_read_config()?;
+        let has_tags = !self.tag_capture.is_empty();
+        let has_traces = self.nodes.iter().any(|nd| nd.trace_buf.is_some());
+        let device_indices = Self::cuda_device_indices(&devices);
+
+        let batch_counts: Vec<usize> = per_device_batches.iter()
+            .map(|b| b.len()).collect();
+        let max_batches = batch_counts.iter().copied().max().unwrap_or(0);
+
+        let mut all_outputs: Vec<Variable> = Vec::new();
+        let mut gathered_tags: HashMap<String, Vec<Variable>> = HashMap::new();
+        let mut gathered_traces: HashMap<(String, usize), Vec<Variable>> = HashMap::new();
+
+        // Record start events on all device streams
+        let timing_starts = Self::record_events_all(&device_indices, CudaEventFlags::Default)?;
+
+        // Round-robin: one batch per device at a time
+        for batch_idx in 0..max_batches {
+            for (rank, device_batches) in per_device_batches.iter().enumerate() {
+                if batch_idx >= device_batches.len() {
+                    continue;
+                }
+                let batch_tensors = &device_batches[batch_idx];
+                set_current_cuda_device(device_indices[rank]);
+
+                let graph_inputs: Vec<Variable> = shard_input_map.iter()
+                    .map(|&idx| Variable::new(batch_tensors[idx].clone(), false))
+                    .collect();
+
+                let out = self.el_che_forward_on_rank(rank, &graph_inputs)?;
+
+                all_outputs.push(Self::move_to(out, gather_device)?);
+
+                if has_tags || has_traces {
                     if rank == 0 {
-                        let tagged = self.tagged_outputs.borrow();
-                        for (name, var) in tagged.iter() {
-                            let moved = if var.data().device() != gather_device {
-                                var.to_device(gather_device)?
-                            } else {
-                                var.clone()
-                            };
-                            gathered_tags.entry(name.clone()).or_default().push(moved);
-                        }
+                        Self::gather_tags_and_traces(
+                            self, gather_device, has_tags, has_traces,
+                            &mut gathered_tags, &mut gathered_traces,
+                        )?;
                     } else {
                         let dist = self.distributed.borrow();
                         let dist = dist.as_ref().unwrap();
                         if let Some(g) = dist.replicas[rank - 1].as_graph() {
-                            let tagged = g.tagged_outputs.borrow();
-                            for (name, var) in tagged.iter() {
-                                let moved = if var.data().device() != gather_device {
-                                    var.to_device(gather_device)?
-                                } else {
-                                    var.clone()
-                                };
-                                gathered_tags.entry(name.clone()).or_default().push(moved);
-                            }
+                            Self::gather_tags_and_traces(
+                                g, gather_device, has_tags, has_traces,
+                                &mut gathered_tags, &mut gathered_traces,
+                            )?;
                         }
                     }
                 }
             }
-
-            set_current_cuda_device(device_idx);
-            let end = CudaEvent::new(CudaEventFlags::Default)?;
-            end.record()?;
-            timing.push((start, end));
         }
 
-        // Store batch counts and timing for step()
-        {
-            let mut dist = self.distributed.borrow_mut();
-            let dist = dist.as_mut().unwrap();
-            dist.last_el_che_counts = batch_counts;
-            dist.last_timing = Some(timing);
-        }
+        // Record end events on all device streams
+        let timing_ends = Self::record_events_all(&device_indices, CudaEventFlags::Default)?;
+        let timing = Self::zip_timing(timing_starts, timing_ends);
 
-        // Set gathered tagged outputs on the main graph (catted across all batches/devices)
+        self.el_che_store_timing(batch_counts, timing);
+        self.el_che_set_gathered_tags(has_tags, &gathered_tags)?;
+        self.el_che_set_gathered_traces(&gathered_traces)?;
+        Self::cat_outputs(all_outputs)
+    }
+
+    // -- El Che helpers -------------------------------------------------------
+
+    /// Forward on a specific rank (rank 0 = self, rank > 0 = replica).
+    fn el_che_forward_on_rank(&self, rank: usize, graph_inputs: &[Variable]) -> Result<Variable> {
+        if rank == 0 {
+            self.forward_impl(graph_inputs)
+        } else {
+            let dist = self.distributed.borrow();
+            let dist = dist.as_ref().unwrap();
+            let replica = &dist.replicas[rank - 1];
+            match replica.as_graph() {
+                Some(g) => g.forward_impl(graph_inputs),
+                None => replica.forward(&graph_inputs[0]),
+            }
+        }
+    }
+
+    /// Move a Variable to the target device, or return it unchanged if already there.
+    fn move_to(var: Variable, target: crate::tensor::Device) -> Result<Variable> {
+        if var.data().device() != target {
+            var.to_device(target)
+        } else {
+            Ok(var)
+        }
+    }
+
+    /// Extract CUDA device indices (0 for CPU devices).
+    fn cuda_device_indices(devices: &[crate::tensor::Device]) -> Vec<u8> {
+        devices.iter().map(|d| match d {
+            crate::tensor::Device::CUDA(i) => *i,
+            _ => 0,
+        }).collect()
+    }
+
+    /// Record a CudaEvent on each device stream.
+    fn record_events_all(
+        device_indices: &[u8],
+        flags: crate::nn::cuda_event::CudaEventFlags,
+    ) -> Result<Vec<crate::nn::cuda_event::CudaEvent>> {
+        use crate::nn::cuda_event::CudaEvent;
+        use crate::tensor::set_current_cuda_device;
+        let mut events = Vec::with_capacity(device_indices.len());
+        for &idx in device_indices {
+            set_current_cuda_device(idx);
+            let ev = CudaEvent::new(flags)?;
+            ev.record()?;
+            events.push(ev);
+        }
+        Ok(events)
+    }
+
+    /// Zip start/end event Vecs into timing pairs.
+    fn zip_timing(
+        starts: Vec<crate::nn::cuda_event::CudaEvent>,
+        ends: Vec<crate::nn::cuda_event::CudaEvent>,
+    ) -> Vec<(crate::nn::cuda_event::CudaEvent, crate::nn::cuda_event::CudaEvent)> {
+        starts.into_iter().zip(ends).collect()
+    }
+
+    /// Read distributed config for El Che forward paths.
+    fn el_che_read_config(&self) -> Result<(usize, Vec<crate::tensor::Device>, crate::tensor::Device)> {
+        let dist = self.distributed.borrow();
+        let dist = dist.as_ref().unwrap();
+        let n = dist.devices.len();
+        let devices = dist.devices.clone();
+        let gather_device = self.data_binding.borrow()
+            .as_ref()
+            .map(|b| b.loader.device())
+            .unwrap_or(devices[0]);
+        Ok((n, devices, gather_device))
+    }
+
+    /// Snapshot tagged outputs from the graph that ran forward (rank 0 = self).
+    fn el_che_snapshot_tags(
+        &self,
+        rank: usize,
+        has_tags: bool,
+    ) -> Result<HashMap<String, Variable>> {
+        if !has_tags {
+            return Ok(HashMap::new());
+        }
+        if rank == 0 {
+            Ok(self.tagged_outputs.borrow().clone())
+        } else {
+            let dist = self.distributed.borrow();
+            let dist = dist.as_ref().unwrap();
+            match dist.replicas[rank - 1].as_graph() {
+                Some(g) => Ok(g.tagged_outputs.borrow().clone()),
+                None => Ok(HashMap::new()),
+            }
+        }
+    }
+
+    /// Snapshot loop traces from the graph that ran forward (rank 0 = self).
+    fn el_che_snapshot_traces(
+        &self,
+        rank: usize,
+        has_traces: bool,
+    ) -> HashMap<String, Vec<Variable>> {
+        let mut result = HashMap::new();
+        if !has_traces {
+            return result;
+        }
+        let collect_from = |g: &Graph| -> HashMap<String, Vec<Variable>> {
+            let mut r = HashMap::new();
+            for tag_name in g.tag_names() {
+                if let Some(traces) = g.traces(&tag_name) {
+                    r.insert(tag_name, traces);
+                }
+            }
+            r
+        };
+        if rank == 0 {
+            result = collect_from(self);
+        } else {
+            let dist = self.distributed.borrow();
+            let dist = dist.as_ref().unwrap();
+            if let Some(g) = dist.replicas[rank - 1].as_graph() {
+                result = collect_from(g);
+            }
+        }
+        result
+    }
+
+    /// Gather detached tags into the accumulator (for per-batch backward path).
+    fn gather_detached_tags(
+        tags: &HashMap<String, Variable>,
+        gather_device: crate::tensor::Device,
+        gathered: &mut HashMap<String, Vec<Variable>>,
+    ) -> Result<()> {
+        for (name, var) in tags {
+            let detached = var.detach();
+            let moved = if detached.data().device() != gather_device {
+                detached.to_device(gather_device)?
+            } else {
+                detached
+            };
+            gathered.entry(name.clone()).or_default().push(moved);
+        }
+        Ok(())
+    }
+
+    /// Gather detached traces into the accumulator (for per-batch backward path).
+    fn gather_detached_traces(
+        traces: &HashMap<String, Vec<Variable>>,
+        gather_device: crate::tensor::Device,
+        gathered: &mut HashMap<(String, usize), Vec<Variable>>,
+    ) -> Result<()> {
+        for (tag_name, step_vars) in traces {
+            for (step_idx, var) in step_vars.iter().enumerate() {
+                let detached = var.detach();
+                let moved = if detached.data().device() != gather_device {
+                    detached.to_device(gather_device)?
+                } else {
+                    detached
+                };
+                gathered
+                    .entry((tag_name.clone(), step_idx))
+                    .or_default()
+                    .push(moved);
+            }
+        }
+        Ok(())
+    }
+
+    /// Store batch counts and timing on DistributedState for step().
+    fn el_che_store_timing(
+        &self,
+        batch_counts: Vec<usize>,
+        timing: Vec<(crate::nn::cuda_event::CudaEvent, crate::nn::cuda_event::CudaEvent)>,
+    ) {
+        let mut dist = self.distributed.borrow_mut();
+        let dist = dist.as_mut().unwrap();
+        dist.last_el_che_counts = batch_counts;
+        dist.last_timing = Some(timing);
+    }
+
+    /// Set gathered tagged outputs on the main graph (catted across batches/devices).
+    fn el_che_set_gathered_tags(
+        &self,
+        has_tags: bool,
+        gathered_tags: &HashMap<String, Vec<Variable>>,
+    ) -> Result<()> {
         if has_tags && !gathered_tags.is_empty() {
             let mut tagged = self.tagged_outputs.borrow_mut();
             tagged.clear();
-            for (name, vars) in &gathered_tags {
+            for (name, vars) in gathered_tags {
                 if vars.len() == 1 {
                     tagged.insert(name.clone(), vars[0].clone());
                 } else {
@@ -1983,13 +2366,40 @@ impl Graph {
                 }
             }
         }
+        Ok(())
+    }
 
-        // Cat all outputs across devices
-        if all_outputs.len() == 1 {
-            return Ok(all_outputs.into_iter().next().unwrap());
+    /// Set gathered loop traces on the main graph (catted per step across batches/devices).
+    fn el_che_set_gathered_traces(
+        &self,
+        gathered_traces: &HashMap<(String, usize), Vec<Variable>>,
+    ) -> Result<()> {
+        if !gathered_traces.is_empty() {
+            let mut by_tag: HashMap<String, Vec<(usize, Variable)>> = HashMap::new();
+            for ((tag_name, step_idx), vars) in gathered_traces {
+                let catted = if vars.len() == 1 {
+                    vars[0].clone()
+                } else {
+                    let refs: Vec<&Variable> = vars.iter().collect();
+                    Variable::cat_many(&refs, 0)?
+                };
+                by_tag.entry(tag_name.clone()).or_default().push((*step_idx, catted));
+            }
+            for (tag_name, mut steps) in by_tag {
+                steps.sort_by_key(|(idx, _)| *idx);
+                let ordered: Vec<Variable> = steps.into_iter().map(|(_, v)| v).collect();
+                self.set_traces(&tag_name, ordered);
+            }
         }
+        Ok(())
+    }
 
-        let refs: Vec<&Variable> = all_outputs.iter().collect();
+    /// Cat output Variables along dim 0, or return the single one.
+    fn cat_outputs(outputs: Vec<Variable>) -> Result<Variable> {
+        if outputs.len() == 1 {
+            return Ok(outputs.into_iter().next().unwrap());
+        }
+        let refs: Vec<&Variable> = outputs.iter().collect();
         Variable::cat_many(&refs, 0)
     }
 

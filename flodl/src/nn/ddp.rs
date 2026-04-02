@@ -2122,7 +2122,8 @@ mod tests {
         model.set_data_loader(loader, "input").unwrap();
 
         // Run one iteration and check tagged output
-        for batch in model.epoch(0).activate() {
+        let mut iter = model.epoch(0).activate();
+        if let Some(batch) = iter.next() {
             let b = batch.unwrap();
             let out = model.forward_batch(&b).unwrap();
 
@@ -2139,7 +2140,6 @@ mod tests {
             let loss = mse_loss(&out, &target).unwrap();
             loss.backward().unwrap();
             model.step().unwrap();
-            break; // one iteration is enough
         }
 
         cuda_synchronize(0);

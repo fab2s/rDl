@@ -44,9 +44,9 @@ RUN       = $(COMPOSE) run --rm dev
 RUN_GPU   = $(COMPOSE) run --rm cuda
 RUN_BENCH = $(COMPOSE) run --rm bench
 
-.PHONY: build test test-release check clippy doc shell clean \
+.PHONY: build test test-release check clippy clippy-all doc shell clean \
         cuda-build cuda-test cuda-test-nccl cuda-test-serial cuda-test-graph cuda-test-all \
-        cuda-clippy cuda-shell \
+        cuda-clippy cuda-clippy-all cuda-shell \
         image cuda-image \
         test-all setup build-libtorch \
         bench-image bench bench-cpu bench-compare bench-publish \
@@ -111,6 +111,10 @@ check: image _require-libtorch
 clippy: image _require-libtorch
 	$(RUN) cargo clippy -- -W clippy::all
 
+# Lint including test code
+clippy-all: image _require-libtorch
+	$(RUN) cargo clippy --tests -- -W clippy::all
+
 # Generate API docs
 doc: image _require-libtorch
 	$(RUN) cargo doc --no-deps --document-private-items
@@ -155,6 +159,10 @@ cuda-test-all: cuda-test cuda-test-nccl cuda-test-serial
 # Lint with CUDA feature
 cuda-clippy: cuda-image _require-libtorch-cuda
 	$(RUN_GPU) cargo clippy --features cuda -- -W clippy::all
+
+# Lint with CUDA feature including test code
+cuda-clippy-all: cuda-image _require-libtorch-cuda
+	$(RUN_GPU) cargo clippy --features cuda --tests -- -W clippy::all
 
 # Interactive shell (CUDA)
 cuda-shell: cuda-image

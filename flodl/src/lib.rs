@@ -89,7 +89,7 @@ pub use nn::{
     GaussianBlur, gaussian_blur_2d,
 };
 pub use graph::{
-    FlowBuilder, MergeOp, Graph, MapBuilder, Trend, TrendGroup,
+    FlowBuilder, MergeOp, Graph, LossContext, MapBuilder, Trend, TrendGroup,
     Profile, NodeTiming, LevelTiming, format_duration,
     SoftmaxRouter, SigmoidRouter, FixedSelector, ArgmaxSelector,
     ThresholdHalt, LearnedHalt,

@@ -315,6 +315,17 @@ impl Graph {
         None
     }
 
+    /// Replace trace buffer contents for the given tag.
+    ///
+    /// Used by El Che gathering to set catted traces from all devices/batches.
+    pub(crate) fn set_traces(&self, tag: &str, traces: Vec<Variable>) {
+        if let Some(&(ni, _)) = self.tag_names.get(tag) {
+            if let Some(ref buf) = self.nodes[ni].trace_buf {
+                *buf.borrow_mut() = traces;
+            }
+        }
+    }
+
     /// Get the last trace output from the most recent loop iteration.
     ///
     /// Convenience wrapper around [`traces()`](Self::traces) that returns only

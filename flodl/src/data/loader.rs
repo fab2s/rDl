@@ -1141,7 +1141,8 @@ fn load_resident_tensors(cpu_tensors: &[Tensor], device: Device) -> Result<Vec<T
     Ok(gpu_data)
 }
 
-/// Pick the gather device: resident backend with most free VRAM, or CPU.
+/// Pick the gather device: resident backend with most free VRAM,
+/// or the primary device when all backends are streaming.
 fn select_gather_device(backends: &[DeviceBackend]) -> (Device, Option<usize>) {
     let mut best_idx: Option<usize> = None;
     let mut best_free: u64 = 0;
@@ -1160,7 +1161,9 @@ fn select_gather_device(backends: &[DeviceBackend]) -> (Device, Option<usize>) {
 
     match best_idx {
         Some(idx) => (backends[idx].device(), Some(idx)),
-        None => (Device::CPU, None),
+        // All streaming: gather on the primary device so targets stay
+        // on the same CUDA device as model weights.
+        None => (backends[0].device(), None),
     }
 }
 
@@ -2192,9 +2195,9 @@ mod tests {
 
         // One epoch of training
         let iter = model.epoch(0);
-        let mut active = iter.activate();
+        let active = iter.activate();
         let mut batch_count = 0;
-        while let Some(batch_result) = active.next() {
+        for batch_result in active {
             let b = batch_result.unwrap();
             assert!(b.has("input"));
             assert!(b.has("target"));
@@ -2454,7 +2457,7 @@ mod tests {
     #[test]
     fn test_el_che_clamping_proportional() {
         // Test the clamping logic in next_el_che
-        let counts = vec![10usize, 23];
+        let counts = [10usize, 23];
         let total: usize = counts.iter().sum(); // 33
         let remaining = 20usize;
 
