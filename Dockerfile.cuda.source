@@ -1,4 +1,4 @@
-# flodl CUDA image — built from PyTorch source for custom GPU architectures.
+# flodl libtorch builder -- compiles libtorch from PyTorch source.
 #
 # Use this when pre-built libtorch doesn't cover your GPU mix.
 # Example: sm_61 (GTX 1060) + sm_120 (RTX 5060 Ti) needs a custom build.
@@ -8,9 +8,11 @@
 #
 # The TORCH_CUDA_ARCH_LIST arg controls which GPU architectures are compiled.
 # `make build-libtorch` auto-detects this from your installed GPUs.
+#
+# This is a builder-only image. The Makefile extracts the built libtorch
+# to libtorch/builds/<arch>/ via docker cp.
 
-# ---- Stage 1: build libtorch from PyTorch source ----
-FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -27,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps needed by PyTorch build system
-# NOTE: do NOT install cmake via pip — pip cmake 4.x is too new for some
+# NOTE: do NOT install cmake via pip -- pip cmake 4.x is too new for some
 # PyTorch submodules. Use the system cmake from apt instead.
 RUN pip3 install --break-system-packages \
     typing_extensions \
@@ -73,37 +75,3 @@ RUN mkdir -p /usr/local/libtorch && \
     cp -a /pytorch/torch/lib /usr/local/libtorch/lib && \
     cp -a /pytorch/torch/include /usr/local/libtorch/include && \
     cp -a /pytorch/torch/share /usr/local/libtorch/share 2>/dev/null || true
-
-# ---- Stage 2: runtime image (same as Dockerfile.cuda) ----
-FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    curl \
-    unzip \
-    ca-certificates \
-    git \
-    gcc \
-    g++ \
-    pkg-config \
-    graphviz \
-    && rm -rf /var/lib/apt/lists/*
-
-# --- Rust ---
-ENV CARGO_HOME="/usr/local/cargo"
-ENV RUSTUP_HOME="/usr/local/rustup"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
-    && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
-ENV PATH="${CARGO_HOME}/bin:${PATH}"
-
-# --- libtorch (from source build) ---
-COPY --from=builder /usr/local/libtorch /usr/local/libtorch
-
-ENV LIBTORCH_PATH="/usr/local/libtorch"
-ENV LD_LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"
-ENV LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"
-ENV CUDA_HOME="/usr/local/cuda"
-
-WORKDIR /workspace

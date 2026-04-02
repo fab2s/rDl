@@ -54,6 +54,7 @@ pub mod cuda_graph;
 pub mod cuda_event;
 pub mod cuda_stream;
 pub mod nccl;
+pub mod ddp;
 pub mod functional;
 
 pub use parameter::Parameter;
@@ -108,6 +109,7 @@ pub use cuda_graph::{CudaGraph, MemPoolId, CaptureMode, cuda_graph_capture, cuda
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NcclComms, ReduceOp};
+pub use ddp::Ddp;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

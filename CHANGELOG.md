@@ -5,6 +5,77 @@ All notable changes to floDl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] - Multi-GPU & Infrastructure
+
+### Added
+
+#### DDP Phase 1: Async GPU-CPU Foundation
+- **`CudaEvent`**: Record/synchronize/elapsed_time on CUDA streams. `CudaEventFlags` (Default for timing, DisableTiming for pure sync). RAII Drop, Send. 14 FFI functions (7 event + 7 stream).
+- **`CudaStream`**: Pool-managed streams per device. Synchronize, wait_event, is_complete. RAII Drop, Send.
+- **`StreamGuard`**: RAII stream switching (sets on create, restores default on drop). Async copy pattern: `let _guard = StreamGuard::new(&stream); tensor.to_device_async(Device::CPU)?;`
+- Enables zero-stall GPU-to-CPU pipeline: `training stream -> CudaEvent -> copy stream -> CPU`
+
+#### DDP Phase 2: NCCL Collective Operations
+- **`NcclComms`**: RAII communicator group for multi-GPU collectives. 5 FFI functions wrapping raw NCCL (ncclCommInitAll, AllReduce, Broadcast via GroupStart/End).
+- **`ReduceOp`**: Sum, Prod, Max, Min, Avg.
+- **`all_reduce()`** / **`all_reduce_on_streams()`**: In-place AllReduce across all devices (default or explicit streams).
+- **`broadcast()`** / **`broadcast_on_streams()`**: Broadcast from root rank to all devices.
+- Raw NCCL (not c10d) for minimal overhead in single-process multi-GPU.
+
+#### DDP Phase 3: Transparent Multi-GPU Training
+- **`Graph::distribute()`**: Auto-detect GPUs, create replicas, broadcast params. Single line to enable multi-GPU. No-op on single GPU.
+- **`Graph::set_optimizer()`**: Creates per-replica optimizers when distributed.
+- **`Graph::step()`**: AllReduce gradients + sync buffers + optimizer step + zero_grad. One call replaces the manual loop.
+- **`Graph::set_lr()`** / **`world_size()`** / **`is_distributed()`**: Multi-GPU aware API.
+- **Cross-device autograd**: `Tensor::to_device()` preserves grad_fn (ToCopyBackward). Forward chunks input, forwards shards on their GPUs, gathers via to_device + cat. libtorch autograd naturally flows gradients back through device transfers.
+- **`Ddp`**: Manual DDP coordinator for complex training patterns (GAN, RL, progressive). Explicit sync_params, all_reduce_gradients, sync_buffers.
+- Training loop is identical for 1 or N GPUs; `distribute()` is the only difference.
+
+#### DDP Phase 4: Auto-Balancing
+- **Per-GPU throughput measurement**: CudaEvent-based timing around each replica's forward pass in `forward_distributed()`. Zero overhead (async GPU recording, no CPU sync).
+- **EMA throughput tracking**: Exponentially smoothed samples/ms per device (alpha=0.3). First measurement initializes directly, subsequent measurements blend.
+- **Adaptive batch sharding**: After 10 calibration steps with equal splits, `chunk_ratios` are recomputed proportional to measured throughput. Re-evaluated every 50 steps. `MIN_CHUNK_RATIO` (5%) prevents starving any GPU.
+- **Weighted gradient averaging**: When chunk ratios are unequal, each replica's gradient is scaled by `(shard_size / batch_size)` then AllReduce Sum, producing the mathematically correct mean gradient regardless of shard distribution.
+- **`Graph::chunk_ratios()`**: Query current batch distribution ratios (for logging/debugging).
+- **`Graph::throughput()`**: Query per-device EMA throughput (samples/ms).
+- All auto-balancing is internal to `forward_distributed()` and `step()`. Training loop is unchanged.
+
+#### NCCL Device Safety
+- **Device save/restore**: All `NcclComms` methods (`new`, `all_reduce`, `broadcast`, and stream variants) now save and restore the current CUDA device around FFI calls. Prevents NCCL operations from leaking device context changes to callers.
+- **Shared `NCCL_LOCK`**: Single `pub(crate)` mutex in `ddp` module, used by both `nccl::tests` and `ddp::tests` to serialize NCCL communicator operations.
+
+### Changed
+
+#### Unified libtorch Management
+- **`libtorch/` directory**: Single host-side directory for all libtorch variants.
+  - `libtorch/precompiled/cpu|cu128|cu126/` for downloaded pre-built variants
+  - `libtorch/builds/<arch>/` for source-compiled variants (e.g., `sm61-sm120`)
+  - `libtorch/.active` points to the variant in use
+  - `libtorch/<variant>/.arch` contains metadata (cuda version, torch version, architectures, source type)
+- **Docker images are libtorch-agnostic**: No libtorch baked into images. Mounted at runtime via volume.
+  - `Dockerfile` (new, replaces `Dockerfile.cpu`): Ubuntu + Rust, no libtorch
+  - `Dockerfile.cuda`: parameterized `CUDA_VERSION`, cudnn-devel base, no libtorch
+  - `Dockerfile.cuda.source`: builder-only (no Stage 2 runtime image), Makefile extracts via `docker cp`
+  - `Dockerfile.bench`: removed libtorch download, kept Python + PyTorch pip install
+- **docker-compose.yml simplified**: 5 services reduced to 3 (`dev`, `cuda`, `bench`). Removed `cuda-local` and `cuda-source`. All services mount `${LIBTORCH_HOST_PATH}:/usr/local/libtorch:ro`.
+- **Makefile auto-detection**: Reads `libtorch/.active` and `.arch` to derive `CUDA_VERSION` and libtorch mount path. Override: `CUDA_VERSION=12.6.0 make cuda-test`.
+- **`download-libtorch.sh --project`**: Downloads to `libtorch/precompiled/<variant>/`, writes `.arch` and `.active`. Existing `--path` mode for native installs unchanged.
+
+#### Test Infrastructure
+- **15 tests un-ignored**: `cuda_event` (3), `cuda_stream` (4), DDP cross-device autograd (2) tests now run in the normal `make cuda-test` flow. They have proper mutex serialization and early-return guards.
+- **NCCL/DDP/Graph tests remain `#[ignore]`**: NCCL communicator init corrupts concurrent CUBLAS operations. Must run single-threaded.
+- **`make cuda-test-all`** (new): Two-pass target -- parallel tests + single-threaded NCCL/DDP/Graph tests.
+- **`make cuda-test-nccl`** (new): Convenience target for NCCL/DDP/Graph tests only.
+
+#### Build Targets
+- **`make setup`**: Auto-detect hardware, download CPU libtorch + CUDA libtorch (or build from source), build Docker image. One command from zero to ready.
+- **`make build-libtorch`**: Compile libtorch from source, extract to `libtorch/builds/<arch>/`, write `.arch`/`.active`.
+- **CI updated**: CUDA job downloads libtorch separately and mounts into container (no longer baked into image).
+
+### Removed
+- `Dockerfile.cpu` (replaced by `Dockerfile`)
+- `cuda-local` and `cuda-source` docker-compose services
+
 ## [0.2.2] - 2026-03-31
 
 ### Added

@@ -126,7 +126,6 @@ mod tests {
     static EVENT_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    #[ignore = "CUDA events need GPU; run with: make cuda-test"]
     fn test_cuda_event_record_synchronize() {
         if !test_device().is_cuda() {
             return;
@@ -145,7 +144,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA events need GPU; run with: make cuda-test"]
     fn test_cuda_event_elapsed_time() {
         if !test_device().is_cuda() {
             return;
@@ -171,7 +169,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA events need GPU; run with: make cuda-test"]
     fn test_cuda_event_disable_timing_elapsed_fails() {
         if !test_device().is_cuda() {
             return;

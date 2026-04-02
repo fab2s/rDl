@@ -167,6 +167,10 @@ pub struct Graph {
     node_input_count: Vec<usize>,
     // Cached execution buffers (reused across forward calls, avoids re-allocation)
     exec_slots: RefCell<Vec<Vec<Option<Variable>>>>,
+    // Distributed Data Parallel state (set by distribute(), None for single-GPU)
+    distributed: RefCell<Option<crate::nn::ddp::DistributedState>>,
+    // Optimizer for step() (works for both single-GPU and distributed)
+    optimizer: RefCell<Option<Box<dyn crate::nn::Optimizer>>>,
 }
 
 impl Graph {
@@ -411,6 +415,8 @@ impl Graph {
             output_port_idx,
             node_input_count,
             exec_slots,
+            distributed: RefCell::new(None),
+            optimizer: RefCell::new(None),
         });
 
         if verbose {
@@ -990,7 +996,11 @@ impl Module for Graph {
     }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        self.forward_impl(std::slice::from_ref(input))
+        if self.distributed.borrow().is_some() {
+            self.forward_distributed(input)
+        } else {
+            self.forward_impl(std::slice::from_ref(input))
+        }
     }
 
     fn parameters(&self) -> Vec<Parameter> {
@@ -1026,6 +1036,318 @@ impl Module for Graph {
 
     fn move_to_device(&self, device: crate::tensor::Device) {
         self.set_device(device);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Distributed Data Parallel + optimizer integration
+// ---------------------------------------------------------------------------
+
+impl Graph {
+    /// Enable multi-GPU training. Detects usable CUDA devices, creates model
+    /// replicas via the factory closure, and broadcasts parameters from rank 0.
+    ///
+    /// If only one usable GPU is found, this is a no-op (single-GPU mode).
+    /// The factory receives a [`Device`] and must return a model with the same
+    /// architecture as `self` (same parameter count and shapes).
+    ///
+    /// After this call, [`forward`](Module::forward) automatically scatters
+    /// input across devices and gathers output. [`step`](Graph::step) handles
+    /// AllReduce + optimizer step + zero_grad.
+    ///
+    /// ```ignore
+    /// model.distribute(|dev| build_model(dev))?;
+    /// ```
+    pub fn distribute<F, M>(&self, factory: F) -> Result<()>
+    where
+        F: Fn(crate::tensor::Device) -> Result<M>,
+        M: crate::nn::Module + 'static,
+    {
+        use crate::nn::ddp::DistributedState;
+        use crate::nn::nccl::NcclComms;
+
+        let devices = crate::tensor::usable_cuda_devices();
+        if devices.len() < 2 {
+            // Single GPU or no GPU: no-op, step() still works with local optimizer
+            return Ok(());
+        }
+
+        // Create replicas for ranks 1..N
+        let mut replicas: Vec<Box<dyn crate::nn::Module>> = Vec::new();
+        for &dev in &devices[1..] {
+            let model = factory(dev)?;
+            replicas.push(Box::new(model));
+        }
+
+        // Init NCCL communicators
+        let comms = NcclComms::new(&devices)?;
+
+        // Match parameters across replicas
+        let rank0_params = self.parameters();
+        let n_params = rank0_params.len();
+        let mut param_groups = Vec::with_capacity(n_params);
+        for (pi, p) in rank0_params.iter().enumerate() {
+            let mut group = vec![p.variable.clone()];
+            for replica in &replicas {
+                let rp = replica.parameters();
+                if rp.len() != n_params {
+                    return Err(TensorError::new(&format!(
+                        "distribute: replica has {} parameters, expected {}",
+                        rp.len(),
+                        n_params
+                    )));
+                }
+                group.push(rp[pi].variable.clone());
+            }
+            param_groups.push(group);
+        }
+
+        // Match buffers
+        let rank0_buffers = self.buffers();
+        let n_buffers = rank0_buffers.len();
+        let mut buffer_groups = Vec::with_capacity(n_buffers);
+        for (bi, b) in rank0_buffers.iter().enumerate() {
+            let mut group = vec![b.clone()];
+            for replica in &replicas {
+                let rb = replica.buffers();
+                if rb.len() != n_buffers {
+                    return Err(TensorError::new(&format!(
+                        "distribute: replica has {} buffers, expected {}",
+                        rb.len(),
+                        n_buffers
+                    )));
+                }
+                group.push(rb[bi].clone());
+            }
+            buffer_groups.push(group);
+        }
+
+        let n = devices.len();
+        let equal_ratio = 1.0 / n as f64;
+
+        let state = DistributedState {
+            replicas,
+            comms,
+            devices,
+            optimizers: Vec::new(),
+            chunk_ratios: vec![equal_ratio; n],
+            param_groups,
+            buffer_groups,
+            last_timing: None,
+            last_shard_sizes: vec![0; n],
+            ema_throughput: vec![0.0; n],
+            step_count: 0,
+            calibration_steps: crate::nn::ddp::DEFAULT_CALIBRATION_STEPS,
+            rebalance_interval: crate::nn::ddp::DEFAULT_REBALANCE_INTERVAL,
+        };
+
+        // Broadcast params from rank 0 to all replicas
+        state.sync_params()?;
+
+        *self.distributed.borrow_mut() = Some(state);
+        Ok(())
+    }
+
+    /// Set the optimizer for training. When distributed, creates one optimizer
+    /// per replica. When single-GPU, creates a single optimizer.
+    ///
+    /// The factory receives the parameter list and returns an optimizer.
+    ///
+    /// ```ignore
+    /// model.set_optimizer(|p| Adam::new(&p, 0.001));
+    /// ```
+    pub fn set_optimizer<F, O>(&self, factory: F)
+    where
+        F: Fn(Vec<crate::nn::Parameter>) -> O,
+        O: crate::nn::Optimizer + 'static,
+    {
+        let mut dist = self.distributed.borrow_mut();
+        if let Some(ref mut state) = *dist {
+            // Distributed: one optimizer per replica
+            let mut optimizers: Vec<Box<dyn crate::nn::Optimizer>> = Vec::new();
+
+            // Rank 0 optimizer (uses self's parameters)
+            let rank0_opt = factory(self.parameters());
+            optimizers.push(Box::new(rank0_opt));
+
+            // Replicas
+            for replica in &state.replicas {
+                let opt = factory(replica.parameters());
+                optimizers.push(Box::new(opt));
+            }
+
+            state.optimizers = optimizers;
+        } else {
+            // Single GPU: one optimizer
+            let opt = factory(self.parameters());
+            *self.optimizer.borrow_mut() = Some(Box::new(opt));
+        }
+    }
+
+    /// Perform one training step.
+    ///
+    /// When distributed: AllReduce gradients (weighted if auto-balanced),
+    /// sync buffers, step all optimizers, zero grad, update auto-balancer.
+    /// When single-GPU: step optimizer, zero grad.
+    ///
+    /// This is the single call that replaces `opt.step(); opt.zero_grad();`
+    /// and makes multi-GPU training transparent.
+    pub fn step(&self) -> Result<()> {
+        let mut dist = self.distributed.borrow_mut();
+        if let Some(ref mut state) = *dist {
+            // Gradient sync: weighted AllReduce when shards are unequal
+            if state.is_balanced() {
+                state.all_reduce_gradients()?;
+            } else {
+                let batch_size: i64 = state.last_shard_sizes.iter().sum();
+                state.weighted_all_reduce_gradients(batch_size)?;
+            }
+            state.sync_buffers()?;
+
+            for opt in &mut state.optimizers {
+                opt.step()?;
+            }
+            for opt in &state.optimizers {
+                opt.zero_grad();
+            }
+
+            // Update throughput tracking and potentially rebalance
+            state.update_balance()?;
+        } else {
+            // Single GPU
+            let mut opt = self.optimizer.borrow_mut();
+            if let Some(ref mut optimizer) = *opt {
+                optimizer.step()?;
+                optimizer.zero_grad();
+            }
+        }
+        Ok(())
+    }
+
+    /// Number of devices in use (1 if not distributed).
+    pub fn world_size(&self) -> usize {
+        self.distributed
+            .borrow()
+            .as_ref()
+            .map_or(1, |d| d.world_size())
+    }
+
+    /// Whether this graph is running in distributed mode.
+    pub fn is_distributed(&self) -> bool {
+        self.distributed.borrow().is_some()
+    }
+
+    /// Current batch distribution ratios across devices.
+    ///
+    /// Returns a vector of fractions summing to 1.0. Empty if not distributed.
+    /// Changes over time as the auto-balancer adapts to measured throughput.
+    pub fn chunk_ratios(&self) -> Vec<f64> {
+        self.distributed
+            .borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |d| d.chunk_ratios.clone())
+    }
+
+    /// Per-device throughput (samples/ms) measured by the auto-balancer.
+    ///
+    /// Returns EMA-smoothed values. Empty if not distributed or no
+    /// measurements yet.
+    pub fn throughput(&self) -> Vec<f64> {
+        self.distributed
+            .borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |d| d.ema_throughput.clone())
+    }
+
+    /// Set learning rate on all optimizers (distributed and single-GPU).
+    pub fn set_lr(&self, lr: f64) {
+        let mut dist = self.distributed.borrow_mut();
+        if let Some(ref mut state) = *dist {
+            for opt in &mut state.optimizers {
+                opt.set_lr(lr);
+            }
+        } else {
+            let mut opt = self.optimizer.borrow_mut();
+            if let Some(ref mut optimizer) = *opt {
+                optimizer.set_lr(lr);
+            }
+        }
+    }
+
+    /// Distributed forward: scatter input, parallel forward on replicas, gather output.
+    /// Records CudaEvent timing per rank for auto-balancing.
+    fn forward_distributed(&self, input: &Variable) -> Result<Variable> {
+        use crate::nn::cuda_event::{CudaEvent, CudaEventFlags};
+        use crate::tensor::set_current_cuda_device;
+
+        // Read config without holding borrow during forward calls
+        let (n, devices, shard_sizes) = {
+            let dist = self.distributed.borrow();
+            let dist = dist.as_ref().unwrap();
+            let batch_size = input.shape()[0];
+            let n = dist.devices.len();
+            let shard_sizes = dist.compute_shard_sizes(batch_size);
+            let devices = dist.devices.clone();
+            (n, devices, shard_sizes)
+        }; // borrow dropped
+
+        let mut offset = 0i64;
+        let mut outputs: Vec<Variable> = Vec::with_capacity(n);
+        let mut timing: Vec<(CudaEvent, CudaEvent)> = Vec::with_capacity(n);
+
+        for (rank, &shard_size) in shard_sizes.iter().enumerate() {
+            if shard_size == 0 {
+                continue;
+            }
+
+            let shard = input.narrow(0, offset, shard_size)?;
+            offset += shard_size;
+
+            // Record start event on this device's default stream
+            let device_idx = match devices[rank] {
+                crate::tensor::Device::CUDA(i) => i,
+                _ => 0,
+            };
+            set_current_cuda_device(device_idx);
+            let start = CudaEvent::new(CudaEventFlags::Default)?;
+            start.record()?;
+
+            if rank == 0 {
+                let dev_shard = shard.to_device(devices[0])?;
+                let out = self.forward_impl(std::slice::from_ref(&dev_shard))?;
+                outputs.push(out);
+            } else {
+                let dev_shard = shard.to_device(devices[rank])?;
+                let out = {
+                    let dist = self.distributed.borrow();
+                    let dist = dist.as_ref().unwrap();
+                    dist.replicas[rank - 1].forward(&dev_shard)?
+                };
+                let out_rank0 = out.to_device(devices[0])?;
+                outputs.push(out_rank0);
+            }
+
+            // Record end event on same device's stream
+            set_current_cuda_device(device_idx);
+            let end = CudaEvent::new(CudaEventFlags::Default)?;
+            end.record()?;
+            timing.push((start, end));
+        }
+
+        // Store timing and shard sizes for step() to consume
+        {
+            let mut dist = self.distributed.borrow_mut();
+            let dist = dist.as_mut().unwrap();
+            dist.last_timing = Some(timing);
+            dist.last_shard_sizes = shard_sizes;
+        }
+
+        if outputs.len() == 1 {
+            return Ok(outputs.into_iter().next().unwrap());
+        }
+
+        let refs: Vec<&Variable> = outputs.iter().collect();
+        Variable::cat_many(&refs, 0)
     }
 }
 

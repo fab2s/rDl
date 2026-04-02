@@ -151,7 +151,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA streams need GPU; run with: make cuda-test"]
     fn test_cuda_stream_create_synchronize() {
         if !test_device().is_cuda() {
             return;
@@ -165,7 +164,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA streams need GPU; run with: make cuda-test"]
     fn test_stream_guard_restores_default() {
         if !test_device().is_cuda() {
             return;
@@ -188,7 +186,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA streams need GPU; run with: make cuda-test"]
     fn test_async_copy_on_stream() {
         if !test_device().is_cuda() {
             return;
@@ -225,7 +222,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA streams need GPU; run with: make cuda-test"]
     fn test_cross_stream_wait_event() {
         if !test_device().is_cuda() {
             return;

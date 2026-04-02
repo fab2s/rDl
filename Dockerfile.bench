@@ -1,9 +1,13 @@
-# flodl benchmark image — extends CUDA image with Python + PyTorch
+# flodl benchmark image -- extends CUDA image with Python + PyTorch
 # for side-by-side flodl vs PyTorch comparison.
+#
+# libtorch for Rust is mounted at runtime (not baked in).
+# Python torch is installed via pip (bundles its own libtorch internally).
 #
 # Usage: docker compose run --rm bench benchmarks/run.sh
 
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+ARG CUDA_VERSION=12.8.0
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -28,22 +32,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 
-# --- libtorch (CUDA 12.8) ---
-ARG LIBTORCH_VERSION=2.10.0
-RUN --mount=type=cache,target=/tmp/libtorch-cache \
-    ZIPFILE="libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu128.zip" && \
-    if [ ! -f "/tmp/libtorch-cache/${ZIPFILE}" ]; then \
-        wget -q "https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu128.zip" \
-            -O "/tmp/libtorch-cache/${ZIPFILE}"; \
-    fi && \
-    unzip -q "/tmp/libtorch-cache/${ZIPFILE}" -d /usr/local
-
+# libtorch for Rust is bind-mounted at runtime to /usr/local/libtorch
 ENV LIBTORCH_PATH="/usr/local/libtorch"
 ENV LD_LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"
 ENV LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"
 ENV CUDA_HOME="/usr/local/cuda"
 
-# --- PyTorch (matching libtorch version, CUDA 12.8) ---
+# --- PyTorch (for Python benchmarks, CUDA 12.8) ---
+ARG LIBTORCH_VERSION=2.10.0
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --break-system-packages \
     torch==${LIBTORCH_VERSION} --index-url https://download.pytorch.org/whl/cu128 && \

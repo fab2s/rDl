@@ -2,7 +2,7 @@ services:
   dev:
     build:
       context: .
-      dockerfile: Dockerfile.cpu
+      dockerfile: Dockerfile
     image: flodl-dev
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
@@ -10,6 +10,7 @@ services:
       - ./.cargo-cache:/usr/local/cargo/registry
       - ./.cargo-git:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
+      - ${LIBTORCH_CPU_PATH:-./libtorch/precompiled/cpu}:/usr/local/libtorch:ro
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -19,38 +20,15 @@ services:
       context: .
       dockerfile: Dockerfile.cuda
       args:
-        CUDA_VARIANT: ${CUDA_VARIANT:-cu128}
-    image: flodl-cuda
+        CUDA_VERSION: ${CUDA_VERSION:-12.8.0}
+    image: flodl-cuda:${CUDA_TAG:-12.8}
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - .:/workspace
       - ./.cargo-cache-cuda:/usr/local/cargo/registry
       - ./.cargo-git-cuda:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
-    working_dir: /workspace
-    stdin_open: true
-    tty: true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  cuda-source:
-    build:
-      context: .
-      dockerfile: Dockerfile.cuda.source
-      args:
-        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-6.1;12.0}
-    image: flodl-cuda
-    user: "${UID:-1000}:${GID:-1000}"
-    volumes:
-      - .:/workspace
-      - ./.cargo-cache-cuda:/usr/local/cargo/registry
-      - ./.cargo-git-cuda:/usr/local/cargo/git
-      - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
+      - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}:/usr/local/libtorch:ro
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -72,6 +50,7 @@ services:
       - .:/workspace
       - ./.cargo-cache-bench:/usr/local/cargo/registry
       - ./.cargo-git-bench:/usr/local/cargo/git
+      - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}:/usr/local/libtorch:ro
     working_dir: /workspace
     stdin_open: true
     tty: true

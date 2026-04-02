@@ -1,4 +1,7 @@
-# flodl CPU-only image — for CI and development without GPU.
+# flodl CPU image -- libtorch mounted at runtime.
+#
+# No libtorch is baked into this image. Mount the appropriate variant
+# from libtorch/ via docker-compose volumes.
 
 FROM ubuntu:24.04
 
@@ -23,16 +26,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 
-# --- libtorch (CPU-only, ~200MB) ---
-ARG LIBTORCH_VERSION=2.10.0
-RUN --mount=type=cache,target=/tmp/libtorch-cache \
-    ZIPFILE="libtorch-shared-with-deps-${LIBTORCH_VERSION}+cpu.zip" && \
-    if [ ! -f "/tmp/libtorch-cache/${ZIPFILE}" ]; then \
-        wget -q "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip" \
-            -O "/tmp/libtorch-cache/${ZIPFILE}"; \
-    fi && \
-    unzip -q "/tmp/libtorch-cache/${ZIPFILE}" -d /usr/local
-
+# libtorch is bind-mounted at runtime to /usr/local/libtorch
 ENV LIBTORCH_PATH="/usr/local/libtorch"
 ENV LD_LIBRARY_PATH="${LIBTORCH_PATH}/lib"
 ENV LIBRARY_PATH="${LIBTORCH_PATH}/lib"

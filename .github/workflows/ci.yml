@@ -129,10 +129,26 @@ jobs:
           rm -rf /tmp/.buildx-cache
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
+      - name: Cache libtorch download (CUDA)
+        id: cache-libtorch-cuda
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/libtorch-ci
+          key: libtorch-cu128-${{ env.LIBTORCH_VERSION }}
+
+      - name: Download libtorch (CUDA)
+        if: steps.cache-libtorch-cuda.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu128.zip"
+          unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu128.zip"
+          mv libtorch libtorch-ci
+          rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu128.zip"
+
       - name: Build with CUDA feature
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
             flodl-cuda-ci \
             cargo build --features cuda
@@ -141,6 +157,7 @@ jobs:
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
             flodl-cuda-ci \
             cargo clippy --features cuda -- -W clippy::all

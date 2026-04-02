@@ -23,7 +23,10 @@ use std::ptr;
 
 use flodl_sys::{self as ffi, FlodlTensor};
 
-use crate::tensor::{check_err, Device, Result, Tensor, TensorError};
+use crate::tensor::{
+    check_err, current_cuda_device, set_current_cuda_device,
+    Device, Result, Tensor, TensorError,
+};
 use super::cuda_stream::CudaStream;
 
 /// NCCL reduction operation.
@@ -58,6 +61,16 @@ pub struct NcclComms {
 unsafe impl Send for NcclComms {}
 
 impl NcclComms {
+    /// Create from a raw handle and device list. Used internally for testing.
+    ///
+    /// # Safety
+    /// Caller must ensure `handle` is a valid NCCL communicator handle
+    /// (or null for mock/test use). Drop on null handle is a no-op.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_raw(handle: *mut c_void, devices: Vec<Device>) -> Self {
+        NcclComms { handle, devices }
+    }
+
     /// Initialize NCCL communicators for the given CUDA devices.
     ///
     /// All devices must be distinct CUDA devices. Returns error on CPU
@@ -81,6 +94,9 @@ impl NcclComms {
         }
 
         let mut handle: *mut c_void = ptr::null_mut();
+        // NCCL init calls cudaSetDevice internally. Save/restore so we
+        // don't corrupt the caller's device context.
+        let saved = current_cuda_device();
         let err = unsafe {
             ffi::flodl_nccl_init(
                 devlist.len() as i32,
@@ -88,6 +104,7 @@ impl NcclComms {
                 &mut handle,
             )
         };
+        set_current_cuda_device(saved);
         check_err(err)?;
         Ok(NcclComms {
             handle,
@@ -103,14 +120,16 @@ impl NcclComms {
     pub fn all_reduce(&self, tensors: &[&Tensor], op: ReduceOp) -> Result<()> {
         self.validate_tensors(tensors, "all_reduce")?;
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let saved = current_cuda_device();
         let err = unsafe {
             ffi::flodl_nccl_all_reduce(
                 self.handle,
                 handles.as_mut_ptr(),
-                ptr::null_mut(), // default streams
+                ptr::null_mut(),
                 op as i32,
             )
         };
+        set_current_cuda_device(saved);
         check_err(err)
     }
 
@@ -132,6 +151,7 @@ impl NcclComms {
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let mut stream_ptrs: Vec<*mut c_void> = streams.iter().map(|s| s.as_ptr()).collect();
+        let saved = current_cuda_device();
         let err = unsafe {
             ffi::flodl_nccl_all_reduce(
                 self.handle,
@@ -140,6 +160,7 @@ impl NcclComms {
                 op as i32,
             )
         };
+        set_current_cuda_device(saved);
         check_err(err)
     }
 
@@ -155,14 +176,16 @@ impl NcclComms {
             )));
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let saved = current_cuda_device();
         let err = unsafe {
             ffi::flodl_nccl_broadcast(
                 self.handle,
                 handles.as_mut_ptr(),
-                ptr::null_mut(), // default streams
+                ptr::null_mut(),
                 root as i32,
             )
         };
+        set_current_cuda_device(saved);
         check_err(err)
     }
 
@@ -187,6 +210,7 @@ impl NcclComms {
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let mut stream_ptrs: Vec<*mut c_void> = streams.iter().map(|s| s.as_ptr()).collect();
+        let saved = current_cuda_device();
         let err = unsafe {
             ffi::flodl_nccl_broadcast(
                 self.handle,
@@ -195,6 +219,7 @@ impl NcclComms {
                 root as i32,
             )
         };
+        set_current_cuda_device(saved);
         check_err(err)
     }
 
@@ -232,6 +257,7 @@ impl Drop for NcclComms {
 mod tests {
     use super::*;
     use crate::tensor::{test_device, cuda_device_count, cuda_synchronize, TensorOptions, DType};
+    use crate::nn::ddp::NCCL_LOCK;
 
     fn require_multi_gpu() -> bool {
         if !test_device().is_cuda() || cuda_device_count() < 2 {
@@ -262,9 +288,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "NCCL needs 2+ GPUs; run with: make cuda-test-nccl"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: make cuda-test-all"]
     fn test_nccl_init_destroy() {
         if !require_multi_gpu() { return; }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
         assert_eq!(comms.size(), 2);
         assert_eq!(comms.devices(), &[Device::CUDA(0), Device::CUDA(1)]);
@@ -272,9 +299,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "NCCL needs 2+ GPUs; run with: make cuda-test-nccl"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: make cuda-test-all"]
     fn test_nccl_broadcast() {
         if !require_multi_gpu() { return; }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
 
         let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
@@ -298,9 +326,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "NCCL needs 2+ GPUs; run with: make cuda-test-nccl"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: make cuda-test-all"]
     fn test_nccl_all_reduce_sum() {
         if !require_multi_gpu() { return; }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
 
         let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
@@ -324,9 +353,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "NCCL needs 2+ GPUs; run with: make cuda-test-nccl"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: make cuda-test-all"]
     fn test_nccl_all_reduce_avg() {
         if !require_multi_gpu() { return; }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
 
         let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
@@ -350,9 +380,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "NCCL needs 2+ GPUs; run with: make cuda-test-nccl"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: make cuda-test-all"]
     fn test_nccl_all_reduce_on_streams() {
         if !require_multi_gpu() { return; }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
 
         let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };

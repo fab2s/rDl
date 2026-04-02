@@ -22,5 +22,5 @@ site/_site/
 site/.jekyll-cache/
 site/Gemfile.lock
 
-# Source-built libtorch cache
-libtorch-build/
+# libtorch variants (downloaded or built from source)
+libtorch/
