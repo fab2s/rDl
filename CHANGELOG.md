@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`DataSet` trait**: Per-item dataset (`get(index) -> Vec<Tensor>`). `Send + Sync` for background prefetch. Automatic batching via `DataSetAdapter` (pre-allocate + copy, O(1 sample) peak memory).
 - **`BatchDataSet` trait**: Per-batch dataset (`get_batch(indices) -> Vec<Tensor>`) for bulk-efficient sources (mmap, database). `Send + Sync`.
 - **`Sampler` trait**: Index ordering per epoch. Built-in: `RandomSampler` (deterministic per seed+epoch), `SequentialSampler`.
-- **`Batch`**: Wrapper with `Index<usize>` for clean destructuring (`let (images, labels) = (&b[0], &b[1])`). Owns its tensors.
+- **`Batch`**: Named tensor wrapper with `Index<usize>` and `Index<&str>` for clean destructuring (`let images = &b["image"]` or `&b[0]`). `.names()`, `.has()`, `.get_named()` for introspection. Owns its tensors.
 - **`DataLoader`**: Builder pattern with auto-detection of resident vs streaming mode.
   - **Resident mode**: Dataset fits in VRAM (75% headroom). Loaded once via `pin_memory()` + `to_device()`. Per-epoch: GPU-side `index_select` with shuffled permutation. Zero CPU-GPU transfer after warmup.
   - **Streaming mode**: Persistent worker thread with dedicated `CudaStream`. Per-epoch fresh batch channel (no deadlock on mid-epoch drop). Worker: `get_batch` -> `pin_memory` -> `StreamGuard` + `to_device_async` -> `CudaEvent`. Consumer: `event.synchronize()` (typically instant due to prefetch depth).
@@ -45,8 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `drop_last` defaults to `true` (BatchNorm safety: size-1 batches cause NaN variance).
   - `EpochIterator` implements `Iterator<Item = Result<Batch>>` + `ExactSizeIterator`.
 - **`TensorError::is_cuda_oom()`**: Detect CUDA out-of-memory errors for graceful fallback.
+- **`.names()`**: Builder method for named batch fields (`["image", "letter", "case", "origin"]`). Auto-generated positional names ("0", "1", ...) when unspecified. Validates name count against dataset tensor count.
 - DDP-aware: loader yields pinned CPU data, `forward_distributed` scatters to devices efficiently.
-- 37 tests covering both modes, multi-target datasets, drop-mid-epoch cleanup, reproducibility.
+
+#### Resident DDP
+- **DDP-aware DataLoader**: Third internal mode `DistributedLoader` with per-device backends. Each GPU independently selects resident (data fits in VRAM) or streaming (prefetch worker) based on its own VRAM. No lowest-common-denominator constraint.
+- **`DeviceBackend`**: Per-device data strategy. Resident: full dataset on GPU, index_select per batch. Streaming: dedicated PrefetchWorker with async H2D transfers.
+- **`Graph::set_data_loader(loader, "input")`**: Attach DataLoader to model. When distributed: upgrades to per-device backends. Auto-wires batch names to graph `.input()` ports. Remaining names treated as targets for loss.
+- **`Graph::epoch(epoch)`**: Returns `GraphEpochIterator` that produces per-rank shards and user-facing Batch. When distributed: each backend produces on-device data, shards stored for presharded forward. When single-GPU: delegates to DataLoader.
+- **`Graph::forward_batch(&batch)`**: Batch-aware forward. Extracts named inputs, handles DDP presharding transparently. Coexists with `Module::forward(&Variable)`.
+- **Presharded forward path**: `forward_distributed_presharded()` consumes per-rank shards from DataLoader via `.take_shards()`. Each replica forwards its local shard (zero cross-device input transfer). Outputs gathered to gather device. CudaEvent timing for auto-balancer.
+- **Gather device selection**: Prefers resident backend with most free VRAM. Falls back to CPU if all backends are streaming (targets fetched from dataset). No GPU 0 priority.
+- **Auto-balancing integration**: Epoch iterator reads chunk_ratios fresh per batch. Shard sizes adapt as ratios change every 50 steps. Mixed resident/streaming backends handle dynamic ratios correctly.
+- Training loop identical for 1 or N GPUs. `distribute()` + `set_data_loader()` are the only differences.
 
 #### Auto-Balancing
 - **Per-GPU throughput measurement**: CudaEvent-based timing around each replica's forward pass in `forward_distributed()`. Zero overhead (async GPU recording, no CPU sync).

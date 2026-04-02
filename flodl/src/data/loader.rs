@@ -88,6 +88,7 @@ pub struct DataLoaderBuilder {
     seed: u64,
     drop_last: bool,
     force_streaming: bool,
+    names: Option<Vec<String>>,
 }
 
 impl DataLoaderBuilder {
@@ -101,6 +102,7 @@ impl DataLoaderBuilder {
             seed: 42,
             drop_last: true,
             force_streaming: false,
+            names: None,
         }
     }
 
@@ -171,6 +173,28 @@ impl DataLoaderBuilder {
         self
     }
 
+    /// Name the tensor positions in each batch.
+    ///
+    /// Names enable `batch["image"]` access alongside positional `batch[0]`.
+    /// The number of names must match the number of tensors returned by the
+    /// dataset's `get()` / `get_batch()`.
+    ///
+    /// If not called, auto-generated positional names ("0", "1", ...) are used.
+    ///
+    /// ```ignore
+    /// let loader = DataLoader::from_dataset(data)
+    ///     .batch_size(64)
+    ///     .names(&["image", "letter", "case", "origin"])
+    ///     .build()?;
+    ///
+    /// let b = loader.epoch(0).next().unwrap()?;
+    /// let images = &b["image"];
+    /// ```
+    pub fn names(mut self, names: &[&str]) -> Self {
+        self.names = Some(names.iter().map(|s| s.to_string()).collect());
+        self
+    }
+
     /// Drop the last incomplete batch if dataset size is not divisible
     /// by batch_size. Default: `true`.
     ///
@@ -208,6 +232,7 @@ impl DataLoaderBuilder {
             seed,
             drop_last,
             force_streaming,
+            names,
         } = self;
 
         let n = dataset.len();
@@ -219,8 +244,22 @@ impl DataLoaderBuilder {
                 "DataLoader: dataset returned empty tensor list",
             ));
         }
+        let num_tensors = sample.len();
         let per_sample_bytes: usize = sample.iter().map(|t| t.nbytes()).sum();
         drop(sample);
+
+        // Resolve names: validate if provided, auto-generate if not
+        let names = match names {
+            Some(ref n) if n.len() != num_tensors => {
+                return Err(TensorError::new(&format!(
+                    "DataLoader: names count ({}) does not match dataset tensor count ({})",
+                    n.len(),
+                    num_tensors,
+                )));
+            }
+            Some(n) => n,
+            None => (0..num_tensors).map(|i| i.to_string()).collect(),
+        };
 
         let use_resident = !force_streaming && can_fit_resident(n, per_sample_bytes, device);
 
@@ -238,7 +277,7 @@ impl DataLoaderBuilder {
         });
 
         if use_resident {
-            match build_resident(Arc::clone(&dataset), batch_size, device, sampler, drop_last) {
+            match build_resident(Arc::clone(&dataset), batch_size, device, sampler, drop_last, names.clone()) {
                 Ok(loader) => Ok(loader),
                 Err(e) if device.is_cuda() && e.is_cuda_oom() => {
                     // VRAM estimate was wrong, fall back to streaming.
@@ -249,12 +288,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(n))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, names)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, names)
         }
     }
 }
@@ -265,6 +304,7 @@ fn build_resident(
     device: Device,
     sampler: Box<dyn Sampler>,
     drop_last: bool,
+    names: Vec<String>,
 ) -> Result<DataLoader> {
     let n = dataset.len();
     let all_indices: Vec<usize> = (0..n).collect();
@@ -290,10 +330,12 @@ fn build_resident(
     Ok(DataLoader {
         inner: LoaderInner::Resident(ResidentLoader {
             gpu_data,
+            _dataset: dataset,
             device,
             batch_size,
             sampler,
             drop_last,
+            names,
         }),
     })
 }
@@ -305,6 +347,7 @@ fn build_streaming(
     sampler: Box<dyn Sampler>,
     drop_last: bool,
     prefetch_depth: usize,
+    names: Vec<String>,
 ) -> Result<DataLoader> {
     let worker = PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth);
 
@@ -316,6 +359,7 @@ fn build_streaming(
             sampler,
             drop_last,
             worker,
+            names,
         }),
     })
 }
@@ -353,12 +397,21 @@ fn build_streaming(
 /// }
 /// ```
 pub struct DataLoader {
-    inner: LoaderInner,
+    pub(crate) inner: LoaderInner,
 }
 
-enum LoaderInner {
+pub(crate) enum LoaderInner {
     Resident(ResidentLoader),
     Streaming(StreamingLoader),
+    Distributed(DistributedLoader),
+}
+
+impl DataLoader {
+    /// Access the internal loader variant (for Graph integration).
+    #[allow(dead_code)]
+    pub(crate) fn inner(&self) -> &LoaderInner {
+        &self.inner
+    }
 }
 
 impl DataLoader {
@@ -384,10 +437,16 @@ impl DataLoader {
     ///
     /// The epoch number is passed to the sampler for deterministic
     /// reproducibility.
+    ///
+    /// For distributed loaders, use `Graph::epoch()` instead (which
+    /// provides chunk_ratios from the auto-balancer).
     pub fn epoch(&mut self, epoch: usize) -> EpochIterator<'_> {
         match &mut self.inner {
             LoaderInner::Resident(loader) => loader.epoch(epoch),
             LoaderInner::Streaming(loader) => loader.epoch(epoch),
+            LoaderInner::Distributed(_) => {
+                panic!("DataLoader: distributed mode requires Graph::epoch(), not direct epoch()")
+            }
         }
     }
 
@@ -396,6 +455,7 @@ impl DataLoader {
         match &self.inner {
             LoaderInner::Resident(l) => l.sampler.len(),
             LoaderInner::Streaming(l) => l.sampler.len(),
+            LoaderInner::Distributed(l) => l.sampler.borrow().len(),
         }
     }
 
@@ -409,6 +469,7 @@ impl DataLoader {
         let (n, bs, dl) = match &self.inner {
             LoaderInner::Resident(l) => (l.sampler.len(), l.batch_size, l.drop_last),
             LoaderInner::Streaming(l) => (l.sampler.len(), l.batch_size, l.drop_last),
+            LoaderInner::Distributed(l) => (l.sampler.borrow().len(), l.batch_size, l.drop_last),
         };
         if dl { n / bs } else { n.div_ceil(bs) }
     }
@@ -418,20 +479,122 @@ impl DataLoader {
         match &self.inner {
             LoaderInner::Resident(l) => l.batch_size,
             LoaderInner::Streaming(l) => l.batch_size,
+            LoaderInner::Distributed(l) => l.batch_size,
         }
     }
 
-    /// Target device.
+    /// Target device (for single-device loaders) or gather device (for distributed).
     pub fn device(&self) -> Device {
         match &self.inner {
             LoaderInner::Resident(l) => l.device,
             LoaderInner::Streaming(l) => l.device,
+            LoaderInner::Distributed(l) => l.gather_device,
         }
     }
 
-    /// Whether the loader is in resident mode (full dataset in memory).
+    /// Whether the loader is in resident mode (full dataset in memory on one device).
     pub fn is_resident(&self) -> bool {
         matches!(&self.inner, LoaderInner::Resident(_))
+    }
+
+    /// Tensor names for each batch position.
+    pub fn names(&self) -> &[String] {
+        match &self.inner {
+            LoaderInner::Resident(l) => &l.names,
+            LoaderInner::Streaming(l) => &l.names,
+            LoaderInner::Distributed(l) => &l.names,
+        }
+    }
+
+    /// Whether the loader is in distributed mode (multi-device backends).
+    pub fn is_distributed(&self) -> bool {
+        matches!(&self.inner, LoaderInner::Distributed(_))
+    }
+
+    /// Get the shared dataset Arc (for upgrade_distributed to load onto devices).
+    pub(crate) fn dataset_arc(&self) -> Result<Arc<dyn BatchDataSet>> {
+        match &self.inner {
+            LoaderInner::Resident(l) => Ok(Arc::clone(&l._dataset)),
+            LoaderInner::Streaming(l) => Ok(Arc::clone(&l._dataset)),
+            LoaderInner::Distributed(l) => Ok(Arc::clone(&l.dataset)),
+        }
+    }
+
+    /// Upgrade this loader to distributed mode with per-device backends.
+    ///
+    /// Called by `Graph::set_data_loader()`. Replaces the inner loader with
+    /// a `DistributedLoader` that has one backend per device (resident or
+    /// streaming, chosen per device based on VRAM).
+    pub(crate) fn upgrade_distributed(
+        &mut self,
+        devices: &[Device],
+        dataset: Arc<dyn BatchDataSet>,
+    ) -> Result<()> {
+        // Extract config from current inner
+        let (batch_size, sampler_len, drop_last, names, seed) = match &self.inner {
+            LoaderInner::Resident(l) => (l.batch_size, l.sampler.len(), l.drop_last, l.names.clone(), 42u64),
+            LoaderInner::Streaming(l) => (l.batch_size, l.sampler.len(), l.drop_last, l.names.clone(), 42u64),
+            LoaderInner::Distributed(_) => {
+                return Err(TensorError::new("DataLoader: already in distributed mode"));
+            }
+        };
+
+        let per_sample_bytes: usize = {
+            let sample = dataset.get_batch(&[0])?;
+            sample.iter().map(|t| t.nbytes()).sum()
+        };
+
+        let prefetch_depth = auto_prefetch_depth(per_sample_bytes, batch_size, devices[0]);
+        let (backends, gather_device, gather_resident_idx) =
+            build_distributed_backends(&dataset, devices, prefetch_depth)?;
+
+        let sampler: Box<dyn Sampler> = Box::new(
+            super::sampler::RandomSampler::new(sampler_len, seed),
+        );
+
+        self.inner = LoaderInner::Distributed(DistributedLoader {
+            backends,
+            dataset,
+            sampler: std::cell::RefCell::new(sampler),
+            batch_size,
+            drop_last,
+            names,
+            pending_shards: std::cell::Cell::new(None),
+            gather_device,
+            gather_resident_idx,
+            seed,
+        });
+
+        Ok(())
+    }
+
+    /// Consume and return pre-placed per-rank shards (for `forward_distributed_presharded`).
+    pub(crate) fn take_shards(&self) -> Option<Vec<Vec<Tensor>>> {
+        match &self.inner {
+            LoaderInner::Distributed(l) => l.take_shards(),
+            _ => None,
+        }
+    }
+
+    /// Whether per-rank shards are pending.
+    pub(crate) fn has_shards(&self) -> bool {
+        match &self.inner {
+            LoaderInner::Distributed(l) => l.has_shards(),
+            _ => false,
+        }
+    }
+
+    /// Start a distributed epoch. Returns a `DistributedEpochIterator`.
+    #[allow(dead_code)]
+    pub(crate) fn epoch_distributed<'a>(
+        &'a mut self,
+        epoch: usize,
+        chunk_ratios: &'a [f64],
+    ) -> Result<DistributedEpochIterator<'a>> {
+        match &self.inner {
+            LoaderInner::Distributed(l) => Ok(DistributedEpochIterator::new(l, epoch, chunk_ratios)),
+            _ => Err(TensorError::new("DataLoader: not in distributed mode")),
+        }
     }
 }
 
@@ -439,13 +602,16 @@ impl DataLoader {
 // ResidentLoader
 // ---------------------------------------------------------------------------
 
-struct ResidentLoader {
+pub(crate) struct ResidentLoader {
     /// Full dataset tensors on target device, one per position.
     gpu_data: Vec<Tensor>,
+    /// Original dataset (kept for upgrade_distributed).
+    _dataset: Arc<dyn BatchDataSet>,
     device: Device,
     batch_size: usize,
     sampler: Box<dyn Sampler>,
     drop_last: bool,
+    names: Vec<String>,
 }
 
 impl ResidentLoader {
@@ -481,6 +647,7 @@ impl ResidentLoader {
                 perm,
                 batch_ranges,
                 pos: 0,
+                names: &self.names,
             }),
         }
     }
@@ -490,7 +657,7 @@ impl ResidentLoader {
 // StreamingLoader
 // ---------------------------------------------------------------------------
 
-struct StreamingLoader {
+pub(crate) struct StreamingLoader {
     /// Dataset shared with the worker thread.
     _dataset: Arc<dyn BatchDataSet>,
     batch_size: usize,
@@ -498,6 +665,7 @@ struct StreamingLoader {
     sampler: Box<dyn Sampler>,
     drop_last: bool,
     worker: PrefetchWorker,
+    names: Vec<String>,
 }
 
 impl StreamingLoader {
@@ -522,6 +690,7 @@ impl StreamingLoader {
             inner: EpochIteratorInner::Streaming(StreamingEpochIter {
                 batch_rx,
                 remaining: num_batches,
+                names: &self.names,
             }),
         }
     }
@@ -544,7 +713,7 @@ pub struct EpochIterator<'a> {
 
 enum EpochIteratorInner<'a> {
     Resident(ResidentEpochIter<'a>),
-    Streaming(StreamingEpochIter),
+    Streaming(StreamingEpochIter<'a>),
 }
 
 struct ResidentEpochIter<'a> {
@@ -553,11 +722,13 @@ struct ResidentEpochIter<'a> {
     /// (start_in_perm, batch_len)
     batch_ranges: Vec<(usize, usize)>,
     pos: usize,
+    names: &'a [String],
 }
 
-struct StreamingEpochIter {
+struct StreamingEpochIter<'a> {
     batch_rx: std::sync::mpsc::Receiver<Result<super::prefetch::PrefetchedBatch>>,
     remaining: usize,
+    names: &'a [String],
 }
 
 impl<'a> Iterator for EpochIterator<'a> {
@@ -608,11 +779,11 @@ impl<'a> ResidentEpochIter<'a> {
             }
         }
 
-        Some(Ok(Batch::new(tensors)))
+        Some(Ok(Batch::new(tensors, self.names.to_vec())))
     }
 }
 
-impl StreamingEpochIter {
+impl StreamingEpochIter<'_> {
     fn next(&mut self) -> Option<Result<Batch>> {
         if self.remaining == 0 {
             return None;
@@ -630,7 +801,7 @@ impl StreamingEpochIter {
                         return Some(Err(e));
                     }
                 }
-                Some(Ok(Batch::new(batch.tensors)))
+                Some(Ok(Batch::new(batch.tensors, self.names.to_vec())))
             }
             Ok(Err(e)) => Some(Err(e)),
             Err(_) => {
@@ -642,6 +813,394 @@ impl StreamingEpochIter {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DistributedLoader (DDP-aware, per-device backends)
+// ---------------------------------------------------------------------------
+
+/// Per-device data backend: resident (full dataset in VRAM) or streaming
+/// (prefetch worker with async H2D transfers).
+///
+/// Each device independently chooses its mode based on available VRAM.
+pub(crate) enum DeviceBackend {
+    Resident {
+        gpu_data: Vec<Tensor>,
+        device: Device,
+    },
+    Streaming {
+        worker: PrefetchWorker,
+        device: Device,
+    },
+}
+
+impl DeviceBackend {
+    fn device(&self) -> Device {
+        match self {
+            DeviceBackend::Resident { device, .. } => *device,
+            DeviceBackend::Streaming { device, .. } => *device,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn is_resident(&self) -> bool {
+        matches!(self, DeviceBackend::Resident { .. })
+    }
+}
+
+/// Distributed data loader with per-device backends.
+///
+/// Created by [`DataLoader::upgrade_distributed`] when `Graph::set_data_loader()`
+/// detects a multi-GPU topology. Each device gets its own backend (resident
+/// if the dataset fits in its VRAM, streaming otherwise).
+pub(crate) struct DistributedLoader {
+    /// One backend per device, indexed by rank.
+    pub backends: Vec<DeviceBackend>,
+    /// Shared dataset (used by streaming backends and for gather fallback).
+    pub dataset: Arc<dyn BatchDataSet>,
+    /// Epoch shuffling (RefCell for interior mutability via shared references).
+    pub sampler: std::cell::RefCell<Box<dyn Sampler>>,
+    pub batch_size: usize,
+    pub drop_last: bool,
+    pub names: Vec<String>,
+    /// Pre-computed per-rank shards from last epoch iterator advance.
+    /// `pending_shards[rank]` = `Vec<Tensor>` (all tensor positions) on `devices[rank]`.
+    /// Set by `DistributedEpochIterator::next()`, consumed by `Graph::forward_distributed_presharded()`.
+    pub pending_shards: std::cell::Cell<Option<Vec<Vec<Tensor>>>>,
+    /// Device for the user-facing batch (loss computation).
+    pub gather_device: Device,
+    /// If gather_device is a resident backend, its index. None if gather is CPU.
+    pub gather_resident_idx: Option<usize>,
+    #[allow(dead_code)]
+    pub seed: u64,
+}
+
+impl DistributedLoader {
+    /// Consume and return the pre-placed per-rank shards.
+    /// Returns None if no shards are pending (forward called without epoch advance).
+    pub fn take_shards(&self) -> Option<Vec<Vec<Tensor>>> {
+        self.pending_shards.take()
+    }
+
+    /// Whether shards are pending from the last epoch iterator advance.
+    pub fn has_shards(&self) -> bool {
+        // Cell<Option<T>> doesn't have a peek, but we can check via take+put
+        let val = self.pending_shards.take();
+        let has = val.is_some();
+        self.pending_shards.set(val);
+        has
+    }
+}
+
+/// Build per-device backends for a distributed loader.
+///
+/// For each device: probe VRAM, attempt resident loading, fallback to streaming
+/// on OOM. Returns the backends and gather device info.
+fn build_distributed_backends(
+    dataset: &Arc<dyn BatchDataSet>,
+    devices: &[Device],
+    prefetch_depth: usize,
+) -> Result<(Vec<DeviceBackend>, Device, Option<usize>)> {
+    let n = dataset.len();
+    let all_indices: Vec<usize> = (0..n).collect();
+
+    // Load full dataset to CPU once (shared across all device loads)
+    let cpu_tensors = dataset.get_batch(&all_indices)?;
+    if cpu_tensors.is_empty() {
+        return Err(TensorError::new(
+            "DataLoader: dataset returned empty tensor list",
+        ));
+    }
+
+    let per_sample_bytes: usize = cpu_tensors.iter().map(|t| t.nbytes()).sum();
+    let mut backends = Vec::with_capacity(devices.len());
+
+    for &dev in devices {
+        if can_fit_resident(n, per_sample_bytes, dev) {
+            // Try resident: pin + transfer
+            match load_resident_tensors(&cpu_tensors, dev) {
+                Ok(gpu_data) => {
+                    backends.push(DeviceBackend::Resident { gpu_data, device: dev });
+                    continue;
+                }
+                Err(e) if dev.is_cuda() && e.is_cuda_oom() => {
+                    // VRAM estimate wrong, fall back to streaming
+                    crate::tensor::cuda_empty_cache();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Streaming fallback
+        let worker = PrefetchWorker::new(Arc::clone(dataset), dev, prefetch_depth);
+        backends.push(DeviceBackend::Streaming { worker, device: dev });
+    }
+
+    // Select gather device: prefer resident backend with most free VRAM
+    let (gather_device, gather_idx) = select_gather_device(&backends);
+
+    Ok((backends, gather_device, gather_idx))
+}
+
+/// Transfer CPU tensors to a device via pin_memory.
+fn load_resident_tensors(cpu_tensors: &[Tensor], device: Device) -> Result<Vec<Tensor>> {
+    let mut gpu_data = Vec::with_capacity(cpu_tensors.len());
+    for t in cpu_tensors {
+        let pinned = t.pin_memory()?;
+        gpu_data.push(pinned.to_device(device)?);
+    }
+    Ok(gpu_data)
+}
+
+/// Pick the gather device: resident backend with most free VRAM, or CPU.
+fn select_gather_device(backends: &[DeviceBackend]) -> (Device, Option<usize>) {
+    let mut best_idx: Option<usize> = None;
+    let mut best_free: u64 = 0;
+
+    for (i, backend) in backends.iter().enumerate() {
+        if let DeviceBackend::Resident { device: Device::CUDA(idx), .. } = backend {
+            let free = crate::tensor::cuda_memory_info_idx(*idx as i32)
+                .map(|(f, _)| f)
+                .unwrap_or(0);
+            if free > best_free {
+                best_free = free;
+                best_idx = Some(i);
+            }
+        }
+    }
+
+    match best_idx {
+        Some(idx) => (backends[idx].device(), Some(idx)),
+        None => (Device::CPU, None),
+    }
+}
+
+/// Epoch iterator for distributed training.
+///
+/// Yields `Result<Batch>` containing target tensors on the gather device.
+/// Simultaneously stores per-rank input shards in the `DistributedLoader`
+/// for `forward_distributed_presharded()` to consume.
+pub struct DistributedEpochIterator<'a> {
+    loader: &'a DistributedLoader,
+    /// Global permutation for this epoch.
+    permutation: Vec<usize>,
+    /// Current position in the permutation (sample index, not batch index).
+    cursor: usize,
+    /// Number of batches remaining.
+    remaining: usize,
+    /// Per-rank chunk ratios (read from Graph's DistributedState each batch).
+    chunk_ratios: &'a [f64],
+    /// Streaming batch receivers, one per streaming backend (indexed by rank).
+    /// None for resident backends.
+    streaming_rx: Vec<Option<std::sync::mpsc::Receiver<Result<super::prefetch::PrefetchedBatch>>>>,
+}
+
+impl<'a> DistributedEpochIterator<'a> {
+    pub(crate) fn new(
+        loader: &'a DistributedLoader,
+        epoch: usize,
+        chunk_ratios: &'a [f64],
+    ) -> Self {
+        let permutation = loader.sampler.borrow_mut().indices(epoch);
+        let n = permutation.len();
+        let bs = loader.batch_size;
+        let num_batches = if loader.drop_last { n / bs } else { n.div_ceil(bs) };
+
+        // Set up streaming receivers for streaming backends
+        let streaming_rx: Vec<Option<std::sync::mpsc::Receiver<Result<super::prefetch::PrefetchedBatch>>>> =
+            loader.backends.iter().map(|_| None).collect();
+
+        DistributedEpochIterator {
+            loader,
+            permutation,
+            cursor: 0,
+            remaining: num_batches,
+            chunk_ratios,
+            streaming_rx,
+        }
+    }
+}
+
+impl Iterator for DistributedEpochIterator<'_> {
+    type Item = Result<Batch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+
+        let bs = self.loader.batch_size;
+        let n = self.permutation.len();
+        let end = (self.cursor + bs).min(n);
+        if self.loader.drop_last && (end - self.cursor) < bs {
+            self.remaining = 0;
+            return None;
+        }
+
+        // Global batch indices from the permutation
+        let batch_indices: Vec<usize> = self.permutation[self.cursor..end].to_vec();
+        let batch_len = batch_indices.len() as i64;
+        self.cursor = end;
+
+        // Compute per-rank shard sizes
+        let shard_sizes = compute_shard_sizes_from_ratios(batch_len, self.chunk_ratios);
+
+        // Split batch indices into per-rank slices
+        let mut per_rank_shards: Vec<Vec<Tensor>> = Vec::with_capacity(self.loader.backends.len());
+        let mut offset = 0usize;
+
+        for (rank, backend) in self.loader.backends.iter().enumerate() {
+            let shard_len = shard_sizes[rank] as usize;
+            let shard_indices = &batch_indices[offset..offset + shard_len];
+            offset += shard_len;
+
+            match backend {
+                DeviceBackend::Resident { gpu_data, device } => {
+                    // Build index tensor on device, index_select each position
+                    let idx_i64: Vec<i64> = shard_indices.iter().map(|&i| i as i64).collect();
+                    let idx_tensor = match Tensor::from_i64(
+                        &idx_i64,
+                        &[idx_i64.len() as i64],
+                        *device,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(e)),
+                    };
+
+                    let mut shard_tensors = Vec::with_capacity(gpu_data.len());
+                    for t in gpu_data {
+                        match t.index_select(0, &idx_tensor) {
+                            Ok(selected) => shard_tensors.push(selected),
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    per_rank_shards.push(shard_tensors);
+                }
+                DeviceBackend::Streaming { worker, device: _ } => {
+                    // Send shard indices to the worker, receive on-device batch
+                    // Set up the channel if this is the first batch
+                    if self.streaming_rx[rank].is_none() {
+                        let rx = worker.start_epoch(
+                            shard_indices.to_vec(),
+                            shard_len,
+                            false, // don't drop_last per-shard
+                        );
+                        self.streaming_rx[rank] = Some(rx);
+                    } else {
+                        // For subsequent batches, we need per-batch loading.
+                        // For now, use a fresh start_epoch per batch (simple but correct).
+                        // Step 4 will add LoadBatch for efficient per-batch streaming.
+                        let rx = worker.start_epoch(
+                            shard_indices.to_vec(),
+                            shard_len,
+                            false,
+                        );
+                        self.streaming_rx[rank] = Some(rx);
+                    }
+
+                    // Receive the batch
+                    let rx = self.streaming_rx[rank].as_ref().unwrap();
+                    match rx.recv() {
+                        Ok(Ok(batch)) => {
+                            #[cfg(feature = "cuda")]
+                            if let Some(ref event) = batch.ready_event {
+                                if let Err(e) = event.synchronize() {
+                                    return Some(Err(e));
+                                }
+                            }
+                            per_rank_shards.push(batch.tensors);
+                        }
+                        Ok(Err(e)) => return Some(Err(e)),
+                        Err(_) => {
+                            return Some(Err(TensorError::new(
+                                "DataLoader: streaming worker stopped unexpectedly",
+                            )));
+                        }
+                    }
+                    // Clear for next batch
+                    self.streaming_rx[rank] = None;
+                }
+            }
+        }
+
+        // Build user-facing Batch with targets on the gather device.
+        // Targets are all tensor positions (for now). In Step 5/6,
+        // forward(&Batch) will filter to target-only fields.
+        let user_batch = match self.build_gather_batch(&batch_indices, &per_rank_shards) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Store per-rank shards for forward_distributed_presharded()
+        self.loader.pending_shards.set(Some(per_rank_shards));
+
+        Some(Ok(user_batch))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for DistributedEpochIterator<'_> {}
+
+impl DistributedEpochIterator<'_> {
+    /// Build the user-facing Batch on the gather device.
+    fn build_gather_batch(
+        &self,
+        batch_indices: &[usize],
+        _per_rank_shards: &[Vec<Tensor>],
+    ) -> Result<Batch> {
+        let names = self.loader.names.clone();
+
+        match self.loader.gather_resident_idx {
+            Some(gather_rank) => {
+                // Gather from a resident backend: index_select all positions
+                if let DeviceBackend::Resident { gpu_data, device } = &self.loader.backends[gather_rank] {
+                    let idx_i64: Vec<i64> = batch_indices.iter().map(|&i| i as i64).collect();
+                    let idx_tensor = Tensor::from_i64(
+                        &idx_i64,
+                        &[idx_i64.len() as i64],
+                        *device,
+                    )?;
+
+                    let mut tensors = Vec::with_capacity(gpu_data.len());
+                    for t in gpu_data {
+                        tensors.push(t.index_select(0, &idx_tensor)?);
+                    }
+                    Ok(Batch::new(tensors, names))
+                } else {
+                    unreachable!("gather_resident_idx points to non-resident backend")
+                }
+            }
+            None => {
+                // All streaming: fetch targets from CPU dataset
+                let tensors = self.loader.dataset.get_batch(batch_indices)?;
+                Ok(Batch::new(tensors, names))
+            }
+        }
+    }
+}
+
+/// Compute per-rank shard sizes from chunk ratios.
+/// Same logic as DistributedState::compute_shard_sizes but standalone.
+fn compute_shard_sizes_from_ratios(batch_size: i64, ratios: &[f64]) -> Vec<i64> {
+    let n = ratios.len();
+    let mut sizes = Vec::with_capacity(n);
+    let mut remaining = batch_size;
+
+    for (i, &ratio) in ratios.iter().enumerate().take(n) {
+        if i == n - 1 {
+            sizes.push(remaining);
+        } else {
+            let s = (batch_size as f64 * ratio).round() as i64;
+            let s = s.max(1).min(remaining - (n - i - 1) as i64);
+            sizes.push(s);
+            remaining -= s;
+        }
+    }
+
+    sizes
 }
 
 // ---------------------------------------------------------------------------
@@ -712,8 +1271,9 @@ mod tests {
         }
     }
 
-    fn make_device_data(n: usize) -> SimpleData {
-        let opts = test_opts();
+    fn make_cpu_data_for_device(n: usize) -> SimpleData {
+        // DataSet contract: return CPU tensors. DataLoader handles device transfer.
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
         SimpleData {
             x: Tensor::randn(&[n as i64, 4], opts).unwrap(),
             y: Tensor::randn(&[n as i64, 2], opts).unwrap(),
@@ -957,7 +1517,7 @@ mod tests {
 
     #[test]
     fn test_device_aware_loading() {
-        let data = make_device_data(20);
+        let data = make_cpu_data_for_device(20);
         let dev = test_device();
         let mut loader = DataLoader::from_dataset(data)
             .batch_size(5)
@@ -1184,5 +1744,203 @@ mod tests {
         // Should be able to start a new epoch without issues
         let batches: Vec<Batch> = loader.epoch(1).map(|b| b.unwrap()).collect();
         assert_eq!(batches.len(), 10);
+    }
+
+    // -- Named Batch tests ---------------------------------------------------
+
+    #[test]
+    fn test_named_batch_via_loader() {
+        let data = make_data(20);
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(5)
+            .names(&["input", "target"])
+            .build()
+            .unwrap();
+
+        let b = loader.epoch(0).next().unwrap().unwrap();
+        assert_eq!(b.names(), &["input", "target"]);
+        assert_eq!(b["input"].shape(), &[5, 4]);
+        assert_eq!(b["target"].shape(), &[5, 2]);
+        assert!(b.has("input"));
+        assert!(b.has("target"));
+        assert!(!b.has("missing"));
+    }
+
+    #[test]
+    fn test_named_batch_streaming() {
+        let data = make_data(20);
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(5)
+            .names(&["x", "y"])
+            .streaming()
+            .build()
+            .unwrap();
+
+        let b = loader.epoch(0).next().unwrap().unwrap();
+        assert_eq!(b.names(), &["x", "y"]);
+        assert_eq!(b["x"].shape(), &[5, 4]);
+        assert_eq!(b["y"].shape(), &[5, 2]);
+    }
+
+    #[test]
+    fn test_names_count_mismatch_errors() {
+        let data = make_data(10);
+        let result = DataLoader::from_dataset(data)
+            .batch_size(5)
+            .names(&["only_one"])
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auto_names_when_unspecified() {
+        let data = make_data(10);
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(5)
+            .build()
+            .unwrap();
+
+        assert_eq!(loader.names(), &["0", "1"]);
+        let b = loader.epoch(0).next().unwrap().unwrap();
+        assert_eq!(b["0"].shape(), &[5, 4]);
+        assert_eq!(b["1"].shape(), &[5, 2]);
+    }
+
+    // -- Graph + DataLoader integration tests --------------------------------
+
+    #[test]
+    fn test_graph_set_data_loader_single_gpu() {
+        use crate::graph::FlowBuilder;
+        use crate::nn::{Adam, Linear, Module, ReLU, mse_loss};
+
+        let model = FlowBuilder::from(Linear::new(4, 8).unwrap())
+            .through(ReLU::new())
+            .through(Linear::new(8, 2).unwrap())
+            .build()
+            .unwrap();
+
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        struct TrainData { x: Tensor, y: Tensor }
+        impl super::DataSet for TrainData {
+            fn len(&self) -> usize { self.x.shape()[0] as usize }
+            fn get(&self, i: usize) -> Result<Vec<Tensor>> {
+                Ok(vec![
+                    self.x.select(0, i as i64)?,
+                    self.y.select(0, i as i64)?,
+                ])
+            }
+        }
+
+        let data = TrainData {
+            x: Tensor::randn(&[20, 4], opts).unwrap(),
+            y: Tensor::randn(&[20, 2], opts).unwrap(),
+        };
+
+        let loader = DataLoader::from_dataset(data)
+            .batch_size(5)
+            .names(&["input", "target"])
+            .build()
+            .unwrap();
+
+        model.set_data_loader(loader, "input").unwrap();
+        model.set_optimizer(|p| Adam::new(&p, 0.01));
+        model.set_training(true);
+
+        // Snapshot params before training
+        let params_before: Vec<f32> = model
+            .parameters()
+            .iter()
+            .flat_map(|p| p.variable.data().to_f32_vec().unwrap())
+            .collect();
+
+        // One epoch of training
+        let iter = model.epoch(0);
+        let mut active = iter.activate();
+        let mut batch_count = 0;
+        while let Some(batch_result) = active.next() {
+            let b = batch_result.unwrap();
+            assert!(b.has("input"));
+            assert!(b.has("target"));
+            let out = model.forward_batch(&b).unwrap();
+            let target = crate::autograd::Variable::new(b["target"].clone(), false);
+            let loss = mse_loss(&out, &target).unwrap();
+            loss.backward().unwrap();
+            model.step().unwrap();
+            batch_count += 1;
+        }
+
+        assert_eq!(batch_count, 4); // 20 / 5 = 4
+
+        // Params should have changed
+        let params_after: Vec<f32> = model
+            .parameters()
+            .iter()
+            .flat_map(|p| p.variable.data().to_f32_vec().unwrap())
+            .collect();
+
+        let changed = params_before
+            .iter()
+            .zip(&params_after)
+            .any(|(a, b)| (a - b).abs() > 1e-8);
+        assert!(changed, "parameters should change after training");
+    }
+
+    #[test]
+    fn test_graph_data_num_batches() {
+        use crate::graph::FlowBuilder;
+        use crate::nn::Linear;
+
+        let model = FlowBuilder::from(Linear::new(4, 2).unwrap())
+            .build()
+            .unwrap();
+
+        let data = make_data(20);
+        let loader = DataLoader::from_dataset(data)
+            .batch_size(5)
+            .names(&["x", "y"])
+            .build()
+            .unwrap();
+
+        model.set_data_loader(loader, "x").unwrap();
+        assert_eq!(model.data_num_batches(), 4);
+        assert_eq!(model.data_batch_size(), 5);
+    }
+
+    #[test]
+    fn test_set_data_loader_invalid_input_name() {
+        use crate::graph::FlowBuilder;
+        use crate::nn::Linear;
+
+        let model = FlowBuilder::from(Linear::new(4, 2).unwrap())
+            .build()
+            .unwrap();
+
+        let data = make_data(10);
+        let loader = DataLoader::from_dataset(data)
+            .batch_size(5)
+            .names(&["x", "y"])
+            .build()
+            .unwrap();
+
+        let result = model.set_data_loader(loader, "missing");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scatter_fallback_without_data_loader() {
+        // Module::forward(&Variable) still works without set_data_loader
+        use crate::graph::FlowBuilder;
+        use crate::nn::{Linear, Module};
+
+        let model = FlowBuilder::from(Linear::new(4, 2).unwrap())
+            .build()
+            .unwrap();
+
+        let x = crate::autograd::Variable::new(
+            Tensor::randn(&[3, 4], Default::default()).unwrap(),
+            false,
+        );
+        let out = model.forward(&x).unwrap();
+        assert_eq!(out.shape(), &[3, 2]);
     }
 }

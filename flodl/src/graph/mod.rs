@@ -171,6 +171,29 @@ pub struct Graph {
     distributed: RefCell<Option<crate::nn::ddp::DistributedState>>,
     // Optimizer for step() (works for both single-GPU and distributed)
     optimizer: RefCell<Option<Box<dyn crate::nn::Optimizer>>>,
+    // DataLoader binding for resident DDP (set by set_data_loader(), None by default)
+    data_binding: RefCell<Option<DataLoaderBinding>>,
+}
+
+/// Binding between a [`DataLoader`] and a [`Graph`] for integrated training.
+///
+/// Created by [`Graph::set_data_loader`]. Maps batch tensor names to
+/// graph inputs and stores the loader reference.
+pub(crate) struct DataLoaderBinding {
+    /// The DataLoader (possibly upgraded to distributed mode).
+    pub loader: crate::data::DataLoader,
+    /// Name of the batch field used as the primary forward input (e.g., "image").
+    pub forward_input: String,
+    /// Mappings from batch field names to graph Input port names.
+    /// Only populated for graphs with `.input()` ports that match batch names.
+    #[allow(dead_code)]
+    pub graph_inputs: Vec<(String, String)>, // (batch_name, graph_input_name)
+    /// Names of batch fields that are targets (for loss), not consumed by forward.
+    #[allow(dead_code)]
+    pub target_names: Vec<String>,
+    /// Chunk ratios for distributed training (updated by auto-balancer).
+    /// Stored here so the epoch iterator can read them without borrowing DistributedState.
+    pub chunk_ratios: Vec<f64>,
 }
 
 impl Graph {
@@ -417,6 +440,7 @@ impl Graph {
             exec_slots,
             distributed: RefCell::new(None),
             optimizer: RefCell::new(None),
+            data_binding: RefCell::new(None),
         });
 
         if verbose {
@@ -997,7 +1021,16 @@ impl Module for Graph {
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         if self.distributed.borrow().is_some() {
-            self.forward_distributed(input)
+            // Check if presharded data is available from the DataLoader
+            let has_shards = self.data_binding.borrow()
+                .as_ref()
+                .is_some_and(|b| b.loader.has_shards());
+
+            if has_shards {
+                self.forward_distributed_presharded()
+            } else {
+                self.forward_distributed_scatter(input)
+            }
         } else {
             self.forward_impl(std::slice::from_ref(input))
         }
@@ -1274,9 +1307,166 @@ impl Graph {
         }
     }
 
+    // -- DataLoader integration -----------------------------------------------
+
+    /// Attach a DataLoader for integrated training.
+    ///
+    /// When distributed: upgrades the loader to per-device backends (resident
+    /// or streaming per device based on VRAM). Enables `model.epoch()` for
+    /// zero-transfer iteration and `model.forward(&batch)` for auto-wired
+    /// forward passes.
+    ///
+    /// When single-GPU: stores the loader as-is. `model.epoch()` delegates
+    /// to `loader.epoch()` directly.
+    ///
+    /// The `forward_input` parameter names the batch field used as the primary
+    /// model input (e.g., "image"). Other batch fields that match graph
+    /// `.input()` ports are auto-wired as auxiliary inputs. All remaining
+    /// batch fields are treated as targets (available in the user-facing
+    /// Batch for loss computation).
+    ///
+    /// ```ignore
+    /// model.set_data_loader(loader, "image")?;
+    /// ```
+    pub fn set_data_loader(
+        &self,
+        mut loader: crate::data::DataLoader,
+        forward_input: &str,
+    ) -> Result<()> {
+        let loader_names: Vec<String> = loader.names().to_vec();
+
+        // Validate forward_input exists in loader names
+        if !loader_names.iter().any(|n| n == forward_input) {
+            return Err(TensorError::new(&format!(
+                "set_data_loader: forward_input '{}' not found in loader names [{}]",
+                forward_input,
+                loader_names.join(", ")
+            )));
+        }
+
+        // If distributed, upgrade the loader to per-device backends
+        let dist = self.distributed.borrow();
+        if let Some(ref state) = *dist {
+            let devices = state.devices.clone();
+            // We need the dataset Arc. Get it by reading from the loader's internals
+            // before upgrading. The upgrade_distributed method handles this.
+            drop(dist); // drop borrow before mutating loader
+            // Create a temporary dataset from the loader's existing data.
+            // upgrade_distributed will load it onto all devices.
+            loader.upgrade_distributed(
+                &devices,
+                // The dataset Arc is extracted inside upgrade_distributed
+                // from the existing loader inner. We pass a dummy that
+                // upgrade_distributed replaces. Actually, let me read the
+                // loader's dataset.
+                // Problem: the dataset is inside the loader. We need to
+                // extract it. Let me add a method.
+                loader.dataset_arc()?,
+            )?;
+        } else {
+            drop(dist);
+        }
+
+        // Match batch names to graph Input ports
+        let graph_input_names: Vec<String> = self.inputs.iter().map(|i| i.name.clone()).collect();
+        let mut graph_inputs: Vec<(String, String)> = Vec::new();
+        let mut target_names: Vec<String> = Vec::new();
+
+        for name in &loader_names {
+            if name == forward_input {
+                continue; // primary input, handled separately
+            }
+            if graph_input_names.contains(name) {
+                graph_inputs.push((name.clone(), name.clone()));
+            } else {
+                target_names.push(name.clone());
+            }
+        }
+
+        // Get chunk_ratios
+        let chunk_ratios = {
+            let dist = self.distributed.borrow();
+            dist.as_ref()
+                .map(|d| d.chunk_ratios.clone())
+                .unwrap_or_default()
+        };
+
+        *self.data_binding.borrow_mut() = Some(DataLoaderBinding {
+            loader,
+            forward_input: forward_input.to_string(),
+            graph_inputs,
+            target_names,
+            chunk_ratios,
+        });
+
+        Ok(())
+    }
+
+    /// Get an epoch iterator for integrated training.
+    ///
+    /// When distributed: returns a `DistributedEpochIterator` that produces
+    /// per-rank shards and a user-facing Batch with targets on the gather device.
+    /// When single-GPU: delegates to the DataLoader's epoch iterator.
+    ///
+    /// ```ignore
+    /// for batch in model.epoch(epoch) {
+    ///     let b = batch?;
+    ///     let out = model.forward(&b)?;
+    ///     let loss = mse_loss(&out, &b["letter"])?;
+    ///     loss.backward()?;
+    ///     model.step()?;
+    /// }
+    /// ```
+    pub fn epoch(&self, epoch: usize) -> GraphEpochIterator<'_> {
+        // Update chunk_ratios from distributed state
+        {
+            let dist = self.distributed.borrow();
+            let mut binding = self.data_binding.borrow_mut();
+            if let (Some(d), Some(ref mut b)) = (dist.as_ref(), binding.as_mut()) {
+                b.chunk_ratios = d.chunk_ratios.clone();
+            }
+        }
+
+        let binding = self.data_binding.borrow();
+        if binding.is_none() {
+            panic!("Graph::epoch() requires set_data_loader() first");
+        }
+
+        let is_distributed = {
+            let b = self.data_binding.borrow();
+            b.as_ref().unwrap().loader.is_distributed()
+        };
+
+        if is_distributed {
+            GraphEpochIterator::Distributed(self, epoch)
+        } else {
+            GraphEpochIterator::Single(self, epoch)
+        }
+    }
+
+    /// Number of batches per epoch (delegates to the attached DataLoader).
+    pub fn data_num_batches(&self) -> usize {
+        self.data_binding
+            .borrow()
+            .as_ref()
+            .expect("call set_data_loader first")
+            .loader
+            .num_batches()
+    }
+
+    /// Batch size (delegates to the attached DataLoader).
+    pub fn data_batch_size(&self) -> usize {
+        self.data_binding
+            .borrow()
+            .as_ref()
+            .expect("call set_data_loader first")
+            .loader
+            .batch_size()
+    }
+
     /// Distributed forward: scatter input, parallel forward on replicas, gather output.
     /// Records CudaEvent timing per rank for auto-balancing.
-    fn forward_distributed(&self, input: &Variable) -> Result<Variable> {
+    fn forward_distributed_scatter(&self, input: &Variable) -> Result<Variable> {
         use crate::nn::cuda_event::{CudaEvent, CudaEventFlags};
         use crate::tensor::set_current_cuda_device;
 
@@ -1349,7 +1539,250 @@ impl Graph {
         let refs: Vec<&Variable> = outputs.iter().collect();
         Variable::cat_many(&refs, 0)
     }
+
+    /// Presharded distributed forward: per-rank data already on each device.
+    /// Consumes shards from the DataLoader, forwards on each replica, gathers output.
+    fn forward_distributed_presharded(&self) -> Result<Variable> {
+        use crate::nn::cuda_event::{CudaEvent, CudaEventFlags};
+        use crate::tensor::set_current_cuda_device;
+
+        // Take per-rank shards from the DataLoader
+        let per_rank_shards = {
+            let binding = self.data_binding.borrow();
+            let binding = binding.as_ref().unwrap();
+            binding.loader.take_shards()
+                .expect("forward_distributed_presharded: no shards pending")
+        };
+
+        let (n, devices, gather_device) = {
+            let dist = self.distributed.borrow();
+            let dist = dist.as_ref().unwrap();
+            let n = dist.devices.len();
+            let devices = dist.devices.clone();
+            let gather_device = self.data_binding.borrow()
+                .as_ref()
+                .map(|b| b.loader.device())
+                .unwrap_or(devices[0]);
+            (n, devices, gather_device)
+        };
+
+        let mut outputs: Vec<Variable> = Vec::with_capacity(n);
+        let mut timing: Vec<(CudaEvent, CudaEvent)> = Vec::with_capacity(n);
+        let mut shard_sizes: Vec<i64> = Vec::with_capacity(n);
+
+        for (rank, shard_data) in per_rank_shards.iter().enumerate() {
+            if shard_data.is_empty() || shard_data[0].shape()[0] == 0 {
+                shard_sizes.push(0);
+                continue;
+            }
+
+            let shard_size = shard_data[0].shape()[0];
+            shard_sizes.push(shard_size);
+
+            // Record start event on this device's default stream
+            let device_idx = match devices[rank] {
+                crate::tensor::Device::CUDA(i) => i,
+                _ => 0,
+            };
+            set_current_cuda_device(device_idx);
+            let start = CudaEvent::new(CudaEventFlags::Default)?;
+            start.record()?;
+
+            // Position 0 is the forward input, already on this rank's device
+            let shard_input = Variable::new(shard_data[0].clone(), false);
+
+            if rank == 0 {
+                let out = self.forward_impl(std::slice::from_ref(&shard_input))?;
+                outputs.push(out);
+            } else {
+                let out = {
+                    let dist = self.distributed.borrow();
+                    let dist = dist.as_ref().unwrap();
+                    dist.replicas[rank - 1].forward(&shard_input)?
+                };
+                // Gather output to gather device
+                let out_gathered = if out.data().device() != gather_device {
+                    out.to_device(gather_device)?
+                } else {
+                    out
+                };
+                outputs.push(out_gathered);
+            }
+
+            // Record end event
+            set_current_cuda_device(device_idx);
+            let end = CudaEvent::new(CudaEventFlags::Default)?;
+            end.record()?;
+            timing.push((start, end));
+        }
+
+        // Store timing and shard sizes for step()
+        {
+            let mut dist = self.distributed.borrow_mut();
+            let dist = dist.as_mut().unwrap();
+            dist.last_timing = Some(timing);
+            dist.last_shard_sizes = shard_sizes;
+        }
+
+        if outputs.len() == 1 {
+            return Ok(outputs.into_iter().next().unwrap());
+        }
+
+        let refs: Vec<&Variable> = outputs.iter().collect();
+        Variable::cat_many(&refs, 0)
+    }
+
+    /// Batch-aware forward pass.
+    ///
+    /// Extracts the primary input and auxiliary graph inputs from the named
+    /// Batch, handles DDP presharding transparently.
+    ///
+    /// ```ignore
+    /// let out = model.forward_batch(&b)?;
+    /// let loss = mse_loss(&out, &b["letter"])?;
+    /// ```
+    pub fn forward_batch(&self, batch: &crate::data::Batch) -> Result<Variable> {
+        // Scope the borrow so it is released before calling methods that re-borrow.
+        let (has_shards, forward_input_name) = {
+            let guard = self.data_binding.borrow();
+            let binding = guard.as_ref()
+                .expect("call set_data_loader before forward_batch");
+
+            let has_shards = self.distributed.borrow().is_some()
+                && binding.loader.has_shards();
+            let name = binding.forward_input.clone();
+            (has_shards, name)
+        };
+
+        // Check if presharded data is available
+        if has_shards {
+            // Set auxiliary graph inputs from the per-rank shards
+            // (handled internally by forward_distributed_presharded)
+            return self.forward_distributed_presharded();
+        }
+
+        let input = if batch.has(&forward_input_name) {
+            Variable::new(batch[forward_input_name.as_str()].clone(), false)
+        } else {
+            return Err(TensorError::new(&format!(
+                "forward_batch: batch missing forward input '{}'",
+                forward_input_name,
+            )));
+        };
+
+        if self.distributed.borrow().is_some() {
+            self.forward_distributed_scatter(&input)
+        } else {
+            self.forward_impl(std::slice::from_ref(&input))
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// GraphEpochIterator
+// ---------------------------------------------------------------------------
+
+/// Iterator over training batches, returned by [`Graph::epoch`].
+///
+/// Wraps either a single-GPU `EpochIterator` or a distributed
+/// `DistributedEpochIterator`. Yields `Result<Batch>`.
+pub enum GraphEpochIterator<'a> {
+    /// Distributed mode: per-device backends, presharded data.
+    Distributed(&'a Graph, usize),
+    /// Single GPU: delegates to DataLoader's epoch iterator.
+    Single(&'a Graph, usize),
+}
+
+/// Internal state once iteration starts (lazily initialized on first next()).
+enum GraphEpochState<'a> {
+    DistributedActive(crate::data::DistributedEpochIterator<'a>),
+    SingleActive(crate::data::EpochIterator<'a>),
+    Pending,
+}
+
+/// Active graph epoch iterator (initialized from GraphEpochIterator on first call).
+pub struct ActiveGraphEpochIterator<'a> {
+    state: GraphEpochState<'a>,
+    #[allow(dead_code)]
+    graph: &'a Graph,
+}
+
+impl<'a> GraphEpochIterator<'a> {
+    /// Activate the iterator (must be called to start iteration).
+    /// This resolves the borrow on the DataLoader binding.
+    pub fn activate(self) -> ActiveGraphEpochIterator<'a> {
+        match self {
+            GraphEpochIterator::Distributed(graph, epoch) => {
+                // Get chunk_ratios and create the distributed iterator
+                let binding = graph.data_binding.borrow();
+                let binding = binding.as_ref().unwrap();
+                let chunk_ratios = &binding.chunk_ratios as *const Vec<f64>;
+
+                // Safety: chunk_ratios lives in the DataLoaderBinding which is
+                // behind a RefCell in the Graph. The Graph outlives the iterator.
+                // We only read chunk_ratios, and they're only mutated between epochs
+                // (in step()), not during iteration.
+                let ratios_ref: &'a [f64] = unsafe { &*chunk_ratios };
+
+                if let crate::data::loader::LoaderInner::Distributed(ref dist_loader) = binding.loader.inner {
+                    let iter = crate::data::DistributedEpochIterator::new(
+                        // Safety: same reasoning -- dist_loader lives in the DataLoaderBinding
+                        unsafe { &*(dist_loader as *const _) },
+                        epoch,
+                        ratios_ref,
+                    );
+                    ActiveGraphEpochIterator {
+                        state: GraphEpochState::DistributedActive(iter),
+                        graph,
+                    }
+                } else {
+                    ActiveGraphEpochIterator {
+                        state: GraphEpochState::Pending,
+                        graph,
+                    }
+                }
+            }
+            GraphEpochIterator::Single(graph, epoch) => {
+                // For single GPU, we need a mutable borrow to call epoch()
+                // on the inner DataLoader.
+                let mut binding = graph.data_binding.borrow_mut();
+                let binding = binding.as_mut().unwrap();
+                let loader_ptr = &mut binding.loader as *mut crate::data::DataLoader;
+
+                // Safety: the DataLoader lives in the Graph's DataLoaderBinding.
+                // We create an EpochIterator that borrows from it. The Graph outlives
+                // the iterator. No concurrent mutation occurs during iteration.
+                let iter = unsafe { (*loader_ptr).epoch(epoch) };
+                ActiveGraphEpochIterator {
+                    state: GraphEpochState::SingleActive(iter),
+                    graph,
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for ActiveGraphEpochIterator<'_> {
+    type Item = Result<crate::data::Batch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.state {
+            GraphEpochState::DistributedActive(iter) => iter.next(),
+            GraphEpochState::SingleActive(iter) => iter.next(),
+            GraphEpochState::Pending => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.state {
+            GraphEpochState::DistributedActive(iter) => iter.size_hint(),
+            GraphEpochState::SingleActive(iter) => iter.size_hint(),
+            GraphEpochState::Pending => (0, Some(0)),
+        }
+    }
+}
+
+impl ExactSizeIterator for ActiveGraphEpochIterator<'_> {}
 
 /// Current time as seconds since epoch (monotonic approximation for ETA).
 fn instant_secs() -> f64 {

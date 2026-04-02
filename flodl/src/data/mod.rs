@@ -44,7 +44,7 @@ pub mod loader;
 pub(crate) mod prefetch;
 
 pub use sampler::{Sampler, RandomSampler, SequentialSampler};
-pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
+pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator, DistributedEpochIterator};
 
 use crate::tensor::{Result, Tensor};
 
@@ -209,36 +209,80 @@ impl<D: DataSet> BatchDataSet for DataSetAdapter<D> {
 // Batch (named accessor wrapper)
 // ---------------------------------------------------------------------------
 
-/// A loaded batch of tensors, supporting indexing for clean destructuring.
+/// A loaded batch of tensors with optional named access.
+///
+/// Supports both positional indexing (`batch[0]`) and named indexing
+/// (`batch["image"]`). Names are set via [`DataLoaderBuilder::names`].
+/// When names are not explicitly set, auto-generated positional names
+/// ("0", "1", "2", ...) are used so both access patterns always work.
 ///
 /// Batch owns its tensors. For resident mode, these are `index_select`
 /// results (not views into the full dataset). For streaming mode, they
-/// come from the prefetch channel. Ownership is consistent across both
+/// come from the prefetch channel. Ownership is consistent across all
 /// paths.
 ///
 /// # Example
 ///
 /// ```ignore
+/// let loader = DataLoader::from_dataset(data)
+///     .batch_size(64)
+///     .names(&["image", "letter", "case", "origin"])
+///     .build()?;
+///
 /// for batch in loader.epoch(epoch) {
 ///     let b = batch?;
-///     let (images, labels) = (&b[0], &b[1]);
-///     // or for FBRL:
-///     let (images, letters, cases, origins) = (&b[0], &b[1], &b[2], &b[3]);
+///     let images = &b["image"];
+///     let letters = &b["letter"];
+///     // positional still works:
+///     let also_images = &b[0];
 /// }
 /// ```
 pub struct Batch {
+    names: Vec<String>,
     tensors: Vec<Tensor>,
 }
 
 impl Batch {
-    /// Create a new batch from a vector of tensors.
-    pub(crate) fn new(tensors: Vec<Tensor>) -> Self {
-        Batch { tensors }
+    /// Create a new batch from tensors with explicit names.
+    pub(crate) fn new(tensors: Vec<Tensor>, names: Vec<String>) -> Self {
+        debug_assert_eq!(
+            names.len(),
+            tensors.len(),
+            "Batch: names count ({}) must match tensor count ({})",
+            names.len(),
+            tensors.len(),
+        );
+        Batch { names, tensors }
+    }
+
+    /// Create a new batch with auto-generated positional names ("0", "1", ...).
+    #[allow(dead_code)]
+    pub(crate) fn new_unnamed(tensors: Vec<Tensor>) -> Self {
+        let names: Vec<String> = (0..tensors.len()).map(|i| i.to_string()).collect();
+        Batch { names, tensors }
     }
 
     /// Get a tensor by position.
     pub fn get(&self, index: usize) -> &Tensor {
         &self.tensors[index]
+    }
+
+    /// Get a tensor by name. Returns `None` if the name is not found.
+    pub fn get_named(&self, name: &str) -> Option<&Tensor> {
+        self.names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| &self.tensors[i])
+    }
+
+    /// Whether the batch contains a tensor with the given name.
+    pub fn has(&self, name: &str) -> bool {
+        self.names.iter().any(|n| n == name)
+    }
+
+    /// The names of the tensors in this batch.
+    pub fn names(&self) -> &[String] {
+        &self.names
     }
 
     /// Number of tensors in this batch.
@@ -255,6 +299,11 @@ impl Batch {
     pub fn into_vec(self) -> Vec<Tensor> {
         self.tensors
     }
+
+    /// Consume the batch and return names and tensors.
+    pub fn into_parts(self) -> (Vec<String>, Vec<Tensor>) {
+        (self.names, self.tensors)
+    }
 }
 
 impl std::ops::Index<usize> for Batch {
@@ -264,9 +313,25 @@ impl std::ops::Index<usize> for Batch {
     }
 }
 
+impl std::ops::Index<&str> for Batch {
+    type Output = Tensor;
+    fn index(&self, name: &str) -> &Tensor {
+        let pos = self.names.iter().position(|n| n == name);
+        match pos {
+            Some(i) => &self.tensors[i],
+            None => panic!(
+                "Batch: unknown field '{}'. Available: [{}]",
+                name,
+                self.names.join(", ")
+            ),
+        }
+    }
+}
+
 impl std::fmt::Debug for Batch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Batch")
+            .field("names", &self.names)
             .field("len", &self.tensors.len())
             .finish()
     }
@@ -373,11 +438,11 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_indexing() {
+    fn test_batch_positional_indexing() {
         let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
         let t0 = Tensor::zeros(&[2, 3], opts).unwrap();
         let t1 = Tensor::ones(&[2, 5], opts).unwrap();
-        let b = Batch::new(vec![t0, t1]);
+        let b = Batch::new_unnamed(vec![t0, t1]);
         assert_eq!(b.len(), 2);
         assert!(!b.is_empty());
         assert_eq!(b[0].shape(), &[2, 3]);
@@ -386,13 +451,85 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_named_indexing() {
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let t0 = Tensor::zeros(&[2, 3], opts).unwrap();
+        let t1 = Tensor::ones(&[2, 5], opts).unwrap();
+        let names = vec!["image".to_string(), "label".to_string()];
+        let b = Batch::new(vec![t0, t1], names);
+        assert_eq!(b["image"].shape(), &[2, 3]);
+        assert_eq!(b["label"].shape(), &[2, 5]);
+        // Positional still works
+        assert_eq!(b[0].shape(), &[2, 3]);
+        assert_eq!(b[1].shape(), &[2, 5]);
+    }
+
+    #[test]
+    fn test_batch_has_and_names() {
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let t0 = Tensor::zeros(&[2, 3], opts).unwrap();
+        let t1 = Tensor::ones(&[2, 5], opts).unwrap();
+        let names = vec!["image".to_string(), "label".to_string()];
+        let b = Batch::new(vec![t0, t1], names);
+        assert!(b.has("image"));
+        assert!(b.has("label"));
+        assert!(!b.has("mask"));
+        assert_eq!(b.names(), &["image", "label"]);
+    }
+
+    #[test]
+    fn test_batch_get_named() {
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let t0 = Tensor::zeros(&[2, 3], opts).unwrap();
+        let t1 = Tensor::ones(&[2, 5], opts).unwrap();
+        let names = vec!["x".to_string(), "y".to_string()];
+        let b = Batch::new(vec![t0, t1], names);
+        assert!(b.get_named("x").is_some());
+        assert_eq!(b.get_named("x").unwrap().shape(), &[2, 3]);
+        assert!(b.get_named("z").is_none());
+    }
+
+    #[test]
+    fn test_batch_auto_names() {
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let t0 = Tensor::zeros(&[2, 3], opts).unwrap();
+        let t1 = Tensor::ones(&[2, 5], opts).unwrap();
+        let b = Batch::new_unnamed(vec![t0, t1]);
+        // Auto-generated names are positional strings
+        assert_eq!(b.names(), &["0", "1"]);
+        assert_eq!(b["0"].shape(), &[2, 3]);
+        assert_eq!(b["1"].shape(), &[2, 5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown field 'missing'")]
+    fn test_batch_named_index_panics_on_missing() {
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let t0 = Tensor::zeros(&[2, 3], opts).unwrap();
+        let b = Batch::new(vec![t0], vec!["image".to_string()]);
+        let _ = &b["missing"];
+    }
+
+    #[test]
     fn test_batch_into_vec() {
         let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
         let t0 = Tensor::zeros(&[2, 3], opts).unwrap();
         let t1 = Tensor::ones(&[2, 5], opts).unwrap();
-        let b = Batch::new(vec![t0, t1]);
+        let b = Batch::new_unnamed(vec![t0, t1]);
         let v = b.into_vec();
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].shape(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_batch_into_parts() {
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let t0 = Tensor::zeros(&[2, 3], opts).unwrap();
+        let t1 = Tensor::ones(&[2, 5], opts).unwrap();
+        let names = vec!["a".to_string(), "b".to_string()];
+        let b = Batch::new(vec![t0, t1], names);
+        let (n, v) = b.into_parts();
+        assert_eq!(n, &["a", "b"]);
+        assert_eq!(v.len(), 2);
     }
 }

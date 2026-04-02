@@ -95,7 +95,8 @@ pub use graph::{
     ThresholdHalt, LearnedHalt,
     Reshape, StateAdd, Reduce, ModelSnapshot,
     PathKind,
+    GraphEpochIterator, ActiveGraphEpochIterator,
 };
 pub use worker::CpuWorker;
 #[cfg(feature = "rng")]
-pub use data::{DataSet, BatchDataSet, Sampler, RandomSampler, SequentialSampler, DataLoader, DataLoaderBuilder, EpochIterator, Batch};
+pub use data::{DataSet, BatchDataSet, Sampler, RandomSampler, SequentialSampler, DataLoader, DataLoaderBuilder, EpochIterator, DistributedEpochIterator, Batch};
