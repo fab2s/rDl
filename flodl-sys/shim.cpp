@@ -4060,6 +4060,7 @@ extern "C" void flodl_cuda_stream_delete(void* stream) {
 // --- NCCL Collective Operations ---
 
 #include <nccl.h>
+#include <atomic>
 
 static ncclDataType_t to_nccl_dtype(at::ScalarType dtype) {
     switch (dtype) {
@@ -4214,9 +4215,11 @@ extern "C" int flodl_nccl_size(void* handle) {
 
 struct FlodlNcclRankComm {
     ncclComm_t comm;
+    std::atomic<bool> aborted{false};
 
     ~FlodlNcclRankComm() {
-        if (comm) {
+        // ncclCommAbort already frees the comm; skip destroy if aborted.
+        if (comm && !aborted.load(std::memory_order_acquire)) {
             ncclCommDestroy(comm);
         }
     }
@@ -4265,6 +4268,24 @@ extern "C" char* flodl_nccl_init_rank(int rank, int nranks, const void* uid,
 
 extern "C" void flodl_nccl_destroy_rank(void* handle) {
     delete static_cast<FlodlNcclRankComm*>(handle);
+}
+
+extern "C" char* flodl_nccl_abort_rank(void* handle) {
+    auto* h = static_cast<FlodlNcclRankComm*>(handle);
+    if (!h || !h->comm) return nullptr;
+    // Idempotent: only abort once.
+    bool expected = false;
+    if (!h->aborted.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel)) {
+        return nullptr; // already aborted
+    }
+    ncclResult_t result = ncclCommAbort(h->comm);
+    h->comm = nullptr; // prevent double-free in destructor
+    if (result != ncclSuccess) {
+        return make_error(std::string("ncclCommAbort failed: ") +
+                          ncclGetErrorString(result));
+    }
+    return nullptr;
 }
 
 extern "C" char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
@@ -4457,6 +4478,10 @@ extern "C" char* flodl_nccl_init_rank(int rank, int nranks, const void* uid,
     return make_error("NCCL requires a CUDA build");
 }
 extern "C" void flodl_nccl_destroy_rank(void* handle) { (void)handle; }
+extern "C" char* flodl_nccl_abort_rank(void* handle) {
+    (void)handle;
+    return nullptr; // no-op on CPU
+}
 extern "C" char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
                                               int ntensors, void* stream,
                                               int op) {

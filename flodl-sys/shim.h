@@ -877,6 +877,12 @@ void flodl_nccl_destroy_rank(void* handle);
 char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
                                   int ntensors, void* stream, int op);
 
+// Abort a single-rank communicator, unblocking any in-progress collective.
+// Thread-safe: can be called from any thread to unblock a stuck AllReduce.
+// After abort, the communicator is destroyed and must not be used again.
+// The corresponding flodl_nccl_destroy_rank() becomes a no-op.
+char* flodl_nccl_abort_rank(void* handle);
+
 // Extract a single-rank communicator from a group handle.
 // Moves ownership: the group's slot for this rank is nullified.
 // The returned handle must be freed with flodl_nccl_destroy_rank().

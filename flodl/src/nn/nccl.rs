@@ -20,6 +20,8 @@
 
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use flodl_sys::{self as ffi, FlodlTensor};
 
@@ -276,10 +278,15 @@ impl NcclComms {
                 )
             };
             check_err(err)?;
+            let abort_handle = Arc::new(NcclAbortHandle {
+                ptr: rank_handle,
+                aborted: AtomicBool::new(false),
+            });
             comms.push(NcclRankComm {
                 handle: rank_handle,
                 rank: i,
                 world_size: self.devices.len(),
+                abort_handle,
             });
         }
         Ok(comms)
@@ -339,6 +346,49 @@ impl std::fmt::Debug for NcclUniqueId {
     }
 }
 
+/// Thread-safe handle for aborting an NCCL communicator from any thread.
+///
+/// When a worker thread is stuck in an NCCL collective (e.g. AllReduce waiting
+/// for a dead rank), calling [`abort`](Self::abort) from any thread unblocks it.
+/// The aborted collective returns an error, and the communicator is destroyed.
+///
+/// Obtained via [`NcclRankComm::abort_handle`]. Multiple clones share the same
+/// underlying communicator pointer.
+pub struct NcclAbortHandle {
+    ptr: *mut c_void,
+    aborted: AtomicBool,
+}
+
+// SAFETY: ncclCommAbort is explicitly documented as thread-safe.
+// The raw pointer is only used for the abort FFI call.
+unsafe impl Send for NcclAbortHandle {}
+unsafe impl Sync for NcclAbortHandle {}
+
+impl NcclAbortHandle {
+    /// Abort the communicator, unblocking any in-progress collective.
+    ///
+    /// Thread-safe and idempotent. After abort, the communicator is destroyed;
+    /// the owning [`NcclRankComm`]'s Drop becomes a no-op.
+    pub fn abort(&self) -> Result<()> {
+        if self.aborted.swap(true, Ordering::AcqRel) {
+            return Ok(()); // already aborted
+        }
+        let err = unsafe { ffi::flodl_nccl_abort_rank(self.ptr) };
+        check_err(err)
+    }
+
+    /// Whether this communicator has been aborted or destroyed.
+    pub fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    /// Mark as handled (comm already destroyed by normal Drop).
+    /// Future `abort()` calls become no-ops, preventing use-after-free.
+    fn mark_destroyed(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+}
+
 /// Single-rank NCCL communicator for multi-threaded DDP.
 ///
 /// **Preferred creation path:** [`NcclComms::new`] + [`NcclComms::split`].
@@ -358,6 +408,7 @@ pub struct NcclRankComm {
     handle: *mut c_void,
     rank: usize,
     world_size: usize,
+    abort_handle: Arc<NcclAbortHandle>,
 }
 
 // NcclRankComm can be sent between threads (though typically stays in its GPU thread).
@@ -389,7 +440,11 @@ impl NcclRankComm {
             )
         };
         check_err(err)?;
-        Ok(NcclRankComm { handle, rank, world_size })
+        let abort_handle = Arc::new(NcclAbortHandle {
+            ptr: handle,
+            aborted: AtomicBool::new(false),
+        });
+        Ok(NcclRankComm { handle, rank, world_size, abort_handle })
     }
 
     /// This rank's index.
@@ -400,6 +455,14 @@ impl NcclRankComm {
     /// Total number of ranks in the communicator.
     pub fn world_size(&self) -> usize {
         self.world_size
+    }
+
+    /// Get a thread-safe abort handle for this communicator.
+    ///
+    /// The handle can be sent to another thread and used to abort a stuck
+    /// collective operation (e.g. AllReduce waiting for a dead rank).
+    pub fn abort_handle(&self) -> Arc<NcclAbortHandle> {
+        self.abort_handle.clone()
     }
 
     /// In-place AllReduce on this rank's tensors using the default stream.
@@ -445,10 +508,14 @@ impl NcclRankComm {
 
 impl Drop for NcclRankComm {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
+        // ncclCommAbort already frees the comm; skip destroy if aborted.
+        if !self.handle.is_null() && !self.abort_handle.is_aborted() {
             unsafe { ffi::flodl_nccl_destroy_rank(self.handle) };
             self.handle = ptr::null_mut();
         }
+        // Invalidate the abort handle so stale Arc<NcclAbortHandle> clones
+        // (held by AsyncDdp) don't call ncclCommAbort on a freed pointer.
+        self.abort_handle.mark_destroyed();
     }
 }
 

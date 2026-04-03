@@ -950,16 +950,18 @@ impl ElChe {
             "wall_ms length must match world_size",
         );
 
-        // Compute per-batch timing for each device with EMA smoothing.
-        // α = 0.3: damps measurement noise, converges in ~3 reports.
-        // First measurement (uncalibrated) is taken raw so initial
-        // calibration isn't delayed.
-        const EMA_ALPHA: f64 = 0.3;
+        // Compute per-batch timing for each device with adaptive EMA.
+        // Alpha scales with prediction error: small jitter (thermal noise)
+        // gets nearly ignored, large shifts (throttle, workload change)
+        // adapt within 1-2 reports. First measurement is taken raw.
         for (rank, &wall) in wall_ms.iter().enumerate() {
             if self.batch_counts[rank] > 0 && wall > 0.0 {
                 let new_ms = wall / self.batch_counts[rank] as f64;
-                self.ms_per_batch[rank] = if self.calibrated {
-                    EMA_ALPHA * new_ms + (1.0 - EMA_ALPHA) * self.ms_per_batch[rank]
+                self.ms_per_batch[rank] = if self.calibrated && self.ms_per_batch[rank] > 0.0 {
+                    let error = (new_ms - self.ms_per_batch[rank]).abs()
+                        / self.ms_per_batch[rank];
+                    let alpha = error.clamp(0.1, 0.8);
+                    alpha * new_ms + (1.0 - alpha) * self.ms_per_batch[rank]
                 } else {
                     new_ms
                 };
@@ -977,8 +979,10 @@ impl ElChe {
             return; // no valid timing
         }
 
-        // Auto-tune anchor before recomputing counts: if AllReduce overhead
-        // exceeds target, scale anchor so that the ratio would hit target.
+        // Auto-tune anchor: increase aggressively if AllReduce overhead
+        // exceeds target, decay slowly (one step at a time) when overhead
+        // drops well below target. Asymmetric response prevents oscillation
+        // while still recovering from over-correction.
         let compute_ms = wall_ms
             .iter()
             .copied()
@@ -986,11 +990,18 @@ impl ElChe {
         if compute_ms > 0.0 && sync_ms > 0.0 {
             let overhead = sync_ms / compute_ms;
             if overhead > self.overhead_target {
+                // Aggressive increase to reduce overhead.
                 let scale = overhead / self.overhead_target;
                 let new_anchor =
                     (self.anchor as f64 * scale).ceil() as usize;
                 self.anchor =
                     new_anchor.clamp(self.min_anchor, self.max_anchor);
+            } else if overhead < self.overhead_target * 0.5
+                      && self.anchor > self.min_anchor {
+                // Gradual decay: only when overhead is less than half the
+                // target, and only one step at a time. Prevents anchor
+                // from staying inflated after a transient overhead spike.
+                self.anchor -= 1;
             }
         }
 
@@ -1029,17 +1040,27 @@ impl ElChe {
 
     /// Recompute batch counts: slow device gets `anchor`, faster devices
     /// get proportionally more based on their ms_per_batch.
+    ///
+    /// Applies a dead zone: a rank's count only changes when the new value
+    /// differs from the current by more than 10%. This prevents batch count
+    /// oscillation from minor speed fluctuations (thermal jitter, OS noise)
+    /// while still adapting to genuine throughput shifts within a few reports.
     fn recompute_batch_counts(&mut self, slow_ms: f64) {
         for rank in 0..self.world_size {
             let ms = self.ms_per_batch[rank];
-            if ms <= 0.0 || (ms - slow_ms).abs() < 1e-6 {
-                // Slow device (or no data): anchor batches.
-                self.batch_counts[rank] = self.anchor;
+            let target = if ms <= 0.0 || (ms - slow_ms).abs() < 1e-6 {
+                self.anchor
             } else {
-                // Faster device: proportional to speed ratio.
                 let ratio = slow_ms / ms;
-                self.batch_counts[rank] =
-                    (self.anchor as f64 * ratio).round().max(1.0) as usize;
+                (self.anchor as f64 * ratio).round().max(1.0) as usize
+            };
+
+            let current = self.batch_counts[rank];
+            let diff = (target as f64 - current as f64).abs();
+            // Dead zone: only update if change exceeds 10% of current count.
+            // Always update on first calibration (current == anchor for all).
+            if diff > current as f64 * 0.10 || !self.calibrated {
+                self.batch_counts[rank] = target;
             }
         }
     }

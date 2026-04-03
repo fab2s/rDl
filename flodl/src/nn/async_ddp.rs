@@ -1258,6 +1258,9 @@ pub struct AsyncDdp {
     coordinator_handle: Option<std::thread::JoinHandle<Result<()>>>,
     devices: Vec<Device>,
     shutdown: Arc<AtomicBool>,
+    /// Abort handles for NCCL communicators. Calling abort unblocks any
+    /// worker stuck in an NCCL collective (e.g. AllReduce for a dead rank).
+    nccl_abort_handles: Vec<Arc<super::nccl::NcclAbortHandle>>,
 }
 
 impl AsyncDdp {
@@ -1368,12 +1371,15 @@ impl AsyncDdp {
         // CRITICAL: ncclCommInitRank from worker threads corrupts CUDA context on
         // heterogeneous GPUs. Always use NcclComms::new() + split() instead.
         // See NcclRankComm and NcclComms::split docs for details.
-        let mut rank_comms: Vec<Option<NcclRankComm>> = if backend == AverageBackend::Nccl {
-            let group = super::nccl::NcclComms::new(&devices)?;
-            group.split()?.into_iter().map(Some).collect()
-        } else {
-            (0..world_size).map(|_| None).collect()
-        };
+        let (mut rank_comms, nccl_abort_handles): (Vec<Option<NcclRankComm>>, Vec<_>) =
+            if backend == AverageBackend::Nccl {
+                let group = super::nccl::NcclComms::new(&devices)?;
+                let comms = group.split()?;
+                let aborts = comms.iter().map(|c| c.abort_handle()).collect();
+                (comms.into_iter().map(Some).collect(), aborts)
+            } else {
+                ((0..world_size).map(|_| None).collect(), Vec::new())
+            };
 
         // Step 3: Create ElChe with config knobs
         let anchor = config.anchor.unwrap_or(10);
@@ -1527,6 +1533,7 @@ impl AsyncDdp {
             coordinator_handle: Some(coordinator_handle),
             devices: devices.to_vec(),
             shutdown,
+            nccl_abort_handles,
         })
     }
 
@@ -1602,6 +1609,7 @@ impl AsyncDdp {
             coordinator_handle: None,
             devices: vec![device],
             shutdown: Arc::new(AtomicBool::new(true)),
+            nccl_abort_handles: Vec::new(),
         })
     }
 
@@ -1615,6 +1623,16 @@ impl AsyncDdp {
         &self.devices
     }
 
+    /// Abort all NCCL communicators, unblocking any stuck collective ops.
+    ///
+    /// Called on error/shutdown to ensure no worker thread hangs forever
+    /// in an AllReduce waiting for a dead rank.
+    fn abort_nccl(&self) {
+        for h in &self.nccl_abort_handles {
+            let _ = h.abort();
+        }
+    }
+
     /// Wait for all training to complete and shut down. Consumes self.
     ///
     /// Workers run their `num_epochs` and exit naturally. After all workers
@@ -1622,21 +1640,49 @@ impl AsyncDdp {
     ///
     /// For single-GPU mode, this is a no-op (training already completed in `auto()`).
     pub fn join(mut self) -> Result<()> {
-        // Wait for all workers to finish their epochs first
-        for h in self.worker_handles.drain(..) {
-            h.join()
-                .map_err(|_| TensorError::new("worker thread panicked"))??;
+        // Join ALL workers, even if some fail. A failed worker already
+        // set shutdown=true (see the error path in the spawn closure),
+        // but we set it again on first error to cover panics.
+        let mut first_err: Option<TensorError> = None;
+        let handles: Vec<_> = self.worker_handles.drain(..).collect();
+
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.shutdown.store(true, Ordering::Relaxed);
+                    self.abort_nccl();
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    self.shutdown.store(true, Ordering::Relaxed);
+                    self.abort_nccl();
+                    if first_err.is_none() {
+                        first_err = Some(TensorError::new("worker thread panicked"));
+                    }
+                }
+            }
         }
 
-        // All workers done. Signal coordinator to stop.
+        // All workers done (or failed). Shut down coordinator.
         self.shutdown.store(true, Ordering::Relaxed);
 
         if let Some(h) = self.coordinator_handle.take() {
-            h.join()
-                .map_err(|_| TensorError::new("coordinator thread panicked"))??;
+            match h.join() {
+                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                Err(_) if first_err.is_none() => {
+                    first_err = Some(TensorError::new("coordinator thread panicked"));
+                }
+                _ => {}
+            }
         }
 
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Print device summary to stderr (same style as Ddp::auto).
@@ -1687,6 +1733,8 @@ impl Drop for AsyncDdp {
     fn drop(&mut self) {
         // Signal shutdown if not already joined
         self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Abort NCCL comms so workers stuck in collectives can unblock.
+        self.abort_nccl();
     }
 }
 

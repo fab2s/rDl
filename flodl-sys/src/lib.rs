@@ -1224,6 +1224,7 @@ unsafe extern "C" {
         rank: i32, nranks: i32, uid: *const u8, handle_out: *mut *mut c_void,
     ) -> *mut i8;
     pub fn flodl_nccl_destroy_rank(handle: *mut c_void);
+    pub fn flodl_nccl_abort_rank(handle: *mut c_void) -> *mut i8;
     pub fn flodl_nccl_all_reduce_rank(
         handle: *mut c_void, tensors: *mut FlodlTensor, ntensors: i32,
         stream: *mut c_void, op: i32,
