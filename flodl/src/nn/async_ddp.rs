@@ -498,6 +498,8 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// The returned tensors are shallow clones (share storage with the model's
     /// Variables). They are `Send` and can be passed through channels.
+    /// Called between batches (after optimizer.step completes on default stream),
+    /// so param data is consistent without explicit stream sync.
     pub fn snapshot_params(&self) -> ParamSnapshot {
         let params = self.param_vars.iter().map(|v| v.data()).collect();
         let buffers = self.buffer_list.iter().map(|b| b.get()).collect();
@@ -650,12 +652,27 @@ impl<M: Module> GpuWorker<M> {
                 self.pending_partition_size = Some(num_samples);
             }
             ControlMsg::Throttle => {
-                // Worker is ahead of the slowest rank: block until the
-                // coordinator sends the next command (SyncNow/Update on
-                // averaging, or Shutdown). This prevents unbounded run-ahead
-                // with large batches or extreme speed ratios.
-                if let Ok(next) = self.control_rx.recv() {
-                    return self.dispatch_control(next);
+                // Worker is ahead of the slowest rank: block until averaging
+                // completes (SyncNow/Update) or Shutdown. Intermediate messages
+                // (RequestParams, PartitionHint) are handled but don't release
+                // the throttle -- the worker stays blocked until the real sync.
+                loop {
+                    match self.control_rx.recv() {
+                        Ok(msg) => {
+                            let releases = matches!(
+                                &msg,
+                                ControlMsg::SyncNow
+                                    | ControlMsg::Update(_)
+                                    | ControlMsg::Shutdown
+                            );
+                            let shutdown = self.dispatch_control(msg)?;
+                            if shutdown || releases {
+                                return Ok(shutdown);
+                            }
+                            // Non-sync message handled, stay throttled.
+                        }
+                        Err(_) => return Ok(true), // channel dead
+                    }
                 }
             }
             ControlMsg::Shutdown => return Ok(true),
