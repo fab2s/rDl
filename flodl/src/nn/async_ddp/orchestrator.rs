@@ -289,7 +289,12 @@ impl AsyncDdp {
                         shutdown_coord.store(true, Ordering::Relaxed);
                         break Some(e);
                     }
-                    coord.drain_metrics();
+                    for m in coord.drain_metrics() {
+                        eprintln!(
+                            "  async-ddp: rank {} epoch {} | loss={:.4} batches={} time={:.0}ms",
+                            m.rank, m.epoch, m.avg_loss, m.batches_processed, m.epoch_ms
+                        );
+                    }
                     if coord.should_average() {
                         // Final drain to catch last-second Exiting messages.
                         // Without this, a fast worker can send Exiting and

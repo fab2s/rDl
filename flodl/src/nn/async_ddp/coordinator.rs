@@ -130,6 +130,8 @@ pub struct Coordinator {
     avg_state: CpuAvgState,
     /// Timeout for snapshot collection (seconds).
     snapshot_timeout_secs: u64,
+    /// Number of CPU averaging rounds aborted due to timeout.
+    abort_count: usize,
 }
 
 /// Builder for configuring a [`Coordinator`].
@@ -211,6 +213,7 @@ impl CoordinatorBuilder {
             checkpoint_every: self.checkpoint_every,
             avg_state: CpuAvgState::Idle,
             snapshot_timeout_secs: self.snapshot_timeout_secs,
+            abort_count: 0,
         }
     }
 }
@@ -270,6 +273,26 @@ impl Coordinator {
     /// Whether CPU averaging is currently in progress (Collecting or Computing).
     pub fn is_cpu_averaging(&self) -> bool {
         !matches!(self.avg_state, CpuAvgState::Idle)
+    }
+
+    /// Number of successful averaging events completed.
+    pub fn avg_count(&self) -> usize {
+        self.avg_count
+    }
+
+    /// Number of CPU averaging rounds aborted due to timeout.
+    pub fn abort_count(&self) -> usize {
+        self.abort_count
+    }
+
+    /// Most recent per-rank batch time (ms).
+    pub fn last_batch_ms(&self) -> &[f64] {
+        &self.last_batch_ms
+    }
+
+    /// Most recent CPU averaging time (ms). Zero for NCCL backend.
+    pub fn last_avg_ms(&self) -> f64 {
+        self.last_avg_ms
     }
 
     /// Process a single timing message. Shared by [`drain_timing`] and
@@ -416,6 +439,11 @@ impl Coordinator {
         self.version += 1;
         self.avg_count += 1;
 
+        eprintln!(
+            "  async-ddp: NCCL averaging #{} complete (v{})",
+            self.avg_count, self.version
+        );
+
         if let Some(every) = self.checkpoint_every {
             if every > 0 && self.avg_count % every == 0 {
                 if let Some(tx) = self.control_txs.first() {
@@ -466,6 +494,11 @@ impl Coordinator {
         self.version += 1;
         self.avg_count += 1;
 
+        eprintln!(
+            "  async-ddp: CPU averaging #{} complete (v{}, {:.1}ms)",
+            self.avg_count, self.version, avg_ms
+        );
+
         if let Some(every) = self.checkpoint_every {
             if every > 0 && self.avg_count % every == 0 {
                 if let Some(tx) = self.control_txs.first() {
@@ -505,12 +538,28 @@ impl Coordinator {
         let state = std::mem::replace(&mut self.avg_state, CpuAvgState::Idle);
         match state {
             CpuAvgState::Idle => {}
-            CpuAvgState::Collecting { .. } => {
+            CpuAvgState::Collecting { snapshots, .. } => {
+                eprintln!(
+                    "  async-ddp: discarding in-progress CPU averaging \
+                     (Collecting, {}/{} snapshots received)",
+                    snapshots.len(), self.world_size
+                );
                 while self.param_rx.try_recv().is_ok() {}
             }
             CpuAvgState::Computing { handle, .. } => {
                 // Join the compute thread so no detached thread holds GPU resources.
-                let _ = handle.join();
+                let result = handle.join();
+                let status = match &result {
+                    Ok(Ok(_)) => "completed result discarded",
+                    Ok(Err(e)) => {
+                        eprintln!("  async-ddp: CPU averaging compute error: {e}");
+                        "errored"
+                    }
+                    Err(_) => "panicked",
+                };
+                eprintln!(
+                    "  async-ddp: discarding in-progress CPU averaging (Computing, {status})"
+                );
                 // Drain any snapshots it might have sent before we discard the result.
                 while self.param_rx.try_recv().is_ok() {}
             }
@@ -586,9 +635,10 @@ impl Coordinator {
                         .filter(|(_, got)| !**got)
                         .map(|(r, _)| r)
                         .collect();
+                    self.abort_count += 1;
                     eprintln!(
                         "  async-ddp: CPU averaging timeout, missing ranks: {missing:?} \
-                         (aborting this round, will retry)"
+                         (abort #{}, will retry)", self.abort_count
                     );
                     self.abort_cpu_averaging();
                 } else {
@@ -618,8 +668,13 @@ impl Coordinator {
                     let avg_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                     // Send averaged params to all workers.
-                    for tx in &self.control_txs {
-                        let _ = tx.send(ControlMsg::Update(result.averaged.clone()));
+                    for (rank, tx) in self.control_txs.iter().enumerate() {
+                        if tx.send(ControlMsg::Update(result.averaged.clone())).is_err() {
+                            eprintln!(
+                                "  async-ddp: failed to deliver Update to rank {rank} \
+                                 (worker channel dead)"
+                            );
+                        }
                     }
 
                     self.finish_averaging_cpu(
