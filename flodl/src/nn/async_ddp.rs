@@ -199,6 +199,9 @@ pub struct AsyncDdpConfig {
     /// Save a checkpoint every N averaging events (multi-GPU) or N epochs (single-GPU).
     /// `None` = no checkpointing. Default: `None`.
     pub checkpoint_every: Option<usize>,
+    /// Timeout for CPU averaging snapshot collection (seconds). Default: 5.
+    /// Only applies to [`AverageBackend::Cpu`].
+    pub snapshot_timeout_secs: u64,
 }
 
 impl Default for AsyncDdpConfig {
@@ -217,6 +220,7 @@ impl AsyncDdpConfig {
             divergence_threshold: None,
             max_batch_diff: None,
             checkpoint_every: None,
+            snapshot_timeout_secs: 5,
         }
     }
 
@@ -259,6 +263,16 @@ impl AsyncDdpConfig {
     /// Errors from the checkpoint function are logged but do not stop training.
     pub fn with_checkpoint_every(mut self, n: usize) -> Self {
         self.checkpoint_every = Some(n);
+        self
+    }
+
+    /// Set the timeout for CPU averaging snapshot collection (seconds).
+    ///
+    /// Default: 5. Only applies to [`AverageBackend::Cpu`]. If not all worker
+    /// snapshots arrive within this timeout, the averaging attempt is aborted
+    /// and retried on the next cycle.
+    pub fn with_snapshot_timeout(mut self, secs: u64) -> Self {
+        self.snapshot_timeout_secs = secs;
         self
     }
 }
@@ -992,6 +1006,54 @@ fn make_partition(
 }
 
 // ---------------------------------------------------------------------------
+// CPU averaging state machine
+// ---------------------------------------------------------------------------
+
+/// State machine for non-blocking CPU averaging.
+///
+/// Instead of blocking the coordinator thread during snapshot collection and
+/// averaging computation, the CPU path operates as a multi-tick state machine:
+///
+/// ```text
+/// Idle -> Collecting -> Computing -> Idle
+///          (try_recv      (thread
+///           per tick)      join)
+/// ```
+///
+/// This keeps [`Coordinator::check_throttle`] running every tick, even during
+/// averaging. Counter snapshots taken at trigger time allow correct timing
+/// attribution: batches during the averaging window carry into the next period.
+enum CpuAvgState {
+    /// No averaging in progress. `should_average()` may trigger a new cycle.
+    Idle,
+    /// Waiting for worker snapshots. `try_recv` on `param_rx` each tick.
+    Collecting {
+        snapshots: Vec<ParamSnapshot>,
+        received: Vec<bool>,
+        deadline: Instant,
+        start: Instant,
+        /// `steps_since_avg` at trigger time (for subtract-not-zero).
+        steps_snapshot: Vec<usize>,
+        /// `wall_ms_accum` at trigger time (for subtract-not-zero).
+        wall_ms_snapshot: Vec<f64>,
+    },
+    /// `average_params` + divergence check running on a background thread.
+    Computing {
+        handle: std::thread::JoinHandle<Result<CpuAvgResult>>,
+        start: Instant,
+        steps_snapshot: Vec<usize>,
+        wall_ms_snapshot: Vec<f64>,
+    },
+}
+
+/// Result from the CPU averaging compute thread.
+struct CpuAvgResult {
+    averaged: AveragedParams,
+    /// For Async policy: new averaging interval and param norms.
+    cadence_update: Option<(usize, Vec<f64>)>,
+}
+
+// ---------------------------------------------------------------------------
 // Coordinator
 // ---------------------------------------------------------------------------
 
@@ -1057,6 +1119,12 @@ pub struct Coordinator {
     avg_count: usize,
     /// Save a checkpoint every N averaging events. None = disabled.
     checkpoint_every: Option<usize>,
+
+    // Non-blocking CPU averaging
+    /// State machine for CPU averaging (Idle/Collecting/Computing).
+    avg_state: CpuAvgState,
+    /// Timeout for snapshot collection (seconds).
+    snapshot_timeout_secs: u64,
 }
 
 /// Builder for configuring a [`Coordinator`].
@@ -1073,6 +1141,7 @@ pub struct CoordinatorBuilder {
     el_che: super::ddp::ElChe,
     divergence_threshold: f64,
     checkpoint_every: Option<usize>,
+    snapshot_timeout_secs: u64,
 }
 
 impl CoordinatorBuilder {
@@ -1103,6 +1172,12 @@ impl CoordinatorBuilder {
         self
     }
 
+    /// Set the timeout for CPU averaging snapshot collection (seconds).
+    pub fn snapshot_timeout_secs(mut self, secs: u64) -> Self {
+        self.snapshot_timeout_secs = secs;
+        self
+    }
+
     /// Build the coordinator.
     pub fn build(self) -> Coordinator {
         Coordinator {
@@ -1129,6 +1204,8 @@ impl CoordinatorBuilder {
             throttled: vec![false; self.world_size],
             avg_count: 0,
             checkpoint_every: self.checkpoint_every,
+            avg_state: CpuAvgState::Idle,
+            snapshot_timeout_secs: self.snapshot_timeout_secs,
         }
     }
 }
@@ -1161,6 +1238,7 @@ impl Coordinator {
             el_che,
             divergence_threshold: 0.05,
             checkpoint_every: None,
+            snapshot_timeout_secs: 5,
         }
     }
 
@@ -1182,6 +1260,11 @@ impl Coordinator {
     /// Per-rank steps since last averaging.
     pub fn steps_since_avg(&self) -> &[usize] {
         &self.steps_since_avg
+    }
+
+    /// Whether CPU averaging is currently in progress (Collecting or Computing).
+    pub fn is_cpu_averaging(&self) -> bool {
+        !matches!(self.avg_state, CpuAvgState::Idle)
     }
 
     /// Process a single timing message. Shared by [`drain_timing`] and
@@ -1241,6 +1324,10 @@ impl Coordinator {
 
     /// Check if averaging should be triggered based on the current policy.
     pub fn should_average(&self) -> bool {
+        // Don't re-trigger while a CPU averaging cycle is in progress.
+        if !matches!(self.avg_state, CpuAvgState::Idle) {
+            return false;
+        }
         // Collectives require all ranks. If any worker has exited,
         // skip averaging to prevent NCCL deadlock or channel disconnect.
         if self.active_count < self.world_size {
@@ -1263,67 +1350,56 @@ impl Coordinator {
 
     /// Trigger parameter averaging based on the configured backend.
     ///
-    /// For NCCL: sends `SyncNow` to all workers (they AllReduce in-place).
-    /// For CPU: collects snapshots, computes weighted average, sends updates.
+    /// For NCCL: sends `SyncNow` to all workers, then runs the common tail
+    /// (ElChe report, version bump, counter reset) synchronously.
+    ///
+    /// For CPU: sends `RequestParams`, snapshots the current counters, and
+    /// enters the [`CpuAvgState::Collecting`] state. The actual collection
+    /// and averaging happen over subsequent [`poll_cpu_averaging`] ticks,
+    /// keeping [`check_throttle`] active throughout.
     pub fn trigger_averaging(&mut self) -> Result<()> {
         match self.backend {
             AverageBackend::Nccl => {
                 for tx in &self.control_txs {
                     let _ = tx.send(ControlMsg::SyncNow);
                 }
+                // NCCL: workers block in AllReduce, no new batches happen,
+                // so zeroing counters is correct.
+                self.finish_averaging_nccl();
             }
             AverageBackend::Cpu => {
-                let avg_start = std::time::Instant::now();
+                // Snapshot counters at trigger time. Batches that arrive
+                // during collection/computing carry into the next period.
+                let steps_snapshot = self.steps_since_avg.clone();
+                let wall_ms_snapshot = self.wall_ms_accum.clone();
 
-                // 1. Request snapshots from all workers
+                // Send RequestParams to all workers
                 for tx in &self.control_txs {
                     let _ = tx.send(ControlMsg::RequestParams);
                 }
-                // 2. Collect snapshots with timeout (worker may have died).
-                //    5s is generous: even a slow GPU snapshot is < 100ms.
-                let timeout = std::time::Duration::from_secs(5);
-                let mut snapshots = Vec::with_capacity(self.world_size);
-                let mut received_ranks = vec![false; self.world_size];
-                for _ in 0..self.world_size {
-                    let snap = self.param_rx.recv_timeout(timeout)
-                        .map_err(|e| {
-                            let missing: Vec<usize> = received_ranks.iter().enumerate()
-                                .filter(|(_, got)| !**got)
-                                .map(|(r, _)| r)
-                                .collect();
-                            TensorError::new(&format!(
-                                "CPU averaging: snapshot collection failed ({e}), \
-                                 missing ranks: {missing:?}"
-                            ))
-                        })?;
-                    if snap.rank < self.world_size {
-                        received_ranks[snap.rank] = true;
-                    }
-                    snapshots.push(snap);
-                }
-                // 3. Check divergence, adjust cadence (Async mode)
-                if self.policy == ApplyPolicy::Async {
-                    self.update_cadence(&snapshots)?;
-                }
-                // 4. Compute weighted average
-                let averaged = Self::average_params(&snapshots, self.version + 1)?;
-                // 5. Send averaged params to all workers
-                for tx in &self.control_txs {
-                    let _ = tx.send(ControlMsg::Update(averaged.clone()));
-                }
 
-                // Record CPU averaging time so ElChe overhead auto-tune
-                // accounts for it (same role as AllReduce time in NCCL path).
-                self.last_avg_ms = avg_start.elapsed().as_secs_f64() * 1000.0;
+                let timeout_secs = self.snapshot_timeout_secs;
+                self.avg_state = CpuAvgState::Collecting {
+                    snapshots: Vec::with_capacity(self.world_size),
+                    received: vec![false; self.world_size],
+                    deadline: Instant::now()
+                        + std::time::Duration::from_secs(timeout_secs),
+                    start: Instant::now(),
+                    steps_snapshot,
+                    wall_ms_snapshot,
+                };
+                // Return immediately; poll_cpu_averaging drives the rest.
             }
         }
+        Ok(())
+    }
 
-        // Report accumulated timing to ElChe for cadence adaptation.
-        // wall_ms_accum[rank] = total wall-clock ms for all batches on that rank
-        // since the last averaging event. ElChe divides by batch_counts to get ms/batch.
+    /// Common tail for NCCL averaging: report to ElChe, bump version, zero counters.
+    ///
+    /// NCCL workers block in AllReduce so no new batches arrive during the
+    /// collective; zeroing is correct.
+    fn finish_averaging_nccl(&mut self) {
         if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
-            // For CPU backend, last_avg_ms captures the full snapshot-average-distribute
-            // cycle. For NCCL, it stays 0.0 (AllReduce overhead is part of wall_ms).
             self.el_che.report_timing(&self.wall_ms_accum, self.last_avg_ms);
             self.last_avg_ms = 0.0;
             if !self.calibrated && self.el_che.is_calibrated() {
@@ -1335,7 +1411,6 @@ impl Coordinator {
         self.version += 1;
         self.avg_count += 1;
 
-        // Checkpoint on rank 0 after averaging, if configured
         if let Some(every) = self.checkpoint_every {
             if every > 0 && self.avg_count % every == 0 {
                 if let Some(tx) = self.control_txs.first() {
@@ -1353,6 +1428,214 @@ impl Coordinator {
         for t in &mut self.throttled {
             *t = false;
         }
+    }
+
+    /// Common tail for CPU averaging: report snapshot counters to ElChe,
+    /// subtract snapshots from current counters (preserve during-averaging batches).
+    fn finish_averaging_cpu(
+        &mut self,
+        avg_ms: f64,
+        steps_snapshot: &[usize],
+        wall_ms_snapshot: &[f64],
+        cadence_update: Option<(usize, Vec<f64>)>,
+    ) {
+        self.last_avg_ms = avg_ms;
+
+        // Report the snapshot values to ElChe (accurate for the period
+        // that triggered averaging, not inflated by during-averaging batches).
+        if wall_ms_snapshot.iter().any(|&ms| ms > 0.0) {
+            self.el_che.report_timing(wall_ms_snapshot, self.last_avg_ms);
+            self.last_avg_ms = 0.0;
+            if !self.calibrated && self.el_che.is_calibrated() {
+                self.calibrated = true;
+                self.rebalance_partitions();
+            }
+        }
+
+        // Apply cadence update from the compute thread (Async policy).
+        if let Some((new_interval, norms)) = cadence_update {
+            self.avg_interval = new_interval;
+            self.last_param_norms = norms;
+        }
+
+        self.version += 1;
+        self.avg_count += 1;
+
+        if let Some(every) = self.checkpoint_every {
+            if every > 0 && self.avg_count % every == 0 {
+                if let Some(tx) = self.control_txs.first() {
+                    let _ = tx.send(ControlMsg::Checkpoint { version: self.version });
+                }
+            }
+        }
+
+        // Subtract snapshot from current counters. Residual = batches
+        // that happened during the averaging window, carried forward.
+        for (i, s) in self.steps_since_avg.iter_mut().enumerate() {
+            *s = s.saturating_sub(steps_snapshot[i]);
+        }
+        for (i, a) in self.wall_ms_accum.iter_mut().enumerate() {
+            *a = (*a - wall_ms_snapshot[i]).max(0.0);
+        }
+        for t in &mut self.throttled {
+            *t = false;
+        }
+    }
+
+    /// Abort an in-progress CPU averaging cycle and return to Idle.
+    ///
+    /// Drains stale snapshots from `param_rx` so the next cycle starts clean.
+    fn abort_cpu_averaging(&mut self) {
+        self.avg_state = CpuAvgState::Idle;
+        // Drain any in-flight snapshots from the aborted round.
+        while self.param_rx.try_recv().is_ok() {}
+    }
+
+    /// Cleanly shut down any in-progress CPU averaging before the coordinator exits.
+    ///
+    /// If in Computing state, joins the background thread (waits for it to finish)
+    /// so no detached thread holds GPU resources when the coordinator returns.
+    /// If in Collecting state, drains stale snapshots.
+    fn drain_avg_state(&mut self) {
+        let state = std::mem::replace(&mut self.avg_state, CpuAvgState::Idle);
+        match state {
+            CpuAvgState::Idle => {}
+            CpuAvgState::Collecting { .. } => {
+                while self.param_rx.try_recv().is_ok() {}
+            }
+            CpuAvgState::Computing { handle, .. } => {
+                // Join the compute thread so no detached thread holds GPU resources.
+                let _ = handle.join();
+                // Drain any snapshots it might have sent before we discard the result.
+                while self.param_rx.try_recv().is_ok() {}
+            }
+        }
+    }
+
+    /// Drive the CPU averaging state machine one tick.
+    ///
+    /// Called every coordinator loop iteration. Handles three states:
+    ///
+    /// - **Idle**: no-op.
+    /// - **Collecting**: `try_recv` on `param_rx` for pending snapshots.
+    ///   Transitions to Computing when all ranks have responded, or soft-aborts
+    ///   on timeout (drains stale snapshots, returns to Idle, logs warning).
+    /// - **Computing**: checks if the background thread has finished. When done,
+    ///   sends `Update` to all workers and runs `finish_averaging_cpu`.
+    ///
+    /// Returns `Ok(())` on normal progress (including soft abort).
+    /// Returns `Err` only on unrecoverable errors (compute thread panic).
+    pub fn poll_cpu_averaging(&mut self) -> Result<()> {
+        // Take ownership of the state to avoid borrow issues.
+        let state = std::mem::replace(&mut self.avg_state, CpuAvgState::Idle);
+
+        match state {
+            CpuAvgState::Idle => {
+                self.avg_state = CpuAvgState::Idle;
+            }
+            CpuAvgState::Collecting {
+                mut snapshots,
+                mut received,
+                deadline,
+                start,
+                steps_snapshot,
+                wall_ms_snapshot,
+            } => {
+                // Drain all available snapshots (non-blocking).
+                while let Ok(snap) = self.param_rx.try_recv() {
+                    if snap.rank < self.world_size && !received[snap.rank] {
+                        received[snap.rank] = true;
+                        snapshots.push(snap);
+                    }
+                    // Ignore duplicates or out-of-range ranks.
+                }
+
+                if snapshots.len() >= self.world_size {
+                    // All snapshots collected. Spawn compute thread.
+                    let version = self.version + 1;
+                    let policy = self.policy;
+                    let avg_interval = self.avg_interval;
+                    let div_threshold = self.divergence_threshold;
+
+                    let handle = std::thread::Builder::new()
+                        .name("cpu-avg-compute".into())
+                        .spawn(move || {
+                            Self::compute_average_and_cadence(
+                                snapshots, version, policy,
+                                avg_interval, div_threshold,
+                            )
+                        })
+                        .map_err(|e| TensorError::new(
+                            &format!("failed to spawn CPU averaging thread: {e}")
+                        ))?;
+
+                    self.avg_state = CpuAvgState::Computing {
+                        handle,
+                        start,
+                        steps_snapshot,
+                        wall_ms_snapshot,
+                    };
+                } else if Instant::now() >= deadline {
+                    // Timeout: soft abort.
+                    let missing: Vec<usize> = received.iter().enumerate()
+                        .filter(|(_, got)| !**got)
+                        .map(|(r, _)| r)
+                        .collect();
+                    eprintln!(
+                        "  async-ddp: CPU averaging timeout, missing ranks: {missing:?} \
+                         (aborting this round, will retry)"
+                    );
+                    self.abort_cpu_averaging();
+                } else {
+                    // Still waiting. Put state back.
+                    self.avg_state = CpuAvgState::Collecting {
+                        snapshots,
+                        received,
+                        deadline,
+                        start,
+                        steps_snapshot,
+                        wall_ms_snapshot,
+                    };
+                }
+            }
+            CpuAvgState::Computing {
+                handle,
+                start,
+                steps_snapshot,
+                wall_ms_snapshot,
+            } => {
+                if handle.is_finished() {
+                    let result = handle.join()
+                        .map_err(|_| TensorError::new(
+                            "CPU averaging compute thread panicked"
+                        ))??;
+
+                    let avg_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Send averaged params to all workers.
+                    for tx in &self.control_txs {
+                        let _ = tx.send(ControlMsg::Update(result.averaged.clone()));
+                    }
+
+                    self.finish_averaging_cpu(
+                        avg_ms,
+                        &steps_snapshot,
+                        &wall_ms_snapshot,
+                        result.cadence_update,
+                    );
+                    // avg_state is already Idle from the mem::replace.
+                } else {
+                    // Still computing. Put state back.
+                    self.avg_state = CpuAvgState::Computing {
+                        handle,
+                        start,
+                        steps_snapshot,
+                        wall_ms_snapshot,
+                    };
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1427,6 +1710,10 @@ impl Coordinator {
     /// Computes relative norm difference: `sum(|norm_i - mean|) / mean`.
     /// If divergence > threshold, halve the interval (more frequent averaging).
     /// If divergence < threshold/2, double the interval (less frequent averaging).
+    ///
+    /// Note: the production path uses [`compute_average_and_cadence`] on a
+    /// background thread. This method is kept for direct testing.
+    #[cfg(test)]
     fn update_cadence(&mut self, snapshots: &[ParamSnapshot]) -> Result<()> {
         // Compute per-rank parameter L2 norm (sum of all param norms)
         let mut norms = Vec::with_capacity(snapshots.len());
@@ -1458,6 +1745,56 @@ impl Coordinator {
 
         self.last_param_norms = norms;
         Ok(())
+    }
+
+    /// Compute weighted average and (optionally) cadence update on a background thread.
+    ///
+    /// Static method: captures only the data it needs, no `&self` borrow.
+    /// Returns `CpuAvgResult` with the averaged params and an optional
+    /// `(new_interval, norms)` tuple for Async policy.
+    fn compute_average_and_cadence(
+        snapshots: Vec<ParamSnapshot>,
+        version: u64,
+        policy: ApplyPolicy,
+        avg_interval: usize,
+        divergence_threshold: f64,
+    ) -> Result<CpuAvgResult> {
+        let averaged = Self::average_params(&snapshots, version)?;
+
+        let cadence_update = if policy == ApplyPolicy::Async {
+            // Inline the divergence computation (same logic as update_cadence
+            // but without &mut self, returns the result instead of mutating).
+            let mut norms = Vec::with_capacity(snapshots.len());
+            for snap in &snapshots {
+                let mut total_norm_sq = 0.0f64;
+                for p in &snap.params {
+                    let n: f64 = p.norm()?.item()?;
+                    total_norm_sq += n * n;
+                }
+                norms.push(total_norm_sq.sqrt());
+            }
+
+            let mean_norm: f64 = norms.iter().sum::<f64>() / norms.len() as f64;
+            let new_interval = if mean_norm < 1e-10 {
+                avg_interval // all zeros, no change
+            } else {
+                let divergence: f64 = norms.iter()
+                    .map(|n| (n - mean_norm).abs())
+                    .sum::<f64>() / mean_norm;
+                if divergence > divergence_threshold {
+                    (avg_interval / 2).max(1)
+                } else if divergence < divergence_threshold / 2.0 {
+                    (avg_interval * 2).min(1000)
+                } else {
+                    avg_interval
+                }
+            };
+            Some((new_interval, norms))
+        } else {
+            None
+        };
+
+        Ok(CpuAvgResult { averaged, cadence_update })
     }
 
     /// Send PartitionHint to each worker based on ElChe throughput ratios.
@@ -1515,10 +1852,16 @@ impl Coordinator {
     pub fn tick(&mut self) -> Result<Vec<MetricsMsg>> {
         self.drain_timing();
         self.check_throttle();
+        self.poll_cpu_averaging()?;
         let metrics = self.drain_metrics();
 
         if self.should_average() {
-            self.trigger_averaging()?;
+            // Final drain to catch last-second Exiting messages before
+            // sending SyncNow (prevents AllReduce with a dead worker).
+            self.drain_timing();
+            if self.should_average() {
+                self.trigger_averaging()?;
+            }
         }
 
         Ok(metrics)
@@ -1791,6 +2134,7 @@ impl AsyncDdp {
         let shutdown_coord = shutdown.clone();
         let div_threshold = config.divergence_threshold;
         let ckpt_every = config.checkpoint_every;
+        let snap_timeout = config.snapshot_timeout_secs;
 
         let coordinator_handle = std::thread::Builder::new()
             .name("async-ddp-coordinator".into())
@@ -1801,7 +2145,8 @@ impl AsyncDdp {
                     coord_control_txs,
                     policy, backend,
                     world_size, total_samples, el_che,
-                );
+                )
+                .snapshot_timeout_secs(snap_timeout);
                 if let Some(dt) = div_threshold {
                     builder = builder.divergence_threshold(dt);
                 }
@@ -1821,14 +2166,32 @@ impl AsyncDdp {
                         break None; // channel disconnected: all workers done
                     }
                     coord.check_throttle();
+                    if let Err(e) = coord.poll_cpu_averaging() {
+                        shutdown_coord.store(true, Ordering::Relaxed);
+                        break Some(e);
+                    }
                     coord.drain_metrics();
                     if coord.should_average() {
-                        if let Err(e) = coord.trigger_averaging() {
-                            shutdown_coord.store(true, Ordering::Relaxed);
-                            break Some(e);
+                        // Final drain to catch last-second Exiting messages.
+                        // Without this, a fast worker can send Exiting and
+                        // destroy its NcclRankComm between our drain and the
+                        // SyncNow send, leaving the slow worker's AllReduce
+                        // with no partner.
+                        coord.drain_timing();
+                        if coord.should_average() {
+                            if let Err(e) = coord.trigger_averaging() {
+                                shutdown_coord.store(true, Ordering::Relaxed);
+                                break Some(e);
+                            }
                         }
                     }
                 };
+
+                // Ensure any in-progress CPU averaging is fully cleaned up
+                // before we return. This joins the compute thread (if any)
+                // so no detached thread holds GPU resources that could
+                // interfere with subsequent NCCL init.
+                coord.drain_avg_state();
 
                 // Workers may take a moment to send final snapshots after
                 // their last timing message. Short grace period.
@@ -2873,6 +3236,15 @@ mod tests {
         policy: ApplyPolicy,
         backend: AverageBackend,
     ) -> CoordTestHarness {
+        make_coord_harness_with_timeout(n, policy, backend, 5)
+    }
+
+    fn make_coord_harness_with_timeout(
+        n: usize,
+        policy: ApplyPolicy,
+        backend: AverageBackend,
+        snapshot_timeout_secs: u64,
+    ) -> CoordTestHarness {
         let (timing_tx, timing_rx) = mpsc::channel();
         let (metrics_tx, metrics_rx) = mpsc::channel();
         let (param_tx, param_rx) = mpsc::channel();
@@ -2895,7 +3267,9 @@ mod tests {
             control_txs,
             policy, backend,
             n, 10000, el_che,
-        ).build();
+        )
+        .snapshot_timeout_secs(snapshot_timeout_secs)
+        .build();
 
         CoordTestHarness { coord, timing_tx, metrics_tx, param_tx, control_rxs }
     }
@@ -2988,35 +3362,44 @@ mod tests {
         h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1 }).unwrap();
         h.coord.drain_timing();
 
-        // Trigger averaging in a thread because it blocks waiting for snapshots
-        let param_tx = h.param_tx.clone();
-        let handle = std::thread::spawn(move || {
-            // Simulate workers responding to RequestParams
-            // Worker 0: weight=1.0, 10 batches
-            param_tx.send(ParamSnapshot {
-                rank: 0,
-                params: vec![Tensor::ones(&[2, 3], opts).unwrap()],
-                buffers: vec![],
-                batch_count: 10,
-            }).unwrap();
-            // Worker 1: weight=3.0, 10 batches
-            param_tx.send(ParamSnapshot {
-                rank: 1,
-                params: vec![Tensor::full(&[2, 3], 3.0, opts).unwrap()],
-                buffers: vec![],
-                batch_count: 10,
-            }).unwrap();
-        });
-
+        // trigger_averaging now returns immediately (enters Collecting state)
         h.coord.trigger_averaging().unwrap();
-        handle.join().unwrap();
 
-        // Workers should receive RequestParams then Update
+        // Workers should receive RequestParams
         for rx in &h.control_rxs {
             match rx.recv().unwrap() {
                 ControlMsg::RequestParams => {}
                 other => panic!("expected RequestParams, got {:?}", std::mem::discriminant(&other)),
             }
+        }
+
+        // Send snapshots (simulating workers responding)
+        h.param_tx.send(ParamSnapshot {
+            rank: 0,
+            params: vec![Tensor::ones(&[2, 3], opts).unwrap()],
+            buffers: vec![],
+            batch_count: 10,
+        }).unwrap();
+        h.param_tx.send(ParamSnapshot {
+            rank: 1,
+            params: vec![Tensor::full(&[2, 3], 3.0, opts).unwrap()],
+            buffers: vec![],
+            batch_count: 10,
+        }).unwrap();
+
+        // Poll until the state machine completes (Collecting -> Computing -> Idle)
+        for _ in 0..100 {
+            h.coord.poll_cpu_averaging().unwrap();
+            if h.coord.version() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(h.coord.version(), 1);
+
+        // Workers should receive Update
+        for rx in &h.control_rxs {
             match rx.recv().unwrap() {
                 ControlMsg::Update(avg) => {
                     // Weighted average of 1.0 and 3.0 with equal batch counts = 2.0
@@ -3834,25 +4217,33 @@ mod tests {
             h.coord.drain_timing();
 
             if h.coord.should_average() {
-                // CPU path: need to supply snapshots
-                let param_tx = h.param_tx.clone();
-                let opts_copy = opts;
-                let handle = std::thread::spawn(move || {
-                    param_tx.send(ParamSnapshot {
-                        rank: 0,
-                        params: vec![Tensor::ones(&[10], opts_copy).unwrap()],
-                        buffers: vec![],
-                        batch_count: 1,
-                    }).unwrap();
-                    param_tx.send(ParamSnapshot {
-                        rank: 1,
-                        params: vec![Tensor::full(&[10], 1.001, opts_copy).unwrap()],
-                        buffers: vec![],
-                        batch_count: 1,
-                    }).unwrap();
-                });
+                // Non-blocking trigger enters Collecting state
                 h.coord.trigger_averaging().unwrap();
-                handle.join().unwrap();
+
+                // Supply snapshots
+                h.param_tx.send(ParamSnapshot {
+                    rank: 0,
+                    params: vec![Tensor::ones(&[10], opts).unwrap()],
+                    buffers: vec![],
+                    batch_count: 1,
+                }).unwrap();
+                h.param_tx.send(ParamSnapshot {
+                    rank: 1,
+                    params: vec![Tensor::full(&[10], 1.001, opts).unwrap()],
+                    buffers: vec![],
+                    batch_count: 1,
+                }).unwrap();
+
+                // Poll until averaging completes
+                let v_before = h.coord.version();
+                for _ in 0..100 {
+                    h.coord.poll_cpu_averaging().unwrap();
+                    if h.coord.version() > v_before {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
                 for rx in &h.control_rxs {
                     while rx.try_recv().is_ok() {}
                 }
@@ -3862,6 +4253,236 @@ mod tests {
         // Low divergence should have increased K beyond initial 1
         assert!(h.coord.avg_interval() > 1,
             "K should increase with low divergence, got {}", h.coord.avg_interval());
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-blocking CPU averaging tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_throttle_during_cpu_averaging() {
+        // The key invariant: check_throttle fires even while CPU averaging
+        // is in Collecting state.
+        let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Cpu);
+        let el_che = ElChe::new(2, 10).with_max_batch_diff(2);
+        h.coord.el_che = el_che;
+
+        // Feed enough timing to trigger averaging
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1 }).unwrap();
+        h.coord.drain_timing();
+
+        // Trigger averaging (enters Collecting state, returns immediately)
+        assert!(h.coord.should_average());
+        h.coord.trigger_averaging().unwrap();
+        assert!(h.coord.is_cpu_averaging());
+        assert!(!h.coord.should_average()); // guard prevents re-trigger
+
+        // Consume RequestParams from control channels
+        for rx in &h.control_rxs {
+            match rx.try_recv() {
+                Ok(ControlMsg::RequestParams) => {}
+                other => panic!("expected RequestParams, got {:?}", other.map(|m| std::mem::discriminant(&m))),
+            }
+        }
+
+        // Simulate rank 0 running ahead by 5 batches during the averaging window
+        for i in 0..5 {
+            h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 1.0, step_count: 2 + i }).unwrap();
+        }
+        h.coord.drain_timing();
+
+        // check_throttle should fire even though we're in Collecting state
+        h.coord.check_throttle();
+
+        // Rank 0 should receive Throttle (it's 5 batches ahead, max_diff=2)
+        match h.control_rxs[0].try_recv() {
+            Ok(ControlMsg::Throttle) => {}
+            other => panic!("expected Throttle for rank 0, got {:?}", other.map(|m| std::mem::discriminant(&m))),
+        }
+        // Rank 1 should NOT be throttled
+        assert!(h.control_rxs[1].try_recv().is_err(), "rank 1 should not be throttled");
+    }
+
+    #[test]
+    fn test_cpu_avg_state_machine_full_cycle() {
+        // Drive the full Idle -> Collecting -> Computing -> Idle cycle.
+        let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Cpu);
+        let dev = test_device();
+        let opts = TensorOptions { dtype: DType::Float32, device: dev };
+
+        // Feed timing
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1 }).unwrap();
+        h.coord.drain_timing();
+
+        assert_eq!(h.coord.version(), 0);
+        assert!(!h.coord.is_cpu_averaging());
+
+        // Trigger: enters Collecting
+        h.coord.trigger_averaging().unwrap();
+        assert!(h.coord.is_cpu_averaging());
+
+        // Poll with no snapshots yet: still Collecting
+        h.coord.poll_cpu_averaging().unwrap();
+        assert!(h.coord.is_cpu_averaging());
+
+        // Supply snapshots
+        h.param_tx.send(ParamSnapshot {
+            rank: 0,
+            params: vec![Tensor::ones(&[4], opts).unwrap()],
+            buffers: vec![],
+            batch_count: 5,
+        }).unwrap();
+        h.param_tx.send(ParamSnapshot {
+            rank: 1,
+            params: vec![Tensor::full(&[4], 3.0, opts).unwrap()],
+            buffers: vec![],
+            batch_count: 5,
+        }).unwrap();
+
+        // Poll: transitions Collecting -> Computing (spawns thread)
+        h.coord.poll_cpu_averaging().unwrap();
+
+        // Poll until Computing -> Idle
+        for _ in 0..100 {
+            h.coord.poll_cpu_averaging().unwrap();
+            if !h.coord.is_cpu_averaging() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Verify completion
+        assert!(!h.coord.is_cpu_averaging());
+        assert_eq!(h.coord.version(), 1);
+
+        // Workers should have received RequestParams then Update
+        for rx in &h.control_rxs {
+            let mut got_request = false;
+            let mut got_update = false;
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    ControlMsg::RequestParams => got_request = true,
+                    ControlMsg::Update(avg) => {
+                        got_update = true;
+                        assert_eq!(avg.version, 1);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(got_request, "worker should have received RequestParams");
+            assert!(got_update, "worker should have received Update");
+        }
+    }
+
+    #[test]
+    fn test_cpu_avg_collection_timeout() {
+        // Use a very short timeout (1 second) and never send snapshots.
+        let mut h = make_coord_harness_with_timeout(
+            2, ApplyPolicy::Sync, AverageBackend::Cpu, 1,
+        );
+
+        // Feed timing to trigger averaging
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1 }).unwrap();
+        h.coord.drain_timing();
+
+        // Trigger: enters Collecting
+        h.coord.trigger_averaging().unwrap();
+        assert!(h.coord.is_cpu_averaging());
+
+        // Wait for the timeout to expire
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Poll: should soft-abort (back to Idle)
+        h.coord.poll_cpu_averaging().unwrap(); // Ok, not Err
+        assert!(!h.coord.is_cpu_averaging());
+        assert_eq!(h.coord.version(), 0); // no version bump
+
+        // should_average is available again for retry
+        assert!(h.coord.should_average());
+    }
+
+    #[test]
+    fn test_stale_snapshot_after_timeout() {
+        // After a timeout, stale snapshots from the aborted round
+        // must not contaminate the next round.
+        let mut h = make_coord_harness_with_timeout(
+            2, ApplyPolicy::Sync, AverageBackend::Cpu, 1,
+        );
+        let dev = test_device();
+        let opts = TensorOptions { dtype: DType::Float32, device: dev };
+
+        // Feed timing
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1 }).unwrap();
+        h.coord.drain_timing();
+
+        // Round 1: trigger, send only rank 0's snapshot, let it timeout
+        h.coord.trigger_averaging().unwrap();
+        h.param_tx.send(ParamSnapshot {
+            rank: 0,
+            params: vec![Tensor::full(&[4], 999.0, opts).unwrap()],
+            buffers: vec![],
+            batch_count: 1,
+        }).unwrap();
+
+        // Wait for timeout
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        h.coord.poll_cpu_averaging().unwrap();
+        assert!(!h.coord.is_cpu_averaging()); // soft abort
+        assert_eq!(h.coord.version(), 0);
+
+        // Round 2: trigger fresh. The stale rank-0 snapshot from round 1
+        // should have been drained by abort_cpu_averaging.
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 2 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 2 }).unwrap();
+        h.coord.drain_timing();
+
+        h.coord.trigger_averaging().unwrap();
+
+        // Send FRESH snapshots for both ranks (value=1.0 and 3.0)
+        h.param_tx.send(ParamSnapshot {
+            rank: 0,
+            params: vec![Tensor::ones(&[4], opts).unwrap()],
+            buffers: vec![],
+            batch_count: 1,
+        }).unwrap();
+        h.param_tx.send(ParamSnapshot {
+            rank: 1,
+            params: vec![Tensor::full(&[4], 3.0, opts).unwrap()],
+            buffers: vec![],
+            batch_count: 1,
+        }).unwrap();
+
+        // Poll until complete
+        for _ in 0..100 {
+            h.coord.poll_cpu_averaging().unwrap();
+            if h.coord.version() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(h.coord.version(), 1);
+
+        // Verify the Update contains fresh data (avg of 1.0 and 3.0 = 2.0),
+        // NOT 999.0 from the stale snapshot.
+        for rx in &h.control_rxs {
+            let mut found_update = false;
+            while let Ok(msg) = rx.try_recv() {
+                if let ControlMsg::Update(avg) = msg {
+                    let sum: f64 = avg.params[0].sum().unwrap().item().unwrap();
+                    let expected = 2.0 * 4.0; // 2.0 per element * 4 elements
+                    assert!(
+                        (sum - expected).abs() < 1e-4,
+                        "expected sum={expected}, got {sum} (stale data leaked?)"
+                    );
+                    found_update = true;
+                }
+            }
+            assert!(found_update, "worker should have received Update");
+        }
     }
 
     #[test]
