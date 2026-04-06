@@ -565,7 +565,7 @@ impl Drop for NcclRankComm {
             self.handle = ptr::null_mut();
         }
         // Invalidate the abort handle so stale Arc<NcclAbortHandle> clones
-        // (held by AsyncDdp) don't call ncclCommAbort on a freed pointer.
+        // (held by DdpHandle) don't call ncclCommAbort on a freed pointer.
         self.abort_handle.mark_destroyed();
     }
 }

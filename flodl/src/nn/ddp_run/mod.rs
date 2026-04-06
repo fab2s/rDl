@@ -1,4 +1,4 @@
-//! Async DDP: thread-per-GPU training with Local SGD and adaptive parameter averaging.
+//! DDP run mode: thread-per-GPU training with Local SGD and adaptive parameter averaging.
 //!
 //! Each GPU runs its own optimizer independently (zero wait). A lightweight coordinator
 //! triggers periodic parameter averaging at ElChe-determined intervals. Two orthogonal
@@ -10,7 +10,7 @@
 //! ```ignore
 //! use flodl::*;
 //!
-//! let ddp = AsyncDdp::builder(model_factory, optim_factory, train_fn)
+//! let handle = Ddp::builder(model_factory, optim_factory, train_fn)
 //!     .dataset(dataset)
 //!     .batch_size(32)
 //!     .num_epochs(10)
@@ -20,7 +20,7 @@
 //!     .checkpoint_fn(|ver, g| g.save_checkpoint(&format!("ckpt_v{ver}.fdl")))
 //!     .run()?;
 //!
-//! let state = ddp.join()?;
+//! let state = handle.join()?;
 //! // state.params[i] corresponds to model.parameters()[i]
 //! // state.buffers[i] corresponds to model.buffers()[i]
 //! ```
@@ -53,7 +53,7 @@
 //!
 //! # Safety guards
 //!
-//! - [`AsyncDdpConfig::with_max_batch_diff`]: hard limit on how far any GPU can
+//! - [`with_max_batch_diff`](DdpRunConfig::with_max_batch_diff): hard limit on how far any GPU can
 //!   run ahead. Set to `0` for strict lockstep. Prevents catastrophic divergence
 //!   with large batches or extreme speed ratios.
 //! - [`ElChe`](super::ddp::ElChe) adaptive speed tracking with dead-zone hysteresis:
@@ -81,11 +81,37 @@ use crate::tensor::{Device, Result, Tensor};
 /// (single-GPU). Errors are logged but do not stop training.
 pub type CheckpointFn<M> = Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>;
 
+/// Epoch callback type: `(epoch, &mut worker)`.
+///
+/// Called at the start of each epoch inside each worker thread, before
+/// [`run_epoch`](GpuWorker::run_epoch). Use this for epoch-level scheduling
+/// such as learning rate schedules, noise curricula, or dynamic loss weights.
+///
+/// The closure itself must be `Send + Sync` (its captures cross thread boundaries),
+/// but the `&mut GpuWorker<M>` reference stays thread-local.
+pub type EpochFn<M> = Arc<dyn Fn(usize, &mut GpuWorker<M>) + Send + Sync>;
+
+// ---------------------------------------------------------------------------
+// Deprecated aliases (backward compatibility)
+// ---------------------------------------------------------------------------
+
+/// Deprecated: renamed to [`DdpHandle`].
+#[deprecated(since = "0.3.0", note = "Renamed to DdpHandle. Use Ddp::builder() to create.")]
+pub type AsyncDdp = DdpHandle;
+
+/// Deprecated: renamed to [`DdpBuilder`].
+#[deprecated(since = "0.3.0", note = "Renamed to DdpBuilder. Use Ddp::builder() to create.")]
+pub type AsyncDdpBuilder<F, M, G, O, T> = DdpBuilder<F, M, G, O, T>;
+
+/// Deprecated: renamed to [`DdpRunConfig`].
+#[deprecated(since = "0.3.0", note = "Renamed to DdpRunConfig")]
+pub type AsyncDdpConfig = DdpRunConfig;
+
 // ---------------------------------------------------------------------------
 // Return type
 // ---------------------------------------------------------------------------
 
-/// Trained parameters and buffers returned by [`AsyncDdp::join`].
+/// Trained parameters and buffers returned by [`DdpHandle::join()`].
 ///
 /// Contains the averaged final state from all workers. Parameters are on CPU.
 /// Buffers include running statistics (e.g. BatchNorm mean/var) needed for inference.
@@ -136,7 +162,7 @@ pub enum ApplyPolicy {
     /// ElChe auto-tunes the averaging interval based on observed parameter
     /// divergence. Starts conservative (K=1), backs off as convergence
     /// stabilizes. Tightens again if replicas drift apart. Best throughput,
-    /// requires monitoring. Pair with [`AsyncDdpConfig::with_max_batch_diff`]
+    /// requires monitoring. Pair with [`DdpRunConfig::with_max_batch_diff`]
     /// for a safety bound.
     Async,
 }
@@ -178,11 +204,11 @@ pub enum AverageBackend {
     Cpu,
 }
 
-/// Configuration for [`AsyncDdp`] tuning knobs.
+/// Configuration for framework-managed DDP training.
 ///
 /// All fields have sensible defaults. Use the builder methods to customize.
 #[derive(Clone, Debug)]
-pub struct AsyncDdpConfig {
+pub struct DdpRunConfig {
     /// ElChe overhead target (fraction of compute time). Default: 0.10.
     pub overhead_target: Option<f64>,
     /// Maximum anchor count (gradient staleness limit). Default: 200.
@@ -202,16 +228,16 @@ pub struct AsyncDdpConfig {
     pub snapshot_timeout_secs: u64,
 }
 
-impl Default for AsyncDdpConfig {
+impl Default for DdpRunConfig {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AsyncDdpConfig {
+impl DdpRunConfig {
     /// Create a default config (all defaults).
     pub fn new() -> Self {
-        AsyncDdpConfig {
+        DdpRunConfig {
             overhead_target: None,
             max_anchor: None,
             anchor: None,
@@ -445,6 +471,7 @@ fn make_partition(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::nn::Module;
@@ -1391,22 +1418,22 @@ mod tests {
 
     #[test]
     fn test_async_ddp_config_max_batch_diff() {
-        let config = AsyncDdpConfig::new().with_max_batch_diff(5);
+        let config = DdpRunConfig::new().with_max_batch_diff(5);
         assert_eq!(config.max_batch_diff, Some(5));
 
-        let config2 = AsyncDdpConfig::new();
+        let config2 = DdpRunConfig::new();
         assert_eq!(config2.max_batch_diff, None);
     }
 
     // -----------------------------------------------------------------------
-    // AsyncDdp tests
+    // DdpHandle / DdpBuilder tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_async_ddp_single_gpu_fallback() {
         // With <2 GPUs, auto() falls back to single-device training.
         // With 2+ GPUs, it uses all of them. Either way, join succeeds.
-        let ddp = AsyncDdp::auto(
+        let ddp = DdpHandle::auto(
             |dev| Linear::on_device(4, 2, dev),
             |params| crate::nn::SGD::new(params, 0.01, 0.0),
             mse_train,
@@ -1431,7 +1458,7 @@ mod tests {
             return;
         }
 
-        let ddp = AsyncDdp::auto(
+        let ddp = DdpHandle::auto(
             |dev| Linear::on_device(4, 2, dev),
             |params| crate::nn::SGD::new(params, 0.01, 0.0),
             mse_train,
@@ -1452,17 +1479,17 @@ mod tests {
     #[test]
     fn test_async_ddp_send_sync() {
         fn assert_send<T: Send>() {}
-        assert_send::<AsyncDdp>();
+        assert_send::<DdpHandle>();
         assert_send::<TrainedState>();
     }
 
     // -----------------------------------------------------------------------
-    // AsyncDdpBuilder tests
+    // DdpBuilder builder tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_builder_with_defaults() {
-        let ddp = AsyncDdp::builder(
+        let ddp = DdpHandle::builder(
             |dev| Linear::on_device(4, 2, dev),
             |params| crate::nn::SGD::new(params, 0.01, 0.0),
             mse_train,
@@ -1481,7 +1508,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_all_options() {
-        let ddp = AsyncDdp::builder(
+        let ddp = DdpHandle::builder(
             |dev| Linear::on_device(4, 2, dev),
             |params| crate::nn::SGD::new(params, 0.01, 0.0),
             mse_train,
@@ -1506,7 +1533,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "dataset is required")]
     fn test_builder_missing_dataset_panics() {
-        let _ = AsyncDdp::builder(
+        let _ = DdpHandle::builder(
             |dev| Linear::on_device(4, 2, dev),
             |params| crate::nn::SGD::new(params, 0.01, 0.0),
             mse_train,
@@ -1519,7 +1546,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "batch_size is required")]
     fn test_builder_missing_batch_size_panics() {
-        let _ = AsyncDdp::builder(
+        let _ = DdpHandle::builder(
             |dev| Linear::on_device(4, 2, dev),
             |params| crate::nn::SGD::new(params, 0.01, 0.0),
             mse_train,
@@ -1532,7 +1559,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "num_epochs is required")]
     fn test_builder_missing_num_epochs_panics() {
-        let _ = AsyncDdp::builder(
+        let _ = DdpHandle::builder(
             |dev| Linear::on_device(4, 2, dev),
             |params| crate::nn::SGD::new(params, 0.01, 0.0),
             mse_train,
@@ -1540,6 +1567,102 @@ mod tests {
         .dataset(Arc::new(TestDataset { n: 100 }))
         .batch_size(4)
         .run();
+    }
+
+    // -----------------------------------------------------------------------
+    // epoch_fn tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_worker_current_epoch_accessor() {
+        let (mut worker, _ch) = make_test_worker();
+        assert_eq!(worker.current_epoch(), 0);
+        worker.advance_epoch();
+        assert_eq!(worker.current_epoch(), 1);
+    }
+
+    #[test]
+    fn test_worker_set_lr() {
+        let (mut worker, _ch) = make_test_worker();
+        // set_lr should not panic; we verify it works by running a train step after
+        worker.set_lr(0.1);
+        let opts = test_opts();
+        let batch = vec![
+            Tensor::randn(&[4, 4], opts).unwrap(),
+            Tensor::randn(&[4, 2], opts).unwrap(),
+        ];
+        let (loss, _) = worker.train_step(&batch, &mse_train).unwrap();
+        assert!(loss > 0.0);
+    }
+
+    #[test]
+    fn test_epoch_fn_called_per_epoch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let epochs_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter_c = counter.clone();
+        let epochs_c = epochs_seen.clone();
+
+        let num_epochs = 3;
+        let ddp = DdpHandle::builder(
+            |dev| Linear::on_device(4, 2, dev),
+            |params| crate::nn::SGD::new(params, 0.01, 0.0),
+            mse_train,
+        )
+        .dataset(Arc::new(TestDataset { n: 100 }))
+        .batch_size(4)
+        .num_epochs(num_epochs)
+        .backend(AverageBackend::Cpu)
+        .epoch_fn(move |epoch, worker| {
+            counter_c.fetch_add(1, Ordering::Relaxed);
+            epochs_c.lock().unwrap().push(epoch);
+            // Verify current_epoch matches the callback argument
+            assert_eq!(worker.current_epoch(), epoch);
+        })
+        .run()
+        .unwrap();
+
+        let world = ddp.world_size();
+        let _state = ddp.join().unwrap();
+        // epoch_fn fires once per epoch per worker
+        assert_eq!(counter.load(Ordering::Relaxed), num_epochs * world);
+        let mut seen = epochs_seen.lock().unwrap().clone();
+        seen.sort();
+        // Each worker sees [0, 1, 2]; with N workers we get N copies
+        let mut expected: Vec<usize> = (0..num_epochs).cycle().take(num_epochs * world).collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn test_epoch_fn_set_lr() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_c = call_count.clone();
+
+        let ddp = DdpHandle::builder(
+            |dev| Linear::on_device(4, 2, dev),
+            |params| crate::nn::SGD::new(params, 0.01, 0.0),
+            mse_train,
+        )
+        .dataset(Arc::new(TestDataset { n: 100 }))
+        .batch_size(4)
+        .num_epochs(3)
+        .backend(AverageBackend::Cpu)
+        .epoch_fn(move |epoch, worker| {
+            // Simulate a LR schedule: decrease LR each epoch
+            let lr = 0.01 * (1.0 - epoch as f64 * 0.3);
+            worker.set_lr(lr);
+            call_count_c.fetch_add(1, Ordering::Relaxed);
+        })
+        .run()
+        .unwrap();
+
+        let world = ddp.world_size();
+        let _state = ddp.join().unwrap();
+        assert_eq!(call_count.load(Ordering::Relaxed), 3 * world);
     }
 
     #[test]
@@ -1729,7 +1852,7 @@ mod tests {
         let log = make_loss_tracker();
         let log_clone = log.clone();
 
-        let ddp = AsyncDdp::auto(
+        let ddp = DdpHandle::auto(
             |dev| Linear::on_device(4, 2, dev),
             |params| crate::nn::SGD::new(params, 0.01, 0.0),
             move |model: &Linear, batch: &[Tensor]| {
@@ -2222,7 +2345,7 @@ mod tests {
 
     #[test]
     fn test_config_defaults() {
-        let cfg = AsyncDdpConfig::new();
+        let cfg = DdpRunConfig::new();
         assert!(cfg.overhead_target.is_none());
         assert!(cfg.max_anchor.is_none());
         assert!(cfg.anchor.is_none());
@@ -2231,7 +2354,7 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let cfg = AsyncDdpConfig::new()
+        let cfg = DdpRunConfig::new()
             .with_overhead_target(0.05)
             .with_max_anchor(100)
             .with_anchor(20)

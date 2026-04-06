@@ -1,4 +1,4 @@
-//! AsyncDdp orchestrator: spawns GPU worker threads and a coordinator thread.
+//! DDP run-mode orchestrator: spawns GPU worker threads and a coordinator thread.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,14 +12,14 @@ use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
 use super::{
-    ApplyPolicy, AverageBackend, AsyncDdpConfig, CheckpointFn,
+    ApplyPolicy, AverageBackend, DdpRunConfig, CheckpointFn, EpochFn,
     TrainedState, TimingMsg, WorkerConfig,
 };
 use super::worker::GpuWorker;
 use super::coordinator::Coordinator;
 
 // ---------------------------------------------------------------------------
-// AsyncDdp orchestrator
+// DDP run-mode orchestrator
 // ---------------------------------------------------------------------------
 
 /// Async DDP orchestrator: spawns GPU worker threads and a coordinator thread.
@@ -28,21 +28,20 @@ use super::coordinator::Coordinator;
 /// triggers periodic parameter averaging based on [`ApplyPolicy`] and
 /// [`AverageBackend`]. Workers self-manage their epochs.
 ///
-/// Use [`AsyncDdp::builder`] for the full configuration API, or [`AsyncDdp::auto`]
-/// for a quick start with defaults.
+/// Use [`Ddp::builder()`](crate::nn::Ddp::builder) for the full configuration API.
 ///
 /// # Quick start
 ///
 /// ```ignore
 /// use flodl::*;
 ///
-/// let ddp = AsyncDdp::builder(model_factory, optim_factory, train_fn)
+/// let handle = Ddp::builder(model_factory, optim_factory, train_fn)
 ///     .dataset(dataset)
 ///     .batch_size(32)
 ///     .num_epochs(10)
 ///     .run()?;                // non-blocking: spawns threads, returns immediately
 ///
-/// let state = ddp.join()?;   // blocks until training completes
+/// let state = handle.join()?;   // blocks until training completes
 /// // state.params / state.buffers contain the averaged trained tensors (CPU)
 /// ```
 ///
@@ -53,7 +52,7 @@ use super::coordinator::Coordinator;
 ///
 /// **Heterogeneous GPUs (mixed generations, different VRAM):**
 /// `Cadence` + `Nccl`. ElChe assigns more batches to the fast GPU. Consider
-/// [`with_max_batch_diff`](AsyncDdpConfig::with_max_batch_diff) as a safety guard.
+/// [`with_max_batch_diff`](DdpRunConfig::with_max_batch_diff) as a safety guard.
 ///
 /// **Maximum throughput (large models, expensive batches):**
 /// `Async` + `Nccl`. Auto-tunes averaging interval. Monitor loss curves.
@@ -66,7 +65,7 @@ use super::coordinator::Coordinator;
 /// With fewer than 2 CUDA devices, training runs on the main thread with no
 /// coordinator or averaging. The API is identical; [`join`](Self::join) returns
 /// a [`TrainedState`] in both cases.
-pub struct AsyncDdp {
+pub struct DdpHandle {
     worker_handles: Vec<std::thread::JoinHandle<Result<()>>>,
     coordinator_handle: Option<std::thread::JoinHandle<Result<TrainedState>>>,
     devices: Vec<Device>,
@@ -78,11 +77,12 @@ pub struct AsyncDdp {
     final_state: Option<TrainedState>,
 }
 
-impl AsyncDdp {
+impl DdpHandle {
     /// Detect GPUs, spawn worker threads and coordinator thread with default config.
     ///
-    /// See [`auto_with`](Self::auto_with) for the full parameter set.
+    /// Prefer [`Ddp::builder()`](crate::nn::Ddp::builder) as the primary entry point.
     #[allow(clippy::too_many_arguments)]
+    #[deprecated(since = "0.3.0", note = "Use Ddp::builder() instead")]
     pub fn auto<F, M, G, O, T>(
         model_factory: F,
         optim_factory: G,
@@ -100,27 +100,19 @@ impl AsyncDdp {
         O: Optimizer + 'static,
         T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
     {
+        #[allow(deprecated)]
         Self::auto_with(
             model_factory, optim_factory, train_fn,
             dataset, batch_size, num_epochs,
-            policy, backend, AsyncDdpConfig::new(),
+            policy, backend, DdpRunConfig::new(),
         )
     }
 
     /// Detect GPUs, spawn worker threads and coordinator thread.
     ///
-    /// - `model_factory` creates a model on the given device (called once per GPU thread).
-    /// - `optim_factory` creates an optimizer for a model's parameters.
-    /// - `train_fn` receives `(&M, &[Tensor])` and returns the scalar loss Variable.
-    ///   The worker handles backward, optimizer step, and zero_grad.
-    /// - `dataset` is shared across workers (Arc, indexed by partition).
-    /// - `num_epochs` controls how many epochs each worker trains before stopping.
-    /// - `config` tunes ElChe and divergence monitoring parameters.
-    ///
-    /// With 2+ CUDA devices, spawns one thread per GPU and a coordinator.
-    /// With 0-1 CUDA devices, runs training on the single available device
-    /// (no threads, no coordinator, no averaging).
+    /// Prefer [`Ddp::builder()`](crate::nn::Ddp::builder) as the primary entry point.
     #[allow(clippy::too_many_arguments)]
+    #[deprecated(since = "0.3.0", note = "Use Ddp::builder() instead")]
     pub fn auto_with<F, M, G, O, T>(
         model_factory: F,
         optim_factory: G,
@@ -130,7 +122,7 @@ impl AsyncDdp {
         num_epochs: usize,
         policy: ApplyPolicy,
         backend: AverageBackend,
-        config: AsyncDdpConfig,
+        config: DdpRunConfig,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -142,7 +134,7 @@ impl AsyncDdp {
         Self::launch(
             model_factory, optim_factory, train_fn,
             dataset, batch_size, num_epochs,
-            policy, backend, config, None,
+            policy, backend, config, None, None,
         )
     }
 
@@ -157,8 +149,9 @@ impl AsyncDdp {
         num_epochs: usize,
         policy: ApplyPolicy,
         backend: AverageBackend,
-        config: AsyncDdpConfig,
+        config: DdpRunConfig,
         checkpoint_fn: Option<CheckpointFn<M>>,
+        epoch_fn: Option<EpochFn<M>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -179,10 +172,11 @@ impl AsyncDdp {
                 dataset, batch_size, num_epochs, dev,
                 checkpoint_fn.as_ref().cloned(),
                 config.checkpoint_every,
+                epoch_fn,
             );
         }
 
-        // Print device summary (same style as Ddp::auto)
+        // Print device summary (same style as Ddp::setup)
         Self::print_summary(&devices, &policy, &backend);
 
         // Step 1: Create temp model on device[0] to extract initial params
@@ -358,6 +352,7 @@ impl AsyncDdp {
             let p_tx = param_tx_main.clone();
             let fp_tx = worker_final_txs.remove(0);
             let ckpt_fn = checkpoint_fn.clone();
+            let epoch_fn_w = epoch_fn.clone();
             let shutdown_w = shutdown.clone();
 
             let worker_nccl = rank_comms[rank].take();
@@ -406,6 +401,9 @@ impl AsyncDdp {
                             if shutdown_w.load(Ordering::Relaxed) {
                                 break;
                             }
+                            if let Some(ref f) = epoch_fn_w {
+                                f(worker.current_epoch(), &mut worker);
+                            }
                             if worker.run_epoch(&*tf)? {
                                 break; // Shutdown received
                             }
@@ -450,7 +448,7 @@ impl AsyncDdp {
         drop(metrics_tx_main);
         drop(param_tx_main);
 
-        Ok(AsyncDdp {
+        Ok(DdpHandle {
             worker_handles,
             coordinator_handle: Some(coordinator_handle),
             devices: devices.to_vec(),
@@ -475,6 +473,7 @@ impl AsyncDdp {
         device: Device,
         checkpoint_fn: Option<CheckpointFn<M>>,
         checkpoint_every: Option<usize>,
+        epoch_fn: Option<EpochFn<M>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M>,
@@ -529,6 +528,9 @@ impl AsyncDdp {
 
         // Train directly on this thread
         for epoch in 0..num_epochs {
+            if let Some(ref f) = epoch_fn {
+                f(worker.current_epoch(), &mut worker);
+            }
             worker.run_epoch(train_fn)?;
             // Single-GPU checkpoint: version = epoch number (monotonic)
             if let (Some(every), Some(f)) = (checkpoint_every, &checkpoint_fn) {
@@ -551,7 +553,7 @@ impl AsyncDdp {
                 .collect::<Result<Vec<_>>>()?,
         };
 
-        Ok(AsyncDdp {
+        Ok(DdpHandle {
             worker_handles: Vec::new(),
             coordinator_handle: None,
             devices: vec![device],
@@ -641,7 +643,7 @@ impl AsyncDdp {
         Err(first_err.unwrap_or_else(|| TensorError::new("join: no trained state available")))
     }
 
-    /// Print device summary to stderr (same style as Ddp::auto).
+    /// Print device summary to stderr (same style as Ddp::setup).
     fn print_summary(devices: &[Device], policy: &ApplyPolicy, backend: &AverageBackend) {
         use crate::tensor::{cuda_device_name_idx, cuda_memory_info_idx};
         use crate::monitor::format_bytes;
@@ -686,12 +688,12 @@ impl AsyncDdp {
 }
 
 // ---------------------------------------------------------------------------
-// AsyncDdpBuilder
+// DdpBuilder
 // ---------------------------------------------------------------------------
 
-/// Builder for configuring and launching async DDP training.
+/// Builder for configuring and launching framework-managed DDP training.
 ///
-/// Created via [`AsyncDdp::builder`]. Required fields must be set before
+/// Created via [`Ddp::builder()`](crate::nn::Ddp::builder). Required fields must be set before
 /// calling [`run`](Self::run); missing fields produce a clear panic message.
 ///
 /// # Example
@@ -699,7 +701,7 @@ impl AsyncDdp {
 /// ```ignore
 /// use flodl::*;
 ///
-/// let ddp = AsyncDdp::builder(
+/// let handle = Ddp::builder(
 ///     |dev| model_factory(dev),
 ///     |params| Adam::new(params, 0.001),
 ///     |model, batch| { /* return loss Variable */ },
@@ -711,9 +713,9 @@ impl AsyncDdp {
 /// .backend(AverageBackend::Nccl)
 /// .run()?;
 ///
-/// let state = ddp.join()?; // blocks until training completes
+/// let state = handle.join()?; // blocks until training completes
 /// ```
-pub struct AsyncDdpBuilder<F, M, G, O, T>
+pub struct DdpBuilder<F, M, G, O, T>
 where
     F: Fn(Device) -> Result<M> + Send + Sync + 'static,
     M: Module + 'static,
@@ -729,12 +731,13 @@ where
     num_epochs: Option<usize>,
     policy: ApplyPolicy,
     backend: AverageBackend,
-    config: AsyncDdpConfig,
+    config: DdpRunConfig,
     checkpoint_fn: Option<CheckpointFn<M>>,
+    epoch_fn: Option<EpochFn<M>>,
     _phantom: PhantomData<(M, O)>,
 }
 
-impl<F, M, G, O, T> AsyncDdpBuilder<F, M, G, O, T>
+impl<F, M, G, O, T> DdpBuilder<F, M, G, O, T>
 where
     F: Fn(Device) -> Result<M> + Send + Sync + 'static,
     M: Module + 'static,
@@ -822,20 +825,40 @@ where
         self
     }
 
+    /// Set an epoch callback called at the start of each epoch inside each worker thread.
+    ///
+    /// Receives `(epoch, &mut GpuWorker<M>)`. Runs before [`run_epoch`](GpuWorker::run_epoch),
+    /// so [`current_epoch()`](GpuWorker::current_epoch) is already correct.
+    ///
+    /// Typical uses: learning rate schedules, noise curricula, dynamic loss weights.
+    ///
+    /// ```text
+    /// .epoch_fn(move |epoch, worker| {
+    ///     worker.set_lr(scheduler.lr(epoch));
+    /// })
+    /// ```
+    pub fn epoch_fn<E>(mut self, f: E) -> Self
+    where
+        E: Fn(usize, &mut GpuWorker<M>) + Send + Sync + 'static,
+    {
+        self.epoch_fn = Some(Arc::new(f));
+        self
+    }
+
     /// Launch training. Non-blocking: spawns threads and returns immediately.
     ///
-    /// Call [`AsyncDdp::join`] to block until training completes and retrieve
+    /// Call [`DdpHandle::join`] to block until training completes and retrieve
     /// the trained parameters and buffers.
     ///
     /// # Panics
     ///
     /// Panics if `dataset`, `batch_size`, or `num_epochs` were not set.
-    pub fn run(self) -> Result<AsyncDdp> {
-        let dataset = self.dataset.expect("AsyncDdpBuilder: dataset is required");
-        let batch_size = self.batch_size.expect("AsyncDdpBuilder: batch_size is required");
-        let num_epochs = self.num_epochs.expect("AsyncDdpBuilder: num_epochs is required");
+    pub fn run(self) -> Result<DdpHandle> {
+        let dataset = self.dataset.expect("DdpBuilder: dataset is required");
+        let batch_size = self.batch_size.expect("DdpBuilder: batch_size is required");
+        let num_epochs = self.num_epochs.expect("DdpBuilder: num_epochs is required");
 
-        AsyncDdp::launch(
+        DdpHandle::launch(
             self.model_factory,
             self.optim_factory,
             self.train_fn,
@@ -846,20 +869,22 @@ where
             self.backend,
             self.config,
             self.checkpoint_fn,
+            self.epoch_fn,
         )
     }
 }
 
-impl AsyncDdp {
-    /// Create a builder for configuring async DDP training.
+impl DdpHandle {
+    /// Create a builder for configuring framework-managed DDP training.
     ///
-    /// The three required closures are provided here. Dataset, batch size,
-    /// and epoch count must be set on the builder before calling [`run`](AsyncDdpBuilder::run).
+    /// Prefer [`Ddp::builder()`](crate::nn::Ddp::builder) as the primary entry point.
+    /// This method exists for backward compatibility.
+    #[deprecated(since = "0.3.0", note = "Use Ddp::builder() instead")]
     pub fn builder<F, M, G, O, T>(
         model_factory: F,
         optim_factory: G,
         train_fn: T,
-    ) -> AsyncDdpBuilder<F, M, G, O, T>
+    ) -> DdpBuilder<F, M, G, O, T>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
         M: Module + 'static,
@@ -867,7 +892,23 @@ impl AsyncDdp {
         O: Optimizer + 'static,
         T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
     {
-        AsyncDdpBuilder {
+        Self::new_builder(model_factory, optim_factory, train_fn)
+    }
+
+    /// Internal builder constructor, called by [`Ddp::builder()`](crate::nn::Ddp::builder).
+    pub(crate) fn new_builder<F, M, G, O, T>(
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+    ) -> DdpBuilder<F, M, G, O, T>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        DdpBuilder {
             model_factory,
             optim_factory,
             train_fn,
@@ -876,14 +917,15 @@ impl AsyncDdp {
             num_epochs: None,
             policy: ApplyPolicy::Cadence,
             backend: AverageBackend::Nccl,
-            config: AsyncDdpConfig::new(),
+            config: DdpRunConfig::new(),
             checkpoint_fn: None,
+            epoch_fn: None,
             _phantom: PhantomData,
         }
     }
 }
 
-impl Drop for AsyncDdp {
+impl Drop for DdpHandle {
     fn drop(&mut self) {
         // Signal shutdown if not already joined
         self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

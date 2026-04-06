@@ -257,6 +257,16 @@ impl<M: Module> GpuWorker<M> {
         self.current_version
     }
 
+    /// Current epoch number (0-based).
+    pub fn current_epoch(&self) -> usize {
+        self.current_epoch
+    }
+
+    /// Set the learning rate on this worker's optimizer.
+    pub fn set_lr(&mut self, lr: f64) {
+        self.optimizer.set_lr(lr);
+    }
+
     /// A reference to the concrete model.
     pub fn model(&self) -> &M {
         &self.model

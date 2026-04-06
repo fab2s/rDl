@@ -55,7 +55,7 @@ pub mod cuda_event;
 pub mod cuda_stream;
 pub mod nccl;
 pub mod ddp;
-pub mod async_ddp;
+pub mod ddp_run;
 pub mod functional;
 
 pub use parameter::Parameter;
@@ -111,7 +111,10 @@ pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
 pub use ddp::{Ddp, DdpConfig, ElChe};
-pub use async_ddp::{ApplyPolicy, AsyncDdp, AsyncDdpBuilder, AsyncDdpConfig, AverageBackend, TrainedState};
+pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState};
+// Deprecated aliases
+#[allow(deprecated)]
+pub use ddp_run::{AsyncDdp, AsyncDdpBuilder, AsyncDdpConfig};
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

@@ -1,4 +1,4 @@
-# Tutorial 12: Async DDP
+# Tutorial 12: DDP Builder
 
 Thread-per-GPU training with Local SGD. Each GPU runs its own optimizer
 independently; a lightweight coordinator triggers periodic parameter
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 let dataset: Arc<dyn BatchDataSet> = Arc::new(MyDataset::new());
 
-let ddp = AsyncDdp::builder(
+let ddp = Ddp::builder(
     |dev| MyModel::on_device(dev),              // model factory
     |params| Adam::new(params, 0.001),          // optimizer factory
     |model, batch| {                            // train function
@@ -64,7 +64,7 @@ multi-GPU server with zero code changes.
 All configuration is done through the builder before calling `.run()`:
 
 ```rust
-let ddp = AsyncDdp::builder(model_factory, optim_factory, train_fn)
+let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
     .dataset(dataset)                      // required
     .batch_size(32)                        // required
     .num_epochs(10)                        // required
@@ -194,7 +194,7 @@ workload.
 1. Fix your seed, dataset, model, and policy. Train with `Nccl`:
 
 ```rust
-let ddp = AsyncDdp::builder(model_factory, optim_factory, train_fn)
+let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
     .dataset(dataset.clone())
     .batch_size(32)
     .num_epochs(10)
@@ -207,7 +207,7 @@ let nccl_state = ddp.join()?;
 2. Same everything, swap the backend:
 
 ```rust
-let ddp = AsyncDdp::builder(model_factory, optim_factory, train_fn)
+let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
     .dataset(dataset.clone())
     .batch_size(32)
     .num_epochs(10)
@@ -270,7 +270,7 @@ Controls how aggressively the averaging interval adapts:
 
 ### NCCL abort handles
 
-If a worker dies mid-collective (e.g., OOM), `AsyncDdp` calls
+If a worker dies mid-collective (e.g., OOM), `DdpHandle` calls
 `ncclCommAbort` on all communicators, unblocking surviving workers instead
 of letting them hang forever. Also triggered in `Drop`.
 
@@ -281,7 +281,7 @@ If not all worker snapshots arrive within `snapshot_timeout_secs` (default
 are drained, and the coordinator retries on the next cycle.
 
 ```rust
-AsyncDdpConfig::new().with_snapshot_timeout(10)  // 10 seconds
+DdpRunConfig::new().with_snapshot_timeout(10)  // 10 seconds
 ```
 
 ## Checkpointing
@@ -289,7 +289,7 @@ AsyncDdpConfig::new().with_snapshot_timeout(10)  // 10 seconds
 Save checkpoints at regular intervals during training:
 
 ```rust
-let ddp = AsyncDdp::builder(model_factory, optim_factory, train_fn)
+let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
     .dataset(dataset)
     .batch_size(32)
     .num_epochs(100)
@@ -333,26 +333,24 @@ The worker handles everything after the loss is returned: `backward()`,
 
 | Type | Description |
 |------|-------------|
-| `AsyncDdp` | Orchestrator: spawns workers + coordinator |
-| `AsyncDdpBuilder` | Fluent builder for configuration |
-| `AsyncDdpConfig` | Configuration struct with builder methods |
+| `DdpHandle` | Orchestrator: spawns workers + coordinator |
+| `DdpBuilder` | Fluent builder for configuration |
+| `DdpRunConfig` | Configuration struct with builder methods |
 | `ApplyPolicy` | Sync / Cadence / Async |
 | `AverageBackend` | Nccl / Cpu |
 | `TrainedState` | Final params + buffers (CPU tensors) |
 | `CheckpointFn<M>` | `Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>` |
 
-### AsyncDdp methods
+### DdpHandle methods
 
 | Method | Description |
 |--------|-------------|
-| `AsyncDdp::builder(model_fn, optim_fn, train_fn)` | Create builder |
-| `AsyncDdp::auto(...)` | Quick-start with all args |
-| `AsyncDdp::auto_with(..., config)` | Quick-start with config |
+| `Ddp::builder(model_fn, optim_fn, train_fn)` | Create builder |
 | `.join()` | Block until done, return TrainedState |
 | `.world_size()` | Number of GPUs |
 | `.devices()` | Device list |
 
-### AsyncDdpConfig methods
+### DdpRunConfig methods
 
 | Method | Default | Description |
 |--------|---------|-------------|

@@ -371,7 +371,7 @@ Two approaches, one goal: scale to every GPU you have.
 
 ```rust
 // Detect GPUs, replicate model, set optimizer, enable training
-Ddp::auto(&model, &builder, |p| Adam::new(p, 0.001))?;
+Ddp::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
 
 // Training loop is IDENTICAL for 1 or N GPUs
 for batch in model.epoch(0) {
@@ -380,10 +380,10 @@ for batch in model.epoch(0) {
 }
 ```
 
-**Async DDP** -- thread-per-GPU, works with any `Module`:
+**DDP Builder** -- thread-per-GPU, works with any `Module`:
 
 ```rust
-let state = AsyncDdp::builder(model_factory, optim_factory, train_fn)
+let state = Ddp::builder(model_factory, optim_factory, train_fn)
     .dataset(dataset)
     .batch_size(32)
     .num_epochs(10)
@@ -393,12 +393,12 @@ let state = AsyncDdp::builder(model_factory, optim_factory, train_fn)
     .join()?;
 ```
 
-| | Graph DDP | Async DDP |
+| | Graph DDP | DDP Builder |
 |---|---|---|
 | **Works with** | `Graph` builder | Any `Module` |
 | **GPU model** | Scatter per batch | Thread per GPU (Local SGD) |
 | **Mixed GPUs** | El Che auto-enabled | `ApplyPolicy` x `AverageBackend` |
-| **Setup** | One line (`Ddp::auto`) | Builder pattern |
+| **Setup** | One line (`Ddp::setup`) | Builder pattern |
 | **Dashboard** | Integrated | Stderr logging |
 
 **A/B testing**: swap `AverageBackend::Nccl` for `AverageBackend::Cpu`
@@ -406,7 +406,7 @@ with one line. If loss curves match, you have validated the cheaper
 backend for your workload.
 
 See the **[Multi-GPU Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/11-multi-gpu.md)**,
-**[Async DDP Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md)**, and
+**[DDP Builder Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md)**, and
 **[DDP Reference](https://github.com/fab2s/floDl/blob/main/docs/ddp.md)**.
 
 ## PyTorch Parity
@@ -537,8 +537,8 @@ codegen-units = 1
 
 | Component | What it does |
 |-----------|-------------|
-| `Ddp::auto` | One-liner: detect GPUs, distribute, set optimizer, train |
-| `AsyncDdp::builder` | Thread-per-GPU with Local SGD, any Module |
+| `Ddp::setup` | One-liner: detect GPUs, distribute, set optimizer, train |
+| `Ddp::builder` | Thread-per-GPU with Local SGD, any Module |
 | `ApplyPolicy` | Sync / Cadence / Async (when to average) |
 | `AverageBackend` | Nccl / Cpu (how to average, A/B testable) |
 | `ElChe` | Heterogeneous GPU cadence strategy |
@@ -572,7 +572,7 @@ supports. If `nvidia-smi` works, floDl trains on it.
 | **New to Rust** | [Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes |
 | **Know Rust, new to DL** | [Tensors](https://github.com/fab2s/floDl/blob/main/docs/tutorials/01-tensors.md) then [Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/04-training.md) |
 | **Know PyTorch** | [Migration Guide](https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md) then [Graph Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/05-graph-builder.md) |
-| **Scaling to multi-GPU** | [Multi-GPU Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/11-multi-gpu.md) then [Async DDP](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md) |
+| **Scaling to multi-GPU** | [Multi-GPU Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/11-multi-gpu.md) then [DDP Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md) |
 | **Just show me code** | [`quickstart`](https://github.com/fab2s/floDl/tree/main/flodl/examples/quickstart/) or [`showcase`](https://github.com/fab2s/floDl/tree/main/flodl/examples/showcase/) |
 
 ### Tutorials
@@ -588,8 +588,8 @@ supports. If `nvidia-smi` works, floDl trains on it.
 8. **[Utilities](https://github.com/fab2s/floDl/blob/main/docs/tutorials/08-utilities.md)** — checkpoints, clipping, freezing, initialization, scheduling
 9. **[Training Monitor](https://github.com/fab2s/floDl/blob/main/docs/tutorials/09-monitor.md)** — ETA, resource tracking, live dashboard
 10. **[Graph Tree](https://github.com/fab2s/floDl/blob/main/docs/tutorials/10-graph-tree.md)** — hierarchical composition, freeze/thaw, subgraph checkpoints
-11. **[Multi-GPU Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/11-multi-gpu.md)** — Ddp::auto, El Che, auto-balancing, DataLoader integration
-12. **[Async DDP](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md)** — thread-per-GPU, Local SGD, A/B testable backends
+11. **[Multi-GPU Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/11-multi-gpu.md)** — Ddp::setup, El Che, auto-balancing, DataLoader integration
+12. **[DDP Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md)** — thread-per-GPU, Local SGD, A/B testable backends
 
 ### Examples
 

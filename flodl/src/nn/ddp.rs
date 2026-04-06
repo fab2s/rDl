@@ -1,21 +1,21 @@
 //! Distributed Data Parallel (DDP) for transparent multi-GPU training.
 //!
-//! Three usage levels:
+//! `Ddp` is the single entry point for all multi-GPU training modes:
 //!
-//! **One-liner (recommended)**: [`Ddp::auto()`] detects GPUs, distributes the
-//! model, sets the optimizer, and enables training mode in a single call.
-//! Works transparently with 1 or N GPUs.
+//! **Setup mode** ([`Ddp::setup()`]): Distributes a Graph across GPUs. You write
+//! the training loop. Works transparently with 1 or N GPUs.
 //!
-//! **Transparent (via Graph)**: Call `model.distribute()`, `set_optimizer()`,
-//! and `set_training()` separately for finer control over setup.
+//! **Builder mode** ([`Ddp::builder()`]): Framework-managed training. Provide
+//! factories and a train function, the framework handles threads, data pipeline,
+//! epochs, and parameter averaging. Returns a [`DdpHandle`] to join.
 //!
-//! **Manual (via Ddp)**: For complex training patterns (GAN, RL, progressive).
-//! Explicit control over gradient sync and parameter broadcast.
+//! **Manual mode** ([`Ddp::wrap()`]): Low-level explicit control over gradient
+//! sync and parameter broadcast for complex patterns (GAN, RL, progressive).
 //!
-//! # One-liner setup
+//! # Setup mode (user owns the loop)
 //!
 //! ```ignore
-//! Ddp::auto(&model, |dev| build_model(dev), |p| Adam::new(&p, 0.001))?;
+//! Ddp::setup(&model, |dev| build_model(dev), |p| Adam::new(&p, 0.001))?;
 //!
 //! // Training loop is identical for 1 or N GPUs:
 //! for (x, y) in &train_loader {
@@ -26,12 +26,16 @@
 //! }
 //! ```
 //!
-//! # Transparent mode (separate calls)
+//! # Builder mode (framework owns the loop)
 //!
 //! ```ignore
-//! model.distribute(|dev| build_model(dev))?;
-//! model.set_optimizer(|p| Adam::new(&p, 0.001));
-//! model.set_training(true);
+//! let handle = Ddp::builder(model_factory, optim_factory, train_fn)
+//!     .dataset(dataset)
+//!     .batch_size(32)
+//!     .num_epochs(10)
+//!     .run()?;
+//!
+//! let state = handle.join()?;
 //! ```
 //!
 //! # Manual mode
@@ -48,7 +52,9 @@ use crate::graph::Graph;
 use crate::nn::{Buffer, Module, Optimizer, Parameter};
 use crate::nn::cuda_event::CudaEvent;
 use crate::nn::nccl::{NcclComms, ReduceOp};
+use crate::nn::ddp_run::{DdpBuilder, DdpHandle};
 use crate::tensor::{Device, Result, Tensor, TensorError};
+
 
 /// Shared lock for serializing NCCL communicator creation across test modules.
 /// NCCL init is a collective operation that deadlocks if two tests try to
@@ -542,7 +548,7 @@ impl Ddp {
     /// Always prints a diagnostic summary to stderr showing detected hardware.
     ///
     /// ```ignore
-    /// Ddp::auto(&model, |dev| build_model(dev), |p| Adam::new(&p, 0.001))?;
+    /// Ddp::setup(&model, |dev| build_model(dev), |p| Adam::new(&p, 0.001))?;
     ///
     /// // Training loop is identical for 1 or N GPUs:
     /// for batch in model.epoch(epoch).activate() {
@@ -551,7 +557,7 @@ impl Ddp {
     ///     model.step()?;
     /// }
     /// ```
-    pub fn auto<F, M, G, O>(
+    pub fn setup<F, M, G, O>(
         model: &Graph,
         builder: F,
         optimizer: G,
@@ -577,14 +583,14 @@ impl Ddp {
 
     /// One-call setup with explicit configuration.
     ///
-    /// Like [`auto()`](Self::auto) but accepts a [`DdpConfig`] for
+    /// Like [`setup()`](Self::setup) but accepts a [`DdpConfig`] for
     /// controlling El Che cadence, speed hints, and overhead targets.
     ///
     /// ```ignore
-    /// Ddp::auto_with(&model, builder, optimizer,
+    /// Ddp::setup_with(&model, builder, optimizer,
     ///     DdpConfig::new().speed_hint(1, 2.3))?;
     /// ```
-    pub fn auto_with<F, M, G, O>(
+    pub fn setup_with<F, M, G, O>(
         model: &Graph,
         builder: F,
         optimizer: G,
@@ -602,6 +608,91 @@ impl Ddp {
         model.set_training(true);
         model.configure_el_che(&config);
         Ok(())
+    }
+
+    /// Deprecated: renamed to [`setup()`](Self::setup).
+    #[deprecated(since = "0.3.0", note = "Renamed to Ddp::setup()")]
+    pub fn auto<F, M, G, O>(
+        model: &Graph,
+        builder: F,
+        optimizer: G,
+    ) -> Result<()>
+    where
+        F: Fn(Device) -> Result<M>,
+        M: Module + 'static,
+        G: Fn(Vec<Parameter>) -> O,
+        O: Optimizer + 'static,
+    {
+        Self::setup(model, builder, optimizer)
+    }
+
+    /// Deprecated: renamed to [`setup_with()`](Self::setup_with).
+    #[deprecated(since = "0.3.0", note = "Renamed to Ddp::setup_with()")]
+    pub fn auto_with<F, M, G, O>(
+        model: &Graph,
+        builder: F,
+        optimizer: G,
+        config: DdpConfig,
+    ) -> Result<()>
+    where
+        F: Fn(Device) -> Result<M>,
+        M: Module + 'static,
+        G: Fn(Vec<Parameter>) -> O,
+        O: Optimizer + 'static,
+    {
+        Self::setup_with(model, builder, optimizer, config)
+    }
+
+    // -------------------------------------------------------------------
+    // Builder mode: framework-managed training
+    // -------------------------------------------------------------------
+
+    /// Create a builder for framework-managed multi-GPU training.
+    ///
+    /// The framework owns the training loop, data pipeline, and epoch management.
+    /// Each GPU gets its own model replica and optimizer. A coordinator triggers
+    /// periodic parameter averaging based on the configured [`ApplyPolicy`] and
+    /// [`AverageBackend`].
+    ///
+    /// Returns a [`DdpBuilder`] for fluent configuration. Call `.run()` to
+    /// spawn training threads, then `.join()` on the returned [`DdpHandle`]
+    /// to block until completion.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use flodl::*;
+    ///
+    /// let handle = Ddp::builder(
+    ///     |dev| model_factory(dev),
+    ///     |params| Adam::new(params, 0.001),
+    ///     |model, batch| { /* forward + loss */ },
+    /// )
+    /// .dataset(dataset)
+    /// .batch_size(32)
+    /// .num_epochs(10)
+    /// .policy(ApplyPolicy::Cadence)
+    /// .backend(AverageBackend::Nccl)
+    /// .run()?;
+    ///
+    /// let state = handle.join()?;
+    /// ```
+    ///
+    /// With fewer than 2 CUDA devices, training runs on the main thread
+    /// with no coordination. The API is identical in both cases.
+    pub fn builder<F, M, G, O, T>(
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+    ) -> DdpBuilder<F, M, G, O, T>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        DdpHandle::new_builder(model_factory, optim_factory, train_fn)
     }
 
     /// Detect whether the current CUDA setup has different GPU models.
@@ -668,13 +759,13 @@ impl Ddp {
 // DDP configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration for [`Ddp::auto_with`].
+/// Configuration for [`Ddp::setup_with()`].
 ///
 /// Controls El Che cadence behavior for heterogeneous multi-GPU training.
 /// Use [`DdpConfig::new()`] for defaults or build with method chaining.
 ///
 /// ```ignore
-/// Ddp::auto_with(&model, builder, optimizer,
+/// Ddp::setup_with(&model, builder, optimizer,
 ///     DdpConfig::new()
 ///         .speed_hint(1, 2.3)     // rank 1 is slow, 2.3x ratio
 ///         .overhead_target(0.08)  // tune to 8% overhead
@@ -1566,7 +1657,7 @@ mod tests {
 
     #[test]
     fn test_ddp_auto_single_gpu() {
-        // On multi-GPU hardware Ddp::auto would initialize NCCL,
+        // On multi-GPU hardware Ddp::setup would initialize NCCL,
         // which poisons CUBLAS for concurrent tests. Skip here;
         // multi-GPU path is validated in test_ddp_auto_multi_gpu.
         if cuda_device_count() >= 2 {
@@ -1582,7 +1673,7 @@ mod tests {
             .build()
             .unwrap();
 
-        Ddp::auto(
+        Ddp::setup(
             &model,
             |dev| {
                 FlowBuilder::from(Linear::on_device(4, 8, dev)?)
@@ -1630,7 +1721,7 @@ mod tests {
         .build()
         .unwrap();
 
-        Ddp::auto(
+        Ddp::setup(
             &model,
             |dev| {
                 FlowBuilder::from(Linear::on_device(4, 8, dev)?)
@@ -2119,7 +2210,7 @@ mod tests {
         .build()
         .unwrap();
 
-        Ddp::auto_with(
+        Ddp::setup_with(
             &model,
             |dev| {
                 FlowBuilder::from(Linear::on_device(4, 8, dev)?)
@@ -2203,7 +2294,7 @@ mod tests {
         .build()
         .unwrap();
 
-        Ddp::auto_with(
+        Ddp::setup_with(
             &model,
             |dev| {
                 FlowBuilder::from(Linear::on_device(4, 8, dev)?)

@@ -1041,7 +1041,7 @@ impl Graph {
     /// AllReduce + optimizer step + zero_grad.
     ///
     /// For a one-liner that also sets the optimizer and training mode, see
-    /// [`Ddp::auto()`](crate::nn::Ddp::auto).
+    /// [`Ddp::setup()`](crate::nn::Ddp::setup).
     ///
     /// ```ignore
     /// model.distribute(|dev| build_model(dev))?;
@@ -1368,7 +1368,7 @@ impl Graph {
 
     /// Configure El Che cadence for distributed training.
     ///
-    /// Called by [`Ddp::auto_with`] after [`distribute`](Graph::distribute).
+    /// Called by [`Ddp::setup_with()`] after [`distribute`](Graph::distribute).
     /// No-op if not in distributed mode.
     pub(crate) fn configure_el_che(&self, config: &crate::nn::ddp::DdpConfig) {
         let mut dist = self.distributed.borrow_mut();

@@ -2,7 +2,7 @@
 
 Comprehensive reference for floDl's multi-GPU training capabilities.
 For progressive introductions, see [Tutorial 11: Multi-GPU Training](tutorials/11-multi-gpu.md)
-and [Tutorial 12: Async DDP](tutorials/12-async-ddp.md).
+and [Tutorial 12: DDP Builder](tutorials/12-async-ddp.md).
 
 ## Overview
 
@@ -11,10 +11,10 @@ backend and ElChe cadence strategy, but differ in how they integrate with
 your model:
 
 **Graph DDP** -- integrates with the Graph builder. One-liner setup via
-`Ddp::auto()`. The training loop is identical for 1 or N GPUs. Best for
+`Ddp::setup()`. The training loop is identical for 1 or N GPUs. Best for
 Graph-based models where you want transparent scaling.
 
-**Async DDP** -- works with any `Module`. Thread-per-GPU with Local SGD.
+**DDP Builder** -- works with any `Module`. Thread-per-GPU with Local SGD.
 Provides `ApplyPolicy` x `AverageBackend` for fine-grained control and
 A/B testing. Best for non-Graph modules or when you need maximum
 configurability.
@@ -23,17 +23,17 @@ configurability.
 
 ```
 Using the Graph builder?
-  YES --> Graph DDP (Ddp::auto)
-  NO  --> Async DDP (AsyncDdp::builder)
+  YES --> Graph DDP (Ddp::setup)
+  NO  --> DDP Builder (Ddp::builder)
 
 Need A/B testing NCCL vs CPU averaging?
-  YES --> Async DDP
+  YES --> DDP Builder
 
 Need per-GPU thread independence (different epochs, fault tolerance)?
-  YES --> Async DDP
+  YES --> DDP Builder
 
 Want the simplest possible setup?
-  YES --> Graph DDP (Ddp::auto)
+  YES --> Graph DDP (Ddp::setup)
 ```
 
 Both approaches auto-detect available CUDA devices and fall back to
@@ -43,7 +43,7 @@ single-GPU/CPU mode when fewer than 2 GPUs are available.
 
 ## Graph DDP
 
-### Ddp::auto()
+### Ddp::setup()
 
 One-liner to auto-detect GPUs, distribute the model, set per-replica
 optimizers, and enable training mode.
@@ -58,7 +58,7 @@ let model = FlowBuilder::new()
     .build("classifier")?;
 
 // Single call: detect GPUs, replicate, set optimizer, training mode
-Ddp::auto(&model, &builder, |p| Adam::new(p, 0.001))?;
+Ddp::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
 
 // Training loop -- identical for 1 or N GPUs
 for epoch in 0..100 {
@@ -79,9 +79,9 @@ Prints hardware diagnostics to stderr:
 - 1 CUDA device: sets optimizer + training mode, no distribution
 - CPU only: same as single device
 
-### Ddp::auto_with()
+### Ddp::setup_with()
 
-Same as `auto()` but accepts a `DdpConfig` for explicit configuration:
+Same as `setup()` but accepts a `DdpConfig` for explicit configuration:
 
 ```rust
 let config = DdpConfig::new()
@@ -89,12 +89,12 @@ let config = DdpConfig::new()
     .overhead_target(0.10)     // keep AllReduce < 10% of compute
     .max_anchor(Some(200));    // gradient staleness cap
 
-Ddp::auto_with(&model, &builder, |p| Adam::new(p, 0.001), config)?;
+Ddp::setup_with(&model, &builder, |p| Adam::new(p, 0.001), config)?;
 ```
 
 ### Graph::distribute()
 
-Called internally by `Ddp::auto()`. Can also be called directly for
+Called internally by `Ddp::setup()`. Can also be called directly for
 manual setup:
 
 ```rust
@@ -232,15 +232,15 @@ per-device batch counts.
 
 ---
 
-## Async DDP
+## DDP Builder
 
-### AsyncDdp::builder()
+### Ddp::builder()
 
 Recommended entry point. Returns a builder that launches training
 non-blocking:
 
 ```rust
-let ddp = AsyncDdp::builder(
+let ddp = Ddp::builder(
     |dev| MyModel::on_device(dev),              // model factory
     |params| Adam::new(params, 0.001),          // optimizer factory
     |model, batch| {                            // train function
@@ -264,16 +264,18 @@ let state = ddp.join()?;                        // blocks until done
 `Rc<RefCell<...>>` types (Variable, Buffer) are not Send, so they must be
 constructed inside each thread. The factories are called once per GPU.
 
-### AsyncDdp::auto() / auto_with()
+### Ddp::builder() quick-start
 
-Quick-start alternatives that take all arguments directly:
+All arguments can be passed directly via the builder:
 
 ```rust
-let ddp = AsyncDdp::auto(
-    model_factory, optim_factory, train_fn,
-    dataset, 32, 10,
-    ApplyPolicy::Cadence, AverageBackend::Nccl,
-)?;
+let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
+    .dataset(dataset)
+    .batch_size(32)
+    .num_epochs(10)
+    .policy(ApplyPolicy::Cadence)
+    .backend(AverageBackend::Nccl)
+    .run()?;
 ```
 
 ### Builder methods
@@ -355,7 +357,7 @@ Idle --> Collecting --> Computing --> Idle
 
 ### TrainedState
 
-Returned by `AsyncDdp::join()`:
+Returned by `DdpHandle::join()`:
 
 ```rust
 pub struct TrainedState {
@@ -370,7 +372,7 @@ snapshot's tensors.
 
 ### Single-GPU fallback
 
-With fewer than 2 CUDA devices, `AsyncDdp` runs training on the main
+With fewer than 2 CUDA devices, `DdpHandle` runs training on the main
 thread. No worker threads, no coordinator, no averaging. The API is
 identical: `join()` returns `TrainedState`. This means you can develop on a
 laptop and deploy to a multi-GPU server with zero code changes.
@@ -608,7 +610,7 @@ hardware.
 **Cause**: One worker died mid-collective. Surviving workers are stuck in
 AllReduce waiting for the dead rank.
 
-**Fix**: `AsyncDdp` handles this automatically via `NcclAbortHandle`. For
+**Fix**: `DdpHandle` handles this automatically via `NcclAbortHandle`. For
 manual DDP, call `abort_handle.abort()` on all communicators when a worker
 fails.
 
@@ -619,25 +621,25 @@ fails.
 **Cause**: Heterogeneous GPUs with different VRAM. The smaller GPU cannot
 fit the same batch size.
 
-**Fix**: Use El Che (auto-enabled by `Ddp::auto()` for heterogeneous
+**Fix**: Use El Che (auto-enabled by `Ddp::setup()` for heterogeneous
 hardware). It assigns fewer batches to the slower/smaller GPU. Or use
-`AsyncDdp` with `Cadence` policy, which naturally partitions data
+`Ddp::builder` with `Cadence` policy, which naturally partitions data
 proportionally. The DataLoader's per-device backend selection also helps:
 the large GPU can go resident while the small GPU streams.
 
 ### CPU averaging timeout
 
-**Error**: `async-ddp: CPU averaging timeout, missing ranks: [1]`
+**Error**: `ddp-run: CPU averaging timeout, missing ranks: [1]`
 
 **Cause**: A worker is not responding to `RequestParams` within the
 timeout window (default 5 seconds).
 
 **Fix**: Check if the worker is stuck in a long computation. Increase
-the timeout via `.with_snapshot_timeout(10)` on `AsyncDdpConfig`, or
+the timeout via `.with_snapshot_timeout(10)` on `DdpRunConfig`, or
 investigate why the worker is unresponsive. Repeated timeouts (check
 `coordinator.abort_count()`) indicate a persistently sick worker.
 
 ---
 
-Previous: [Tutorial 12: Async DDP](tutorials/12-async-ddp.md) |
+Previous: [Tutorial 12: DDP Builder](tutorials/12-async-ddp.md) |
 Next: [PyTorch Migration Guide](pytorch_migration.md)

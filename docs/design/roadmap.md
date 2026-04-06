@@ -291,8 +291,8 @@ padding modules, `Unfold`/`Fold`
 ## Phase 11: Multi-GPU Training -- DONE
 
 - **Data loading**: `DataSet` and `BatchDataSet` traits, `DataLoader` with resident/streaming/distributed modes, VRAM-aware prefetch, `Sampler` trait
-- **Graph DDP**: `Ddp::auto()` one-liner. Transparent scatter/gather, AllReduce, per-replica optimizers. `Graph::step()` handles the full sync cycle.
-- **Async DDP**: `AsyncDdp::builder()` for thread-per-GPU Local SGD. `ApplyPolicy` (Sync/Cadence/Async) x `AverageBackend` (Nccl/Cpu) for A/B testing.
+- **Graph DDP**: `Ddp::setup()` one-liner. Transparent scatter/gather, AllReduce, per-replica optimizers. `Graph::step()` handles the full sync cycle.
+- **DDP Builder**: `Ddp::builder()` for thread-per-GPU Local SGD. `ApplyPolicy` (Sync/Cadence/Async) x `AverageBackend` (Nccl/Cpu) for A/B testing.
 - **El Che**: heterogeneous GPU cadence strategy. Slow device anchors sync, fast device fills wall time. Auto-tunes from CudaEvent timing.
 - **NCCL bindings**: `NcclComms`, `NcclRankComm` (init-on-main + split), `NcclAbortHandle` for dead worker recovery.
 - **CUDA primitives**: `CudaEvent`, `CudaStream`, `StreamGuard` for async GPU-CPU pipeline.
