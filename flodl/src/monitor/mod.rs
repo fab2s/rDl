@@ -148,6 +148,39 @@ impl<'a, const N: usize> Metrics for (&'a Graph, &'a [(&'a str, f64); N]) {
     }
 }
 
+/// DDP builder epoch metrics: feeds `record_scalar` data and per-GPU
+/// throughput/batch share into the Monitor.
+///
+/// ```ignore
+/// while let Some(m) = handle.next_metrics() {
+///     monitor.log(m.epoch, Duration::from_millis(m.epoch_ms as u64), &m);
+/// }
+/// ```
+impl Metrics for &crate::nn::EpochMetrics {
+    fn into_metrics(self) -> Vec<(String, f64)> {
+        let mut out = Vec::with_capacity(self.scalars.len() + 1);
+        out.push(("loss".to_string(), self.avg_loss));
+        // Deterministic order: sort by key
+        let mut keys: Vec<&String> = self.scalars.keys().collect();
+        keys.sort();
+        for k in keys {
+            out.push((k.clone(), self.scalars[k]));
+        }
+        out
+    }
+
+    fn gpu_metrics(&self) -> Vec<GpuMetrics> {
+        self.device_indices.iter().enumerate().map(|(i, &dev)| {
+            GpuMetrics {
+                device_index: dev,
+                throughput: self.per_rank_throughput.get(i).copied().unwrap_or(0.0),
+                chunk_ratio: self.per_rank_batch_share.get(i).copied().unwrap_or(0.0),
+                shard_size: 0, // not tracked per-epoch in builder mode
+            }
+        }).collect()
+    }
+}
+
 /// Training monitor with ETA, resource tracking, and optional live dashboard.
 pub struct Monitor {
     total_epochs: usize,
@@ -189,6 +222,13 @@ impl Monitor {
         let srv = server::DashboardServer::start(port)?;
         eprintln!("  dashboard: http://localhost:{}", port);
         srv.set_hardware(self.hardware.clone());
+
+        // Sample GPU hardware for immediate tab init (before epoch 1)
+        let init_sample = self.sampler.sample();
+        if init_sample.gpus.len() >= 2 {
+            srv.set_gpu_init(Self::gpu_init_json(&init_sample.gpus));
+        }
+
         self.server = Some(srv);
         Ok(())
     }
@@ -583,9 +623,15 @@ impl Monitor {
 
         let hw_js = format!("\"{}\"", self.hardware.replace('\\', "\\\\").replace('"', "\\\""));
 
+        // GPU init from first epoch's resource data
+        let gpu_init_js = self.epochs.first()
+            .filter(|e| e.resources.gpus.len() >= 2)
+            .map(|e| Self::gpu_init_json(&e.resources.gpus))
+            .unwrap_or_else(|| "null".to_string());
+
         // Inject archive constants before the main <script> tag
         let archive_block = format!(
-            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\n</script>",
+            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n</script>",
             data_json,
             svg_js,
             format_eta(total_time),
@@ -593,6 +639,7 @@ impl Monitor {
             hash_js,
             meta_js,
             hw_js,
+            gpu_init_js,
         );
 
         let template = include_str!("dashboard.html");
@@ -677,6 +724,27 @@ impl Monitor {
             b.push('}');
         }
         b.push(']');
+    }
+
+    /// Serialize GPU hardware info as a JSON array for dashboard init.
+    /// Minimal format: `[{"dev":0,"name":"...","vram_total":...}, ...]`
+    fn gpu_init_json(gpus: &[resources::GpuSnapshot]) -> String {
+        use std::fmt::Write;
+        let mut b = String::from("[");
+        for (i, gpu) in gpus.iter().enumerate() {
+            if i > 0 { b.push(','); }
+            b.push('{');
+            let _ = write!(b, "\"dev\":{}", gpu.device_index);
+            if !gpu.name.is_empty() {
+                let _ = write!(b, ",\"name\":\"{}\"", gpu.name);
+            }
+            if let Some(total) = gpu.vram_total_bytes {
+                let _ = write!(b, ",\"vram_total\":{}", total);
+            }
+            b.push('}');
+        }
+        b.push(']');
+        b
     }
 
     /// Write metric values to a JSON buffer, replacing NaN/Infinity with null.

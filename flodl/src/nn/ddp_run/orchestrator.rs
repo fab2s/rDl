@@ -75,6 +75,8 @@ pub struct DdpHandle {
     nccl_abort_handles: Vec<Arc<nccl::NcclAbortHandle>>,
     /// For single-GPU mode: final state captured inline during run_single().
     final_state: Option<TrainedState>,
+    /// Receiver for aggregated epoch metrics from the coordinator.
+    metrics_rx: Option<mpsc::Receiver<super::EpochMetrics>>,
 }
 
 impl DdpHandle {
@@ -238,6 +240,15 @@ impl DdpHandle {
             el_che = el_che.with_max_batch_diff(diff);
         }
 
+        // Step 3b: Create epoch metrics channel (coordinator -> main thread)
+        let (epoch_metrics_tx, epoch_metrics_rx) = mpsc::channel();
+
+        // Device indices for coordinator GPU metrics
+        let coord_device_indices: Vec<u8> = devices.iter().map(|d| match d {
+            Device::CUDA(idx) => *idx,
+            _ => 0,
+        }).collect();
+
         // Step 4: Spawn coordinator thread
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_coord = shutdown.clone();
@@ -255,7 +266,9 @@ impl DdpHandle {
                     policy, backend,
                     world_size, total_samples, el_che,
                 )
-                .snapshot_timeout_secs(snap_timeout);
+                .snapshot_timeout_secs(snap_timeout)
+                .epoch_metrics_tx(epoch_metrics_tx)
+                .device_indices(coord_device_indices);
                 if let Some(dt) = div_threshold {
                     builder = builder.divergence_threshold(dt);
                 }
@@ -455,6 +468,7 @@ impl DdpHandle {
             shutdown,
             nccl_abort_handles,
             final_state: None,
+            metrics_rx: Some(epoch_metrics_rx),
         })
     }
 
@@ -560,6 +574,7 @@ impl DdpHandle {
             shutdown: Arc::new(AtomicBool::new(true)),
             nccl_abort_handles: Vec::new(),
             final_state: Some(final_state),
+            metrics_rx: None,
         })
     }
 
@@ -571,6 +586,32 @@ impl DdpHandle {
     /// Devices in use.
     pub fn devices(&self) -> &[Device] {
         &self.devices
+    }
+
+    /// Non-blocking: drain all available aggregated epoch metrics.
+    ///
+    /// Returns an empty Vec if no metrics have been recorded (either no
+    /// [`record_scalar()`](super::record_scalar) calls in `train_fn`,
+    /// or single-GPU mode where the coordinator is absent).
+    pub fn poll_metrics(&self) -> Vec<super::EpochMetrics> {
+        match &self.metrics_rx {
+            Some(rx) => {
+                let mut out = Vec::new();
+                while let Ok(m) = rx.try_recv() {
+                    out.push(m);
+                }
+                out
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Blocking: wait for the next epoch's aggregated metrics.
+    ///
+    /// Returns `None` when training ends (coordinator drops the sender).
+    /// In single-GPU mode, always returns `None` immediately.
+    pub fn next_metrics(&self) -> Option<super::EpochMetrics> {
+        self.metrics_rx.as_ref().and_then(|rx| rx.recv().ok())
     }
 
     /// Abort all NCCL communicators, unblocking any stuck collective ops.

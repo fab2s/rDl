@@ -132,6 +132,14 @@ pub struct Coordinator {
     snapshot_timeout_secs: u64,
     /// Number of CPU averaging rounds aborted due to timeout.
     abort_count: usize,
+
+    // Epoch metrics aggregation
+    /// Channel to send aggregated epoch metrics to DdpHandle.
+    epoch_metrics_tx: Option<mpsc::Sender<super::EpochMetrics>>,
+    /// Buffer for collecting per-rank metrics before aggregation.
+    epoch_buffer: std::collections::HashMap<usize, Vec<MetricsMsg>>,
+    /// CUDA device index per rank (for EpochMetrics GPU data).
+    device_indices: Vec<u8>,
 }
 
 /// Builder for configuring a [`Coordinator`].
@@ -149,6 +157,8 @@ pub struct CoordinatorBuilder {
     divergence_threshold: f64,
     checkpoint_every: Option<usize>,
     snapshot_timeout_secs: u64,
+    epoch_metrics_tx: Option<mpsc::Sender<super::EpochMetrics>>,
+    device_indices: Vec<u8>,
 }
 
 impl CoordinatorBuilder {
@@ -185,6 +195,18 @@ impl CoordinatorBuilder {
         self
     }
 
+    /// Set the channel for forwarding aggregated epoch metrics to the main thread.
+    pub fn epoch_metrics_tx(mut self, tx: mpsc::Sender<super::EpochMetrics>) -> Self {
+        self.epoch_metrics_tx = Some(tx);
+        self
+    }
+
+    /// Set the CUDA device indices (one per rank).
+    pub fn device_indices(mut self, indices: Vec<u8>) -> Self {
+        self.device_indices = indices;
+        self
+    }
+
     /// Build the coordinator.
     pub fn build(self) -> Coordinator {
         Coordinator {
@@ -214,6 +236,9 @@ impl CoordinatorBuilder {
             avg_state: CpuAvgState::Idle,
             snapshot_timeout_secs: self.snapshot_timeout_secs,
             abort_count: 0,
+            epoch_metrics_tx: self.epoch_metrics_tx,
+            epoch_buffer: std::collections::HashMap::new(),
+            device_indices: self.device_indices,
         }
     }
 }
@@ -247,6 +272,8 @@ impl Coordinator {
             divergence_threshold: 0.05,
             checkpoint_every: None,
             snapshot_timeout_secs: 5,
+            epoch_metrics_tx: None,
+            device_indices: (0..world_size as u8).collect(),
         }
     }
 
@@ -341,13 +368,37 @@ impl Coordinator {
 
     /// Process all pending metrics messages (non-blocking drain).
     ///
-    /// Returns collected metrics for logging/monitoring.
+    /// Returns collected metrics for logging/monitoring. Also buffers
+    /// per-rank messages and aggregates into [`EpochMetrics`](super::EpochMetrics)
+    /// when all active ranks have reported for the same epoch.
     pub fn drain_metrics(&mut self) -> Vec<MetricsMsg> {
         let mut msgs = Vec::new();
         while let Ok(msg) = self.metrics_rx.try_recv() {
+            self.epoch_buffer.entry(msg.epoch).or_default().push(msg.clone());
             msgs.push(msg);
         }
+        self.try_aggregate_epochs();
         msgs
+    }
+
+    /// Check if any buffered epoch has reports from all active ranks.
+    /// If so, aggregate and send to the main thread.
+    fn try_aggregate_epochs(&mut self) {
+        let tx = match &self.epoch_metrics_tx {
+            Some(tx) => tx,
+            None => return,
+        };
+        let expected = self.active_count;
+        let complete: Vec<usize> = self.epoch_buffer.iter()
+            .filter(|(_, msgs)| msgs.len() >= expected)
+            .map(|(epoch, _)| *epoch)
+            .collect();
+        for epoch in complete {
+            if let Some(msgs) = self.epoch_buffer.remove(&epoch) {
+                let metrics = aggregate_epoch_metrics(epoch, &msgs, &self.device_indices);
+                let _ = tx.send(metrics);
+            }
+        }
     }
 
     /// Check if averaging should be triggered based on the current policy.
@@ -968,5 +1019,80 @@ impl Coordinator {
         for tx in &self.control_txs {
             let _ = tx.send(ControlMsg::Shutdown);
         }
+    }
+}
+
+/// Aggregate per-rank [`MetricsMsg`] into a single [`EpochMetrics`].
+///
+/// Loss and scalars are averaged weighted by batch count (proportional
+/// to each rank's contribution). Epoch time is the max across ranks.
+pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_indices: &[u8]) -> super::EpochMetrics {
+    let total_batches: usize = msgs.iter().map(|m| m.batches_processed).sum();
+
+    // Batch-weighted average loss
+    let avg_loss = if total_batches > 0 {
+        msgs.iter()
+            .map(|m| m.avg_loss * m.batches_processed as f64)
+            .sum::<f64>()
+            / total_batches as f64
+    } else {
+        0.0
+    };
+
+    // Max epoch_ms across ranks
+    let epoch_ms = msgs.iter().map(|m| m.epoch_ms).fold(0.0_f64, f64::max);
+
+    // Per-rank scalar means
+    let per_rank: Vec<std::collections::HashMap<String, f64>> = msgs
+        .iter()
+        .map(|m| {
+            m.scalars
+                .iter()
+                .map(|(k, (sum, count))| {
+                    (k.clone(), if *count > 0 { sum / *count as f64 } else { 0.0 })
+                })
+                .collect()
+        })
+        .collect();
+
+    // Weighted-average scalars across ranks
+    let mut scalars: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut weights: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for m in msgs {
+        let w = m.batches_processed as f64;
+        for (k, (sum, count)) in &m.scalars {
+            if *count > 0 {
+                let mean = sum / *count as f64;
+                *scalars.entry(k.clone()).or_default() += mean * w;
+                *weights.entry(k.clone()).or_default() += w;
+            }
+        }
+    }
+    for (k, v) in &mut scalars {
+        if let Some(w) = weights.get(k) {
+            if *w > 0.0 {
+                *v /= *w;
+            }
+        }
+    }
+
+    // Per-rank throughput (samples/ms) and batch share
+    let total_samples: usize = msgs.iter().map(|m| m.samples_processed).sum();
+    let per_rank_throughput: Vec<f64> = msgs.iter().map(|m| {
+        if m.epoch_ms > 0.0 { m.samples_processed as f64 / m.epoch_ms } else { 0.0 }
+    }).collect();
+    let per_rank_batch_share: Vec<f64> = msgs.iter().map(|m| {
+        if total_samples > 0 { m.samples_processed as f64 / total_samples as f64 } else { 0.0 }
+    }).collect();
+
+    let dev_indices = if device_indices.len() >= msgs.len() {
+        device_indices[..msgs.len()].to_vec()
+    } else {
+        (0..msgs.len() as u8).collect()
+    };
+
+    super::EpochMetrics {
+        epoch, scalars, per_rank, avg_loss, epoch_ms,
+        per_rank_throughput, per_rank_batch_share, device_indices: dev_indices,
     }
 }

@@ -69,10 +69,51 @@ pub use worker::*;
 pub use coordinator::*;
 pub use orchestrator::*;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::rng::Rng;
 use crate::tensor::{Device, Result, Tensor};
+
+// ---------------------------------------------------------------------------
+// Thread-local scalar accumulator for DDP train_fn
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static SCALAR_ACCUM: RefCell<HashMap<String, (f64, usize)>> = RefCell::new(HashMap::new());
+}
+
+/// Record a named scalar value from inside a DDP worker's `train_fn`.
+///
+/// Values are accumulated per-epoch and reported at epoch boundaries.
+/// The epoch-level value for each tag is the mean over all recorded values.
+///
+/// If called outside a DDP training context (e.g. on the main thread),
+/// the values accumulate in the thread-local but are never drained.
+///
+/// ```ignore
+/// // Inside train_fn:
+/// flodl::record_scalar("ce_loss", ce.item()?);
+/// flodl::record_scalar("kl_loss", kl.item()?);
+/// flodl::record_scalar("accuracy", acc);
+/// ```
+pub fn record_scalar(name: &str, value: f64) {
+    SCALAR_ACCUM.with(|acc| {
+        let mut map = acc.borrow_mut();
+        let entry = map.entry(name.to_string()).or_insert((0.0, 0));
+        entry.0 += value;
+        entry.1 += 1;
+    });
+}
+
+/// Drain the thread-local scalar accumulator, returning `(sum, count)` per tag.
+///
+/// Called by [`GpuWorker`] at epoch boundaries to package accumulated scalars
+/// into the [`MetricsMsg`].
+pub(crate) fn drain_scalars() -> HashMap<String, (f64, usize)> {
+    SCALAR_ACCUM.with(|acc| std::mem::take(&mut *acc.borrow_mut()))
+}
 
 
 /// Checkpoint callback type: `(version, &model) -> Result<()>`.
@@ -129,6 +170,44 @@ pub struct TrainedState {
     pub params: Vec<Tensor>,
     /// Averaged buffer tensors (CPU). Same order as `Module::buffers()`.
     pub buffers: Vec<Tensor>,
+}
+
+/// Aggregated epoch metrics from all DDP workers.
+///
+/// Available via [`DdpHandle::poll_metrics()`] and [`DdpHandle::next_metrics()`].
+/// The coordinator aggregates per-rank [`MetricsMsg`] into this structure once
+/// all ranks have reported for the same epoch.
+///
+/// # Example
+///
+/// ```ignore
+/// let handle = Ddp::builder(...).run()?;
+/// while let Some(m) = handle.next_metrics() {
+///     for (name, value) in &m.scalars {
+///         monitor.record_scalar(name, *value);
+///     }
+/// }
+/// let state = handle.join()?;
+/// ```
+#[derive(Clone, Debug)]
+pub struct EpochMetrics {
+    /// Epoch number (0-based).
+    pub epoch: usize,
+    /// Weighted-average scalar metrics across all ranks.
+    /// Each value is the batch-weighted mean.
+    pub scalars: HashMap<String, f64>,
+    /// Per-rank scalar metrics (index = rank).
+    pub per_rank: Vec<HashMap<String, f64>>,
+    /// Average loss across all ranks (batch-weighted).
+    pub avg_loss: f64,
+    /// Wall-clock epoch time (ms), max across ranks.
+    pub epoch_ms: f64,
+    /// Per-rank throughput in samples/ms (index = rank).
+    pub per_rank_throughput: Vec<f64>,
+    /// Per-rank batch share as fraction 0.0..1.0 (index = rank).
+    pub per_rank_batch_share: Vec<f64>,
+    /// CUDA device index per rank (for dashboard GPU tabs).
+    pub device_indices: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +423,11 @@ pub struct MetricsMsg {
     pub batches_processed: usize,
     /// Wall-clock time for this epoch (ms).
     pub epoch_ms: f64,
+    /// Total samples processed this epoch (batches * batch_size).
+    pub samples_processed: usize,
+    /// Named scalar metrics recorded via [`record_scalar()`] during this epoch.
+    /// Each value is `(sum, count)` for computing the mean.
+    pub scalars: HashMap<String, (f64, usize)>,
 }
 
 /// Parameter snapshot sent from a GPU worker to the coordinator (CPU averaging path only).
@@ -920,6 +1004,7 @@ mod tests {
 
         metrics_tx.send(MetricsMsg {
             rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 10, epoch_ms: 100.0,
+            samples_processed: 320, scalars: HashMap::new(),
         }).unwrap();
         let msg = ch.metrics_rx.recv().unwrap();
         assert_eq!(msg.batches_processed, 10);
@@ -1196,6 +1281,7 @@ mod tests {
 
         h.metrics_tx.send(MetricsMsg {
             rank: 0, epoch: 1, avg_loss: 0.3, batches_processed: 50, epoch_ms: 2000.0,
+            samples_processed: 1600, scalars: HashMap::new(),
         }).unwrap();
 
         let metrics = h.coord.drain_metrics();
@@ -2641,5 +2727,139 @@ mod tests {
         worker.run_epoch(&mse_train).unwrap();
         assert_eq!(worker.partition.len(), 20);
         assert_ne!(worker.partition.len(), initial_partition_len);
+    }
+
+    // -----------------------------------------------------------------------
+    // record_scalar tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_record_scalar_accumulates() {
+        // Clear any leftovers from other tests on this thread
+        drain_scalars();
+
+        record_scalar("loss", 1.0);
+        record_scalar("loss", 2.0);
+        record_scalar("loss", 3.0);
+
+        let map = drain_scalars();
+        assert_eq!(map.len(), 1);
+        let (sum, count) = map["loss"];
+        assert_eq!(sum, 6.0);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_record_scalar_multiple_tags() {
+        drain_scalars();
+
+        record_scalar("a", 1.0);
+        record_scalar("b", 2.0);
+        record_scalar("a", 3.0);
+
+        let map = drain_scalars();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["a"], (4.0, 2));
+        assert_eq!(map["b"], (2.0, 1));
+    }
+
+    #[test]
+    fn test_drain_scalars_clears() {
+        drain_scalars();
+
+        record_scalar("x", 1.0);
+        let first = drain_scalars();
+        assert_eq!(first.len(), 1);
+
+        // Second drain should be empty
+        let second = drain_scalars();
+        assert!(second.is_empty());
+
+        // New records show up in the next drain
+        record_scalar("y", 5.0);
+        let third = drain_scalars();
+        assert_eq!(third.len(), 1);
+        assert!(!third.contains_key("x"));
+        assert_eq!(third["y"], (5.0, 1));
+    }
+
+    #[test]
+    fn test_record_scalar_thread_isolation() {
+        drain_scalars();
+        record_scalar("main", 1.0);
+
+        let child_result = std::thread::spawn(|| {
+            // Child thread starts with empty accumulator
+            let empty = drain_scalars();
+            assert!(empty.is_empty());
+
+            record_scalar("child", 42.0);
+            drain_scalars()
+        }).join().unwrap();
+
+        // Child's values
+        assert_eq!(child_result.len(), 1);
+        assert_eq!(child_result["child"], (42.0, 1));
+
+        // Main thread still has its own values
+        let main_result = drain_scalars();
+        assert_eq!(main_result.len(), 1);
+        assert_eq!(main_result["main"], (1.0, 1));
+    }
+
+    #[test]
+    fn test_aggregate_epoch_metrics() {
+        use super::coordinator::aggregate_epoch_metrics;
+
+        let mut scalars_r0 = HashMap::new();
+        scalars_r0.insert("loss".to_string(), (3.0, 3_usize)); // mean = 1.0
+        scalars_r0.insert("acc".to_string(), (1.8, 3));         // mean = 0.6
+
+        let mut scalars_r1 = HashMap::new();
+        scalars_r1.insert("loss".to_string(), (4.0, 2_usize)); // mean = 2.0
+        scalars_r1.insert("acc".to_string(), (0.8, 2));         // mean = 0.4
+
+        let msgs = vec![
+            MetricsMsg {
+                rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 60,
+                epoch_ms: 1000.0, samples_processed: 1920, scalars: scalars_r0,
+            },
+            MetricsMsg {
+                rank: 1, epoch: 0, avg_loss: 0.7, batches_processed: 40,
+                epoch_ms: 1200.0, samples_processed: 1280, scalars: scalars_r1,
+            },
+        ];
+
+        let dev_indices = vec![0_u8, 1];
+        let m = aggregate_epoch_metrics(0, &msgs, &dev_indices);
+        assert_eq!(m.epoch, 0);
+
+        // Batch-weighted average loss: (0.5*60 + 0.7*40) / 100 = 0.58
+        assert!((m.avg_loss - 0.58).abs() < 1e-9);
+
+        // Max epoch_ms
+        assert_eq!(m.epoch_ms, 1200.0);
+
+        // Weighted scalar: loss = (1.0*60 + 2.0*40) / 100 = 1.4
+        assert!((m.scalars["loss"] - 1.4).abs() < 1e-9);
+
+        // Weighted scalar: acc = (0.6*60 + 0.4*40) / 100 = 0.52
+        assert!((m.scalars["acc"] - 0.52).abs() < 1e-9);
+
+        // Per-rank
+        assert_eq!(m.per_rank.len(), 2);
+        assert!((m.per_rank[0]["loss"] - 1.0).abs() < 1e-9);
+        assert!((m.per_rank[1]["loss"] - 2.0).abs() < 1e-9);
+
+        // Throughput: rank 0 = 1920/1000 = 1.92, rank 1 = 1280/1200 ~= 1.0667
+        assert!((m.per_rank_throughput[0] - 1.92).abs() < 1e-9);
+        assert!((m.per_rank_throughput[1] - 1280.0 / 1200.0).abs() < 1e-9);
+
+        // Batch share: rank 0 = 1920/3200 = 0.6, rank 1 = 1280/3200 = 0.4
+        assert!((m.per_rank_batch_share[0] - 0.6).abs() < 1e-9);
+        assert!((m.per_rank_batch_share[1] - 0.4).abs() < 1e-9);
+
+        // Device indices
+        assert_eq!(m.device_indices, vec![0, 1]);
     }
 }

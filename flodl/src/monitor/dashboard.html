@@ -250,8 +250,8 @@ function processEpoch(d){
       const idx=g.dev!=null?g.dev:0;
       const s=gpuSeries[idx];
       if(!s)return;
-      s.vram.push(g.vram_alloc||null);
-      s.throughput.push(g.throughput||null);
+      s.vram.push(g.vram_alloc!=null?g.vram_alloc:null);
+      s.throughput.push(g.throughput!=null?g.throughput:null);
       s.chunk.push(g.chunk!=null?g.chunk*100:null);
       s.util.push(g.util!=null?g.util:null);
       if(g.name&&!s.name)s.name=g.name;
@@ -349,7 +349,7 @@ function updateGpuSummary(){
     const isFastest=+idx===maxIdx&&gpuCount>1;
     const isSlowest=+idx===minIdx&&gpuCount>1&&minIdx!==maxIdx;
     html+='<div class="gpu-row'+(isFastest?' fastest':'')+(isSlowest?' slowest':'')+'">';
-    html+='<span class="gpu-name" title="'+s.name+'">GPU '+idx+'</span>';
+    html+='<span class="gpu-name" title="'+s.name+'">'+(s.name?shortGpuName(s.name):'GPU '+idx)+'</span>';
     html+='<div class="gpu-vram-bar"><div class="gpu-vram-fill" style="width:'+vramPct.toFixed(1)+'%;background:'+vramColor+'"></div></div>';
     html+='<div class="gpu-stat"><span class="gpu-stat-label">VRAM</span><span class="gpu-stat-value">'+(lastVram!=null?fmtBytes(lastVram):'\u2014')+'</span></div>';
     html+='<div class="gpu-stat"><span class="gpu-stat-label">Util</span><span class="gpu-stat-value">'+(lastUtil!=null?lastUtil.toFixed(0)+'%':'\u2014')+'</span></div>';
@@ -451,6 +451,8 @@ if(typeof LIVE_LABEL!=='undefined'||typeof LIVE_HASH!=='undefined'){
 }
 if(typeof LIVE_HARDWARE!=='undefined'){showHardware(LIVE_HARDWARE)}
 if(typeof LIVE_META!=='undefined'&&LIVE_META!==null){showMeta(LIVE_META)}
+if(typeof LIVE_GPU_INIT!=='undefined'&&LIVE_GPU_INIT!==null){initGpuTabs(LIVE_GPU_INIT)}
+if(typeof ARCHIVE_GPU_INIT!=='undefined'&&ARCHIVE_GPU_INIT!==null){initGpuTabs(ARCHIVE_GPU_INIT)}
 
 // --- Header ---
 function updateHeader(d){

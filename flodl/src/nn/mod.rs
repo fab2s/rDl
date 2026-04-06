@@ -111,7 +111,7 @@ pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
 pub use ddp::{Ddp, DdpConfig, ElChe};
-pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState};
+pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, record_scalar};
 // Deprecated aliases
 #[allow(deprecated)]
 pub use ddp_run::{AsyncDdp, AsyncDdpBuilder, AsyncDdpConfig};

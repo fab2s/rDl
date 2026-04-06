@@ -504,13 +504,19 @@ impl<M: Module> GpuWorker<M> {
     }
 
     /// Send epoch-end metrics to the coordinator.
+    ///
+    /// Drains the thread-local scalar accumulator populated by
+    /// [`record_scalar()`](super::record_scalar) calls during this epoch.
     pub fn report_epoch(&self, avg_loss: f64, batches: usize, epoch_ms: f64) -> Result<()> {
+        let scalars = super::drain_scalars();
         self.metrics_tx.send(MetricsMsg {
             rank: self.rank,
             epoch: self.current_epoch,
             avg_loss,
             batches_processed: batches,
             epoch_ms,
+            samples_processed: batches * self.batch_size,
+            scalars,
         }).map_err(|_| TensorError::new("metrics channel disconnected"))
     }
 
