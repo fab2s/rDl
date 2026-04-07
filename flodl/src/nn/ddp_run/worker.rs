@@ -210,17 +210,22 @@ impl<M: Module> GpuWorker<M> {
         // Create prefetch worker for async H2D (VRAM gauge).
         // Cap depth at 512 to avoid huge channel allocations when
         // batch_bytes is tiny (e.g. toy test datasets).
+        // Depth 0 = skip prefetch entirely (sync fallback for tight VRAM).
         let (prefetch, per_sample_bytes) = if config.device.is_cuda() {
             let sample = dataset.get_batch(&[0])?;
             let psb: usize = sample.iter().map(|t| t.nbytes()).sum();
             drop(sample);
             let depth = crate::data::prefetch_depth_from_vram(
-                psb, config.batch_size, config.device, 0.25,
+                psb, config.batch_size, config.device, 0.90,
             ).min(512);
-            let pw = crate::data::prefetch::PrefetchWorker::new(
-                Arc::clone(&dataset), config.device, depth,
-            );
-            (Some(pw), psb)
+            if depth > 0 {
+                let pw = crate::data::prefetch::PrefetchWorker::new(
+                    Arc::clone(&dataset), config.device, depth,
+                );
+                (Some(pw), psb)
+            } else {
+                (None, psb)
+            }
         } else {
             (None, 0)
         };
@@ -632,18 +637,24 @@ impl<M: Module> GpuWorker<M> {
 
         // Recalculate prefetch depth at each plan boundary (VRAM may vary).
         // Cap at num_batches: no point buffering more than the chunk contains.
-        if let Some(ref mut pw) = self.prefetch {
+        // Depth 0 means VRAM is too tight for any prefetch buffer.
+        let use_prefetch = if let Some(ref mut pw) = self.prefetch {
             let vram_depth = crate::data::prefetch_depth_from_vram(
-                self.per_sample_bytes, self.batch_size, self.device, 0.25,
+                self.per_sample_bytes, self.batch_size, self.device, 0.90,
             );
-            pw.set_prefetch_depth(vram_depth.min(num_batches));
-        }
+            let depth = vram_depth.min(num_batches);
+            pw.set_prefetch_depth(depth);
+            depth > 0
+        } else {
+            false
+        };
 
         let epoch_start = Instant::now();
         let mut total_loss = 0.0;
 
-        if let Some(ref prefetch) = self.prefetch {
-            // CUDA path: async prefetch with VRAM gauge.
+        if use_prefetch {
+            // CUDA async path: prefetch with VRAM gauge.
+            let prefetch = self.prefetch.as_ref().unwrap();
             // start_distributed_epoch creates a fresh bounded channel whose
             // capacity equals the prefetch depth (VRAM budget). The prefetch
             // thread fills it; SyncSender blocks when VRAM is full.
@@ -677,12 +688,21 @@ impl<M: Module> GpuWorker<M> {
                 }
             }
         } else {
-            // CPU path: synchronous batch loading
+            // Sync path: load one batch at a time, move to device if needed.
+            // Used for CPU devices, or CUDA when VRAM is too tight for prefetch.
             for batch_idx in 0..num_batches {
                 let start = batch_idx * self.batch_size;
                 let end = start + self.batch_size;
                 let indices = &self.partition[start..end];
                 let batch = self.dataset.get_batch(indices)?;
+
+                let batch: Vec<Tensor> = if self.device.is_cuda() {
+                    batch.into_iter()
+                        .map(|t| t.to_device(self.device))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    batch
+                };
 
                 let (loss, ms) = self.train_step(&batch, train_fn)?;
                 total_loss += loss;

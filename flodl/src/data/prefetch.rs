@@ -130,7 +130,7 @@ impl PrefetchWorker {
     /// Update prefetch depth. Takes effect on the next epoch (the channel
     /// is recreated with the new capacity in `start_epoch()`).
     pub fn set_prefetch_depth(&mut self, depth: usize) {
-        self.prefetch_depth = depth.max(1);
+        self.prefetch_depth = depth;
     }
 }
 

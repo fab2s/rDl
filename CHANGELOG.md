@@ -188,10 +188,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`TrainedState`** on partial failure: If some workers died, `collect_final_state()` averages surviving workers' snapshots. If averaging fails, falls back to the first snapshot's tensors. Returns `None` only if zero snapshots arrived.
 
 #### Adaptive Data Pipeline
-- **VRAM-aware prefetch depth**: `prefetch_depth_from_vram()` computes channel depth from free VRAM, per-sample bytes, and batch size. No manual tuning needed.
+- **VRAM-aware prefetch depth**: `prefetch_depth_from_vram()` computes prefetch budget as the gap between current VRAM usage and a configurable cap. No manual tuning needed.
 - **Bootstrap prefetch**: Initial depth of 4 batches during DataLoader construction. Real depth computed at `epoch(0)` after model is loaded and VRAM usage is stable.
-- **Per-epoch VRAM probing**: `epoch(N)` re-probes free VRAM and fills `(1 - margin)` of available space. Adapts to VRAM fragmentation and activation memory changes across epochs.
-- **`DataLoaderBuilder::vram_margin(f64)`**: Default 0.10 (10% coordination margin). Clamped to [0.01, 0.50]. User sets based on model activation overhead.
+- **Per-epoch VRAM probing**: `epoch(N)` re-probes VRAM usage and fills up to the cap. Adapts to VRAM fragmentation and activation memory changes across epochs.
+- **`DataLoaderBuilder::vram_max_usage(f64)`**: Default 0.90 (use up to 90% of total VRAM). Clamped to [0.50, 0.99]. Remaining headroom covers activations, gradients, and CUDA overhead.
 - **Manual override**: `.prefetch(n)` or `set_prefetch_depth()` disables automatic adaptation (`user_set_depth` flag).
 - **`auto_resize()`**: Manual trigger for VRAM-based resize between epochs.
 

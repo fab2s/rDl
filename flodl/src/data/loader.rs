@@ -18,9 +18,9 @@ use super::sampler::{RandomSampler, Sampler, SequentialSampler};
 use super::{Batch, BatchDataSet, DataSet, DataSetAdapter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
-/// VRAM headroom: fraction of free memory considered usable for resident data.
-/// Reserves 25% for model parameters, gradients, activations, and CUDA overhead.
-const VRAM_HEADROOM: f64 = 0.75;
+/// Default fraction of total VRAM to use. Reserves 10% for activations,
+/// gradients, and CUDA allocator overhead.
+const VRAM_MAX_USAGE: f64 = 0.90;
 
 /// Check whether the full dataset fits in VRAM (or RAM for CPU).
 ///
@@ -36,9 +36,11 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
     let idx = device.index() as i32;
 
     match crate::tensor::cuda_memory_info_idx(idx) {
-        Ok((free, _total)) => {
-            let usable = (free as f64 * VRAM_HEADROOM) as u64;
-            total_bytes < usable
+        Ok((free, total)) => {
+            let used = total.saturating_sub(free);
+            let cap = (total as f64 * VRAM_MAX_USAGE) as u64;
+            let budget = cap.saturating_sub(used);
+            total_bytes < budget
         }
         Err(_) => false, // can't probe -> assume won't fit
     }
@@ -49,19 +51,19 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
 /// at `epoch()` time when free VRAM reflects actual model allocation.
 const BOOTSTRAP_PREFETCH: usize = 4;
 
-/// Compute prefetch depth from free VRAM and margin.
+/// Compute prefetch depth from VRAM usage cap.
 ///
-/// `margin` is the fraction to keep free (default 0.10 = 10%). The
-/// margin covers activation memory, gradients, and CUDA allocator
-/// overhead.
+/// `max_usage` is the fraction of **total** VRAM to use (default 0.90).
+/// The prefetch budget is the gap between current usage and the cap,
+/// leaving room for activations, gradients, and CUDA allocator overhead.
 ///
 /// Called at each `epoch()` boundary. By that point the model, optimizer,
-/// and any other allocations are done, so free VRAM is the real budget.
+/// and any other allocations are done, so current usage is the real baseline.
 pub(crate) fn prefetch_depth_from_vram(
     per_sample_bytes: usize,
     batch_size: usize,
     device: Device,
-    margin: f64,
+    max_usage: f64,
 ) -> usize {
     if !device.is_cuda() {
         return 2; // CPU: just double-buffer
@@ -73,12 +75,14 @@ pub(crate) fn prefetch_depth_from_vram(
     }
 
     let idx = device.index() as i32;
-    let free = crate::tensor::cuda_memory_info_idx(idx)
-        .map(|(free, _)| free)
-        .unwrap_or(0) as usize;
+    let (free, total) = crate::tensor::cuda_memory_info_idx(idx)
+        .unwrap_or((0, 0));
 
-    let budget = (free as f64 * (1.0 - margin)) as usize;
-    (budget / batch_bytes).max(2)
+    let used = (total as usize).saturating_sub(free as usize);
+    let cap = (total as f64 * max_usage.clamp(0.5, 0.99)) as usize;
+    let budget = cap.saturating_sub(used);
+
+    budget / batch_bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +101,7 @@ pub struct DataLoaderBuilder {
     drop_last: bool,
     force_streaming: bool,
     names: Option<Vec<String>>,
-    vram_margin: f64,
+    vram_max_usage: f64,
 }
 
 impl DataLoaderBuilder {
@@ -112,7 +116,7 @@ impl DataLoaderBuilder {
             drop_last: true,
             force_streaming: false,
             names: None,
-            vram_margin: 0.10,
+            vram_max_usage: 0.90,
         }
     }
 
@@ -174,18 +178,17 @@ impl DataLoaderBuilder {
         self
     }
 
-    /// VRAM safety margin for prefetch buffer (streaming mode).
+    /// Maximum fraction of total VRAM to use for prefetch (streaming mode).
     ///
-    /// Default: 0.10 (10%). At each `epoch()` call, the loader probes
-    /// free VRAM and fills `(1 - margin)` of it with prefetch batches.
-    /// The margin covers activation memory, gradients, and CUDA allocator
-    /// overhead during training.
+    /// Default: 0.90 (use up to 90% of total VRAM). At each `epoch()` call,
+    /// the loader probes current VRAM usage and fills the gap between that
+    /// usage and the cap with prefetch batches. The remaining headroom covers
+    /// activation memory, gradients, and CUDA allocator overhead.
     ///
-    /// The real VRAM budget is computed at `epoch()` time (not `build()`),
-    /// so the model can be loaded in any order. The worker fills the
-    /// channel progressively.
-    pub fn vram_margin(mut self, margin: f64) -> Self {
-        self.vram_margin = margin.clamp(0.01, 0.50);
+    /// The budget is computed at `epoch()` time (not `build()`), so the model
+    /// can be loaded in any order. Clamped to `[0.50, 0.99]`.
+    pub fn vram_max_usage(mut self, max_usage: f64) -> Self {
+        self.vram_max_usage = max_usage.clamp(0.50, 0.99);
         self
     }
 
@@ -258,7 +261,7 @@ impl DataLoaderBuilder {
             drop_last,
             force_streaming,
             names,
-            vram_margin,
+            vram_max_usage,
         } = self;
 
         let n = dataset.len();
@@ -315,12 +318,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(n))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_margin, user_set_depth, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, names)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_margin, user_set_depth, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, names)
         }
     }
 }
@@ -376,7 +379,7 @@ fn build_streaming(
     drop_last: bool,
     prefetch_depth: usize,
     per_sample_bytes: usize,
-    vram_margin: f64,
+    vram_max_usage: f64,
     user_set_depth: bool,
     names: Vec<String>,
 ) -> Result<DataLoader> {
@@ -392,7 +395,7 @@ fn build_streaming(
             worker,
             names,
             per_sample_bytes,
-            vram_margin,
+            vram_max_usage,
             user_set_depth,
         }),
     })
@@ -600,7 +603,7 @@ impl DataLoader {
         match &mut self.inner {
             LoaderInner::Resident(_) => 0,
             LoaderInner::Streaming(l) => {
-                let depth = prefetch_depth_from_vram(l.per_sample_bytes, l.batch_size, l.device, l.vram_margin);
+                let depth = prefetch_depth_from_vram(l.per_sample_bytes, l.batch_size, l.device, l.vram_max_usage);
                 l.worker.set_prefetch_depth(depth);
                 l.user_set_depth = true;
                 depth
@@ -610,7 +613,7 @@ impl DataLoader {
                 let mut max_depth = 0;
                 for backend in &mut l.backends {
                     if let DeviceBackend::Streaming { worker, device, per_sample_bytes } = backend {
-                        let depth = prefetch_depth_from_vram(*per_sample_bytes, bs, *device, 0.10);
+                        let depth = prefetch_depth_from_vram(*per_sample_bytes, bs, *device, VRAM_MAX_USAGE);
                         worker.set_prefetch_depth(depth);
                         max_depth = max_depth.max(depth);
                     }
@@ -797,8 +800,8 @@ pub(crate) struct StreamingLoader {
     names: Vec<String>,
     /// Per-sample bytes (for adaptive resize depth calculation).
     per_sample_bytes: usize,
-    /// VRAM safety margin for adaptive prefetch (fraction to keep free).
-    vram_margin: f64,
+    /// Maximum fraction of total VRAM to use for prefetch.
+    vram_max_usage: f64,
     /// True when the user explicitly set depth (`.prefetch()` or `set_prefetch_depth()`).
     /// Skips automatic adaptation so we don't override the user's choice.
     user_set_depth: bool,
@@ -806,12 +809,12 @@ pub(crate) struct StreamingLoader {
 
 impl StreamingLoader {
     fn epoch(&mut self, epoch: usize) -> EpochIterator<'_> {
-        // Probe free VRAM and size the prefetch buffer to fill (1 - margin).
+        // Probe VRAM usage and size the prefetch buffer to fill up to cap.
         // At epoch 0 this is the real signal: model is loaded, VRAM is known.
         // At epoch N>0: re-probe in case conditions changed.
         if !self.user_set_depth {
             let depth = prefetch_depth_from_vram(
-                self.per_sample_bytes, self.batch_size, self.device, self.vram_margin,
+                self.per_sample_bytes, self.batch_size, self.device, self.vram_max_usage,
             );
             self.worker.set_prefetch_depth(depth);
         }
@@ -2289,19 +2292,19 @@ mod tests {
     #[test]
     fn test_prefetch_depth_from_vram_cpu() {
         // CPU always returns 2 (double-buffer)
-        let depth = prefetch_depth_from_vram(100, 32, Device::CPU, 0.10);
+        let depth = prefetch_depth_from_vram(100, 32, Device::CPU, 0.90);
         assert_eq!(depth, 2);
     }
 
     #[test]
     fn test_prefetch_depth_from_vram_zero_batch() {
-        let depth = prefetch_depth_from_vram(0, 32, Device::CPU, 0.10);
+        let depth = prefetch_depth_from_vram(0, 32, Device::CPU, 0.90);
         assert_eq!(depth, 2);
     }
 
     #[test]
     fn test_prefetch_depth_from_vram_zero_bytes() {
-        let depth = prefetch_depth_from_vram(100, 0, Device::CPU, 0.10);
+        let depth = prefetch_depth_from_vram(100, 0, Device::CPU, 0.90);
         assert_eq!(depth, 2);
     }
 
@@ -2395,11 +2398,11 @@ mod tests {
     }
 
     #[test]
-    fn test_vram_margin_builder() {
+    fn test_vram_max_usage_builder() {
         let data = SequentialData { n: 100 };
         let loader = DataLoader::from_dataset(data)
             .batch_size(10)
-            .vram_margin(0.05) // 5% margin
+            .vram_max_usage(0.80) // 80% of total VRAM
             .streaming()
             .build()
             .unwrap();
@@ -2409,12 +2412,12 @@ mod tests {
     }
 
     #[test]
-    fn test_vram_margin_clamped() {
+    fn test_vram_max_usage_clamped() {
         let data = SequentialData { n: 100 };
-        // Extreme values get clamped to [0.01, 0.50]
+        // Extreme values get clamped to [0.50, 0.99]
         let loader = DataLoader::from_dataset(data)
             .batch_size(10)
-            .vram_margin(0.001) // below min, clamped to 0.01
+            .vram_max_usage(0.10) // below min, clamped to 0.50
             .streaming()
             .build()
             .unwrap();
