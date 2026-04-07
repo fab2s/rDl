@@ -295,6 +295,7 @@ function switchTab(id){
 
 // --- GPU tab initialization (called once on first epoch with gpus) ---
 function initGpuTabs(gpus){
+  if(gpuCount>0)return; // already initialized
   gpuCount=gpus.length;
   if(gpuCount<2)return; // single GPU: no tabs needed
   const bar=document.getElementById('tabBar');

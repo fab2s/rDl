@@ -26,7 +26,8 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
   <a href="#multi-gpu-training">Multi-GPU</a> &bull;
   <a href="#pytorch-parity">Parity</a> &bull;
   <a href="#performance">Benchmarks</a> &bull;
-  <a href="https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md">Migration Guide</a>
+  <a href="https://github.com/fab2s/floDl/blob/main/docs/pytorch_migration.md">Migration Guide</a> &bull;
+  <a href="https://github.com/fab2s/floDl/blob/main/docs/tutorials/13-data-loading.md">Data Loading</a>
 </p>
 
 ---
@@ -77,6 +78,14 @@ every op, module, and pattern.
 > **New to Rust?** Read [Rust for PyTorch Users](https://github.com/fab2s/floDl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes.
 
 ## Getting Started
+
+**With the CLI** (guided setup):
+
+```bash
+curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/fdl -o fdl && chmod +x fdl
+./fdl setup          # detect hardware, download libtorch, pick build environment
+./fdl init my-proj   # scaffold a new project
+```
 
 **With Docker** (no Rust or libtorch needed):
 
@@ -409,7 +418,8 @@ with one line. If loss curves match, you have validated the cheaper
 backend for your workload.
 
 See the **[Multi-GPU Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/11-multi-gpu.md)**,
-**[DDP Builder Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md)**, and
+**[DDP Builder Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md)**,
+**[Data Loading Tutorial](https://github.com/fab2s/floDl/blob/main/docs/tutorials/13-data-loading.md)**, and
 **[DDP Reference](https://github.com/fab2s/floDl/blob/main/docs/ddp.md)**.
 
 ## PyTorch Parity
@@ -547,7 +557,7 @@ codegen-units = 1
 | `ElChe` | Heterogeneous GPU cadence strategy |
 | `NcclComms` / `NcclRankComm` | NCCL AllReduce, Broadcast, abort handles |
 | `CudaEvent` / `CudaStream` | Async GPU-CPU pipeline, timing |
-| `DataLoader` | Resident/streaming/distributed, VRAM-aware prefetch |
+| `DataLoader` | Resident/streaming/distributed, VRAM-aware prefetch, auto OOM fallback |
 
 </details>
 
@@ -557,7 +567,7 @@ Every differentiable path is verified against finite-difference gradients:
 - 117 autograd op-level checks (every op + compositions)
 - Module-level checks (every NN module, input + parameter gradients)
 - Exact optimizer step verifications (SGD, Adam, AdamW, RMSprop, Adagrad, RAdam, NAdam)
-- 1022 library tests, zero clippy warnings — all tests run on both CPU and CUDA
+- 1027 library tests, zero clippy warnings — all tests run on both CPU and CUDA
 
 ### Hardware Compatibility
 
@@ -593,6 +603,7 @@ supports. If `nvidia-smi` works, floDl trains on it.
 10. **[Graph Tree](https://github.com/fab2s/floDl/blob/main/docs/tutorials/10-graph-tree.md)** — hierarchical composition, freeze/thaw, subgraph checkpoints
 11. **[Multi-GPU Training](https://github.com/fab2s/floDl/blob/main/docs/tutorials/11-multi-gpu.md)** — Ddp::setup, El Che, auto-balancing, DataLoader integration
 12. **[DDP Builder](https://github.com/fab2s/floDl/blob/main/docs/tutorials/12-async-ddp.md)** — thread-per-GPU, Local SGD, A/B testable backends
+13. **[Data Loading](https://github.com/fab2s/floDl/blob/main/docs/tutorials/13-data-loading.md)** — DataLoader, resident/streaming modes, VRAM-aware prefetch, DDP integration
 
 ### Examples
 

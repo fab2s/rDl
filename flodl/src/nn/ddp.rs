@@ -1017,6 +1017,20 @@ impl ElChe {
         self.anchor
     }
 
+    /// Target wall time (ms) for one sync interval.
+    ///
+    /// Returns `anchor * slowest_ms_per_batch`, the intended wall-clock
+    /// duration between AllReduce events. Both GPUs should accumulate
+    /// this much compute time before syncing. Returns 0 if not yet
+    /// calibrated (no timing data).
+    pub fn anchor_wall_ms(&self) -> f64 {
+        if !self.calibrated {
+            return 0.0;
+        }
+        let slow_ms = self.ms_per_batch.iter().copied().fold(0.0_f64, f64::max);
+        self.anchor as f64 * slow_ms
+    }
+
     /// Reduce the anchor by `factor` (e.g. 0.5 = halve).
     ///
     /// One-directional correction for parameter divergence: tightens sync

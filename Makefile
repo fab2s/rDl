@@ -51,6 +51,7 @@ RUN_BENCH = $(COMPOSE) run --rm bench
         test-all setup build-libtorch \
         bench-image bench bench-cpu bench-compare bench-publish \
         docs-rs site site-stop test-init \
+        cli cuda-cli \
         _require-libtorch _require-libtorch-cuda
 
 # --- libtorch guards ---
@@ -255,6 +256,21 @@ build-libtorch:
 	echo "[flodl] libtorch build complete!"; \
 	echo "[flodl] Active: builds/$$ARCH_DIR"; \
 	echo "[flodl] Run 'make cuda-test' to verify."
+
+# --- CLI ---
+
+cli: image _require-libtorch
+	$(RUN) cargo build --release -p flodl-cli
+
+cuda-cli: cuda-image _require-libtorch-cuda
+	$(RUN_GPU) cargo build --release -p flodl-cli --features cuda
+
+# Run the compiled CLI (inside Docker with libtorch available)
+run-cli: _require-libtorch
+	$(RUN) ./target/release/flodl-cli $(ARGS)
+
+cuda-run-cli: _require-libtorch-cuda
+	$(RUN_GPU) ./target/release/flodl-cli $(ARGS)
 
 # --- Benchmarks ---
 

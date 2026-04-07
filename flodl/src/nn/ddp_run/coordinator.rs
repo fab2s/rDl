@@ -886,11 +886,30 @@ impl Coordinator {
             ApplyPolicy::Sync => {
                 self.steps_since_avg.iter().all(|&s| s >= 1)
             }
-            ApplyPolicy::Cadence | ApplyPolicy::Async => {
-                // Both use ElChe's proportional batch counts. The slow GPU
-                // anchors the cadence; faster GPUs get proportionally more.
-                // Async differs from Cadence only in epoch dispatch, not
-                // in sync timing.
+            ApplyPolicy::Cadence => {
+                // Wall-time trigger: fire when the slowest rank has
+                // accumulated enough compute time since the last sync.
+                // This avoids estimation errors from batch-count prediction
+                // (EMA lag, dead zone, rounding) that cause the fast GPU
+                // to idle at AllReduce boundaries.
+                let target = self.el_che.anchor_wall_ms();
+                if target > 0.0 {
+                    let min_wall = self.wall_ms_accum.iter()
+                        .copied()
+                        .fold(f64::MAX, f64::min);
+                    return min_wall >= target;
+                }
+                // Fallback (uncalibrated): batch-count trigger with equal
+                // counts until first timing measurement arrives.
+                let counts = self.el_che.batch_counts();
+                self.steps_since_avg.iter().enumerate()
+                    .all(|(r, &s)| s >= counts[r])
+            }
+            ApplyPolicy::Async => {
+                // Batch-count trigger: proportional to throughput.
+                // Async benefits from overshooting — the divergence between
+                // replicas provides implicit regularization (Local SGD).
+                // Wall-time matching kills this by constraining the fast GPU.
                 let counts = self.el_che.batch_counts();
                 self.steps_since_avg.iter().enumerate()
                     .all(|(r, &s)| s >= counts[r])

@@ -166,6 +166,27 @@ weight[rank] = count[rank] / sum(counts)
 gradient_avg = sum(weight[rank] * gradient[rank])
 ```
 
+### The El Che forward path
+
+When El Che is active, `model.step()` does more than a simple AllReduce:
+
+1. Each device processes `batch_counts[rank]` complete batches
+   independently. The fast GPU may process 2-3x more batches than the
+   slow one.
+2. Gradients accumulate naturally across all forward passes via libtorch
+   autograd.
+3. Accumulated gradients are normalized by `1/count[rank]` (mean per
+   device).
+4. Weighted AllReduce: each replica's gradient is scaled by
+   `count[rank]/total`, producing the mathematically correct mean.
+5. `report_timing()` feeds CudaEvent measurements back to ElChe for
+   adaptive speed ratio updates.
+6. Updated batch counts are pushed to the DataLoader for the next window.
+
+Tagged outputs (`model.tagged("name")`) and loop traces
+(`model.traces("name")`) are gathered across all batches and all devices,
+so loss functions and metrics work transparently on the combined output.
+
 ## Auto-balancing
 
 The auto-balancer measures per-GPU throughput and adjusts batch
@@ -249,14 +270,17 @@ ddp.weighted_all_reduce_gradients(&batch_counts)?;
 | Method | Description |
 |--------|-------------|
 | `model.distribute(builder)` | Create replicas on all GPUs |
+| `model.auto_distribute(builder)` | Auto-detect GPUs and distribute (no-op if < 2) |
 | `model.set_optimizer(factory)` | Per-replica optimizers |
 | `model.step()` | AllReduce + sync + optimizer + zero_grad |
+| `model.set_lr(lr)` | Set learning rate on all optimizers |
 | `model.world_size()` | Number of GPUs (1 if not distributed) |
 | `model.is_distributed()` | True if multi-GPU |
 | `model.chunk_ratios()` | Per-GPU batch share |
 | `model.throughput()` | Per-GPU EMA throughput |
+| `model.shard_sizes()` | Per-GPU shard sizes from last forward |
+| `model.devices()` | Device list (empty if not distributed) |
 | `model.has_el_che()` | True if El Che is active |
-| `model.configure_el_che(config)` | Set El Che parameters |
 | `model.set_data_loader(loader, input)` | Attach DataLoader |
 | `model.epoch(n)` | Distributed epoch iterator |
 | `model.forward_batch(&batch)` | Batch-aware forward |

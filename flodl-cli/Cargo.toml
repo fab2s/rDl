@@ -1,0 +1,21 @@
+[package]
+name = "flodl-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "CLI tool for the floDl deep learning framework"
+publish = false
+
+[[bin]]
+name = "flodl-cli"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["flodl/cuda"]
+
+[dependencies]
+flodl = { path = "../flodl" }

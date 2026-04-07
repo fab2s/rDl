@@ -202,10 +202,27 @@ AllReduce happens when the slow device completes its anchor count.
 3. **Speed ratios**: discovered from CudaEvent timing after the first sync
 
 After each sync, `report_timing(wall_ms, sync_ms)` is called:
-- EMA-smoothed `ms_per_batch` per rank (alpha = error-scaled, 0.1-0.5)
-- Dead-zone hysteresis: ignores jitter < 5% of current estimate
-- Anchor auto-tune: if sync overhead > target, increase anchor aggressively;
-  if overhead < target/2, decrease gradually
+
+**Speed discovery:**
+- Each rank's `ms_per_batch` is computed as `wall_ms[rank] / batch_count[rank]`
+- EMA-smoothed with error-adaptive alpha: large corrections (>20% off) use
+  alpha=0.5 for fast catch-up; small jitter (<5%) uses alpha=0.1 or is
+  ignored entirely (dead-zone hysteresis)
+- Speed ratios derived from relative ms_per_batch values (slowest = 1.0)
+
+**Anchor auto-tuning:**
+- `overhead_ratio = sync_ms / (wall_ms - sync_ms)` measures what fraction
+  of compute time was spent in AllReduce
+- If overhead > target: increase anchor by `max(2, 1.5x)` (aggressive,
+  because overhead is wasted GPU time)
+- If overhead < target/2: decrease anchor by 1 (gradual, because lower
+  anchor means fresher gradients)
+- Anchor is clamped to `[1, max_anchor]`
+
+**Batch count distribution:**
+- `counts[rank] = round(anchor * speed_ratio[rank])`
+- `clamp_total(max)`: proportionally clamp counts near epoch boundaries
+  so workers do not overshoot the remaining samples
 
 ### Configuration
 
@@ -292,9 +309,10 @@ let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
 | `.anchor(usize)` | No | 10 | Initial anchor count |
 | `.divergence_threshold(f64)` | No | 0.05 | Async mode divergence threshold |
 | `.max_batch_diff(usize)` | No | None | Max batch lead (0 = lockstep) |
-| `.checkpoint_every(usize)` | No | None | Checkpoint interval |
-| `.checkpoint_fn(Fn)` | No | None | Checkpoint callback |
-| `.epoch_fn(Fn)` | No | None | Per-epoch callback (LR schedules, etc.) |
+| `.progressive_dispatch(bool)` | No | Auto | Stream work in small chunks (auto: true for Cadence/Async) |
+| `.checkpoint_every(usize)` | No | None | Checkpoint interval (averaging events or epochs) |
+| `.checkpoint_fn(Fn)` | No | None | Checkpoint callback on rank 0 |
+| `.epoch_fn(Fn)` | No | None | Per-epoch callback inside each worker thread |
 
 ### DdpRunConfig
 
@@ -304,16 +322,24 @@ Advanced config via `DdpRunConfig` (passed through the builder methods above):
 |-------|---------|-------------|
 | `partition_ratios` | None | Fixed per-rank data splits (e.g. `[0.7, 0.3]`). Disables auto-rebalancing. |
 | `snapshot_timeout_secs` | 5 | CPU averaging timeout before soft-abort |
+| `progressive_dispatch` | Auto | When true, coordinator streams small chunks to workers instead of full epoch partitions. Auto enables for Cadence/Async policies. |
 
 ### ApplyPolicy
 
 Controls WHEN parameter averaging occurs (the interval K).
 
-| Policy | K | Behavior | Best for |
-|--------|---|----------|----------|
-| `Sync` | 1 | Average after every batch. Fast GPU waits. | Homogeneous GPUs, correctness-first |
-| `Cadence` | N (ElChe) | Slow GPU anchors cadence. Fast GPU fills wall time. | Heterogeneous GPUs (default) |
-| `Async` | Adaptive | Auto-tunes from divergence monitoring. Starts at K=1. | Maximum throughput, large models |
+| Policy | K | Trigger | Behavior | Best for |
+|--------|---|---------|----------|----------|
+| `Sync` | 1 | Every batch | Average after every batch. Fast GPU waits. | Homogeneous GPUs, correctness-first |
+| `Cadence` | N (ElChe) | Wall-time | Fires when slowest rank's accumulated wall time reaches anchor wall-time. Slow GPU anchors cadence. Fast GPU fills wall time. | Heterogeneous GPUs (default) |
+| `Async` | Adaptive | Batch-count | Fires when all ranks complete their assigned batch counts. Overshooting is intentional: replicas explore different parameter neighborhoods, producing diversity that benefits convergence. Auto-tunes from divergence monitoring. | Maximum throughput, large models |
+
+**Why Cadence uses wall-time but Async uses batch-count**: Cadence needs
+predictable rendezvous points for the AllReduce barrier. Wall-time gives
+a stable anchor tied to the slow device's actual pace. Async benefits from
+letting fast devices overshoot: the slight divergence between replicas acts
+like implicit exploration. Benchmark evidence shows async with wall-time
+trigger produces worse convergence than batch-count trigger.
 
 ### AverageBackend
 
@@ -371,6 +397,45 @@ EpochPlan { epoch, partition_offset, partition_size }
 
 **Auto lookahead:** in `Async` mode, fast ranks may run 1 epoch ahead of the last globally-aggregated epoch, keeping GPUs busy while the slow rank finishes.
 
+### Progressive dispatch
+
+When `progressive_dispatch` is enabled (default for Cadence/Async), the
+coordinator sends work in small chunks instead of full epoch partitions.
+This provides continuous adaptation to throughput changes within an epoch.
+
+Without progressive dispatch (Sync mode default), each worker receives
+its full epoch partition upfront and processes it sequentially. This is
+simpler and has lower coordination overhead, but cannot react to
+throughput changes mid-epoch.
+
+```rust
+// Explicitly enable (auto for Cadence/Async)
+.progressive_dispatch(true)
+
+// Explicitly disable (auto for Sync)
+.progressive_dispatch(false)
+```
+
+### Epoch callbacks
+
+The `epoch_fn` callback runs at the start of each epoch inside each
+worker thread, before training begins. It receives the epoch number and
+a mutable reference to the `GpuWorker`:
+
+```rust
+.epoch_fn(|epoch, worker| {
+    // Learning rate schedule
+    let lr = 0.001 * (0.95_f64).powi(epoch as i32);
+    worker.set_lr(lr);
+})
+```
+
+The callback runs on every GPU thread independently. Use it for:
+- Learning rate schedules (`worker.set_lr()`)
+- Noise curricula (adjusting dropout or data augmentation)
+- Dynamic loss weights that change per epoch
+- Logging epoch transitions
+
 ### CPU averaging state machine
 
 The CPU backend operates as a non-blocking 3-phase state machine:
@@ -388,6 +453,96 @@ Idle --> Collecting --> Computing --> Idle
   When done, sends `Update` to all workers.
 
 `check_throttle()` runs every tick, even during averaging.
+
+### Metrics pipeline
+
+The DDP Builder provides a structured metrics pipeline for monitoring
+training progress from outside the worker threads.
+
+**Inside the train function** -- record custom scalars:
+
+```rust
+|model, batch| {
+    let input = Variable::new(batch[0].clone(), false);
+    let target = Variable::new(batch[1].clone(), false);
+    let pred = model.forward(&input)?;
+    let loss = pred.mse(&target)?.mean()?;
+
+    // Record custom metrics (thread-local, zero overhead)
+    let accuracy = compute_accuracy(&pred, &target);
+    record_scalar("accuracy", accuracy);
+
+    Ok(loss)
+}
+```
+
+**Outside** -- consume aggregated epoch metrics:
+
+```rust
+let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
+    .dataset(dataset)
+    .batch_size(32)
+    .num_epochs(100)
+    .run()?;
+
+// Non-blocking polling loop
+loop {
+    for metrics in ddp.poll_metrics() {
+        println!(
+            "epoch {} | loss={:.4} | accuracy={:.4} | {:.0}ms",
+            metrics.epoch, metrics.avg_loss,
+            metrics.scalars.get("accuracy").unwrap_or(&0.0),
+            metrics.epoch_ms,
+        );
+    }
+    if ddp.is_finished() { break; }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+let state = ddp.join()?;
+```
+
+**`EpochMetrics` fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `epoch` | `usize` | Epoch number (0-based) |
+| `avg_loss` | `f64` | Loss averaged across all ranks |
+| `batches_processed` | `usize` | Total batches across all ranks |
+| `epoch_ms` | `f64` | Wall time for the epoch (slowest rank) |
+| `samples_processed` | `usize` | Total samples across all ranks |
+| `per_rank_loss` | `Vec<f64>` | Per-rank average loss |
+| `per_rank_time_ms` | `Vec<f64>` | Per-rank wall time |
+| `per_rank_scalars` | `Vec<HashMap<String, f64>>` | Per-rank custom scalars |
+| `scalars` | `HashMap<String, f64>` | Aggregated custom scalars (averaged across ranks) |
+
+### Monitor integration
+
+Wire the DDP handle into a training `Monitor` for the live dashboard:
+
+```rust
+let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
+    .dataset(dataset)
+    .batch_size(32)
+    .num_epochs(100)
+    .run()?;
+
+let mut monitor = Monitor::new(100);
+ddp.setup_monitor(&mut monitor);
+monitor.serve(3000)?;
+
+// Feed metrics to the monitor
+while let Some(metrics) = ddp.next_metrics() {
+    let elapsed = std::time::Duration::from_millis(metrics.epoch_ms as u64);
+    monitor.log(metrics.epoch, elapsed, &metrics);
+}
+let state = ddp.join()?;
+monitor.finish();
+```
+
+`setup_monitor()` attaches the graph identity (label + structural hash),
+architecture SVG, and training configuration (policy, backend, world size)
+to the monitor. The dashboard shows per-GPU tabs, throughput charts, and
+batch share distribution automatically.
 
 ### TrainedState
 
@@ -480,6 +635,66 @@ with stale parameters before the update arrives.
 
 For most models, this difference is negligible. For models with sharp loss
 landscapes or very small learning rates, the synchronization point matters.
+
+---
+
+## Data Pipeline
+
+The `DataLoader` is DDP-aware and adapts automatically to distributed
+training. Understanding its modes helps get the best throughput.
+
+### Modes
+
+| Mode | Description | When |
+|------|-------------|------|
+| **Resident** | Entire dataset loaded into GPU VRAM once. Per-epoch reshuffling via GPU-side `index_select`. | Dataset fits in 75% of free VRAM |
+| **Streaming** | Persistent background worker thread with async H2D on dedicated CUDA stream. Prefetch depth auto-adapts to VRAM. | Dataset too large for VRAM |
+| **Distributed** | Per-device backends (each GPU independently selects resident or streaming). No lowest-common-denominator. | `Ddp::setup()` or `Graph::distribute()` |
+
+### VRAM-aware prefetch
+
+In streaming mode, the prefetch depth is computed automatically:
+
+```
+depth = clamp(free_vram * headroom / batch_bytes, 2, max_depth)
+```
+
+- **Bootstrap**: 4 batches at construction time (model not yet loaded)
+- **epoch(0)**: re-probes VRAM after model allocation, fills to cap
+- **epoch(N)**: re-probes each epoch, adapts to fragmentation
+- **`vram_max_usage(0.90)`**: use up to 90% of total VRAM (default)
+- **`.prefetch(n)`**: manual override, disables automatic adaptation
+- **OOM fallback**: if resident mode fails with CUDA OOM, automatically
+  retries with streaming mode
+
+### Per-device backends (DDP)
+
+When distributed across heterogeneous GPUs:
+
+```
+RTX 5060 Ti (16 GB):  resident (6 GB dataset fits easily)
+GTX 1060 (6 GB):      streaming (only 2 GB free after model)
+```
+
+Each GPU independently selects the best mode. No constraint from the
+smallest GPU forces the larger GPU into streaming. The gather device
+(where outputs are collected) prefers the resident backend with the most
+free VRAM.
+
+### DataLoader builder reference
+
+| Method | Default | Description |
+|--------|---------|-------------|
+| `.batch_size(usize)` | Required | Batch size per GPU |
+| `.device(Device)` | CPU | Target device (leave as CPU for DDP) |
+| `.seed(u64)` | 42 | RNG seed for shuffling (epoch-deterministic) |
+| `.shuffle(bool)` | true | Enable shuffling (RandomSampler) |
+| `.sampler(Box<dyn Sampler>)` | -- | Custom sampler (overrides shuffle) |
+| `.prefetch(usize)` | Auto | Override auto-detected prefetch depth |
+| `.vram_max_usage(f64)` | 0.90 | Max VRAM fraction for prefetch |
+| `.streaming()` | Auto | Force streaming mode |
+| `.names(&[&str])` | Positional | Name batch tensor positions |
+| `.drop_last(bool)` | true | Drop incomplete final batch (BatchNorm safety) |
 
 ---
 
@@ -675,5 +890,5 @@ investigate why the worker is unresponsive. Repeated timeouts (check
 
 ---
 
-Previous: [Tutorial 12: DDP Builder](tutorials/12-async-ddp.md) |
+Previous: [Tutorial 13: Data Loading](tutorials/13-data-loading.md) |
 Next: [PyTorch Migration Guide](pytorch_migration.md)

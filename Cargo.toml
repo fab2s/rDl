@@ -1,5 +1,5 @@
 [workspace]
-members = ["flodl-sys", "flodl"]
+members = ["flodl-sys", "flodl", "flodl-cli"]
 exclude = ["benchmarks"]
 resolver = "2"
 

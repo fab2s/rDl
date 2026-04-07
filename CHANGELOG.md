@@ -133,7 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 #### DDP Builder — Thread-Per-GPU Training
 - **`DdpHandle`**: Thread-per-GPU training with Local SGD and adaptive parameter averaging. Each GPU runs its own training loop with a local optimizer. A lightweight coordinator thread triggers periodic parameter averaging. Two orthogonal knobs: [`ApplyPolicy`] (when to average) and [`AverageBackend`] (how to average).
-- **`DdpBuilder`** (recommended entry point): Fluent API for configuring and launching training. Required: `.dataset()`, `.batch_size()`, `.num_epochs()`. Optional: `.policy()`, `.backend()`, `.overhead_target()`, `.max_anchor()`, `.divergence_threshold()`, `.max_batch_diff()`, `.checkpoint_every()`, `.checkpoint_fn()`.
+- **`DdpBuilder`** (recommended entry point): Fluent API for configuring and launching training. Required: `.dataset()`, `.batch_size()`, `.num_epochs()`. Optional: `.policy()`, `.backend()`, `.overhead_target()`, `.max_anchor()`, `.anchor()`, `.divergence_threshold()`, `.max_batch_diff()`, `.checkpoint_every()`, `.checkpoint_fn()`, `.epoch_fn()`, `.progressive_dispatch()`.
   ```rust
   let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
       .dataset(dataset)
@@ -147,15 +147,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`Ddp::builder()`**: Quick-start alternative (replaces the former `AsyncDdp::auto()`/`auto_with()`).
 - **`ApplyPolicy`**: Controls WHEN averaging occurs.
   - `Sync`: K=1 (every batch). Equivalent to standard DDP. Best convergence.
-  - `Cadence`: K=N (ElChe anchor count). Slow GPU anchors the cadence, fast GPUs fill wall time. Recommended for heterogeneous hardware.
-  - `Async`: K=adaptive. Auto-tunes averaging interval from divergence monitoring. Maximum throughput.
+  - `Cadence`: K=N (ElChe anchor count). Slow GPU anchors the cadence, fast GPUs fill wall time. Uses wall-time trigger (fires when slowest rank's accumulated wall time reaches anchor wall-time). Recommended for heterogeneous hardware.
+  - `Async`: K=adaptive. Uses batch-count trigger (fires when all ranks complete their assigned counts). Overshooting is intentional: each replica explores slightly different parameter neighborhoods between averaging events, producing diversity that benefits convergence. Auto-tunes interval from divergence monitoring. Maximum throughput.
 - **`AverageBackend`**: Controls HOW averaging is performed. Orthogonal to policy, all combinations valid for A/B testing.
   - `Nccl`: In-place AllReduce on GPU. Zero extra memory, GPU-to-GPU DMA. All GPUs sync at collective barrier.
   - `Cpu`: Workers send parameter snapshots to coordinator, which averages on CPU and distributes. No GPU ever blocks. Uses O(world_size * model_size) CPU RAM. Non-blocking 3-phase state machine (Idle/Collecting/Computing) keeps coordinator responsive during averaging.
 - **`GpuWorker<M>`**: Generic worker bound to a single GPU. Thread-local model + optimizer (Rc-based, not Send). CUDA streams for overlapped compute/communication. Handles `SyncNow` (NCCL), `RequestParams`/`Update` (CPU), `Throttle`, `StartEpoch`, `Checkpoint`, `Shutdown`.
 - **`Coordinator`**: Lightweight scheduling thread. Collects timing from workers (for ElChe throughput ratios), triggers averaging, monitors divergence to auto-tune interval, rebalances data partitions. Builder pattern with configurable `divergence_threshold`, `overhead_target`, `max_anchor`, `checkpoint_every`, `snapshot_timeout_secs`.
 - **`TrainedState`**: Return type from `DdpHandle::join()`. Contains averaged `params` and `buffers` as CPU tensors, ready for inference or checkpoint.
-- **`DdpRunConfig`**: Configuration struct with builder methods: `with_overhead_target()`, `with_max_anchor()`, `with_anchor()`, `with_divergence_threshold()`, `with_max_batch_diff()`, `with_checkpoint_every()`, `with_snapshot_timeout()`, `with_partition_ratios()`.
+- **`DdpRunConfig`**: Configuration struct with builder methods: `with_overhead_target()`, `with_max_anchor()`, `with_anchor()`, `with_divergence_threshold()`, `with_max_batch_diff()`, `with_checkpoint_every()`, `with_snapshot_timeout()`, `with_partition_ratios()`, `with_progressive_dispatch()`.
+- **`progressive_dispatch`**: When enabled, the coordinator streams work in small chunks instead of sending full epoch partitions, adapting to throughput continuously. Default: auto (true for Cadence/Async, false for Sync).
 - **Global epoch management**: Coordinator owns epochs globally. Workers are mode-agnostic (wait for `EpochPlan`, run partition, report metrics). `EpochPlan { epoch, partition_offset, partition_size }` ensures deterministic, non-overlapping sample coverage. Throughput-proportional partition sizing when ElChe is calibrated; `partition_ratios` for fixed splits. Auto lookahead in `Async` mode (fast ranks may run 1 epoch ahead).
 - **Single-GPU fallback**: With fewer than 2 CUDA devices, training runs on the main thread with no coordinator or averaging. API is identical; `join()` returns `TrainedState` in both cases.
 
@@ -175,6 +176,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Coordinator accessors**: `avg_count()`, `abort_count()`, `last_batch_ms()`, `last_avg_ms()`, `is_cpu_averaging()`, `version()`, `avg_interval()`, `is_calibrated()`, `steps_since_avg()` for external monitoring.
 - **Divergence monitoring** (Async policy): Per-rank parameter L2 norms tracked. Relative norm difference triggers interval halving (diverging) or doubling (converging). Threshold configurable via `divergence_threshold` (default 0.05).
 - **Hardware summary**: Prints GPU count, heterogeneous/homogeneous detection, per-GPU name + VRAM, policy, and backend at launch.
+
+#### DDP Builder — Metrics Pipeline
+- **`record_scalar(name, value)`**: Thread-local function callable from inside the train function. Records named scalar metrics (accuracy, custom losses, etc.) per batch. Metrics are aggregated per rank per epoch and forwarded to the coordinator.
+- **`EpochMetrics`**: Aggregated metrics for one completed epoch. Fields: `epoch`, `avg_loss`, `batches_processed`, `epoch_ms`, `samples_processed`, `per_rank_loss`, `per_rank_time_ms`, `per_rank_scalars`, `scalars`.
+- **`DdpHandle::poll_metrics()`**: Non-blocking poll for completed epoch metrics. Returns a `Vec<EpochMetrics>` of all epochs aggregated since the last poll. Enables external monitoring loops.
+- **`DdpHandle::next_metrics()`**: Blocking call that returns the next available `EpochMetrics`. Useful for sequential metric processing.
+- **`DdpHandle::setup_monitor(&self, &mut Monitor)`**: Wire the DDP handle's graph identity, architecture SVG, and training config into a training monitor. Enables the live dashboard and HTML archive for DDP Builder training runs.
+- **`LossContext`**: Per-batch context passed to loss closures in distributed training. Provides batch metadata (shard sizes, device indices) for loss functions that need to weight contributions correctly.
 
 #### DDP Builder — Epoch Callback
 - **`EpochFn<M>`**: `Arc<dyn Fn(usize, &mut GpuWorker<M>) + Send + Sync>`. Called at the start of each epoch inside each worker thread, before `run_epoch_plan()`.
@@ -197,6 +206,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 #### Module Builders
 - **`ConvTranspose1dBuilder`**, **`ConvTranspose2dBuilder`**, **`ConvTranspose3dBuilder`**: Fluent builder APIs for transposed convolution layers (`with_stride`, `with_padding`, `with_output_padding`, `with_dilation`, `with_groups`, `with_bias`, `on_device`, `done`). Consistent with existing Conv1d/Conv2d/Conv3d builder pattern.
+
+#### CLI Tool
+- **`fdl`** (shell script): Zero-dependency entry point. Auto-detects libtorch, Docker, Rust, GPUs. Dispatches to the compiled binary (native or Docker) with shell fallback for diagnostics. Interactive setup wizard guides users through libtorch installation and build environment selection.
+- **`flodl-cli`** (Rust workspace member): Compiled binary with GPU probing via `flodl::probe_device()`. Commands:
+  - `fdl setup`: Guided 3-step wizard: (1) system detection, (2) libtorch download with hardware-specific choices, (3) build environment (Docker/native/both).
+  - `fdl init <name> [--docker]`: Scaffold a new floDl project. Default mode uses mounted libtorch (like the main repo). `--docker` bakes libtorch into the Docker image for standalone deployment. Generates Cargo.toml, Dockerfiles, docker-compose.yml, Makefile, and annotated src/main.rs.
+  - `fdl diagnose [--json]`: System + GPU + libtorch + compatibility report. Probes each GPU with a test kernel, verifies libtorch arch coverage, detects Docker containers.
+  - `fdl help / version`
+- Binary is `publish = false` (links libtorch, not portable). Built lazily on first `fdl` invocation.
 
 #### Small Additions
 - **`Linear::no_bias_on_device()`**: Create a bias-free linear layer on a specific device. Previously `no_bias()` was CPU-only.
@@ -239,6 +257,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 #### Build Targets
 - **`make setup`**: Auto-detect hardware, download CPU libtorch + CUDA libtorch (or build from source), build Docker image. One command from zero to ready.
 - **`make build-libtorch`**: Compile libtorch from source, extract to `libtorch/builds/<arch>/`, write `.arch`/`.active`.
+- **`make cli`** / **`make cuda-cli`**: Build flodl-cli (CPU/CUDA). **`make run-cli`** / **`make cuda-run-cli`**: Run inside Docker.
 - **CI updated**: CUDA job downloads libtorch separately and mounts into container (no longer baked into image).
 
 ### Removed

@@ -1191,6 +1191,84 @@ mod tests {
     }
 
     #[test]
+    fn test_coordinator_should_average_wall_time() {
+        // After calibration, Cadence uses wall-time trigger (not batch counts).
+        // Async keeps batch-count trigger (overshooting is the feature).
+        // Setup: 2 ranks, anchor=10, rank 0 = 5ms/batch (fast), rank 1 = 10ms/batch (slow).
+        // anchor_wall_ms = 10 * 10 = 100ms.
+        let mut h = make_coord_harness(2, ApplyPolicy::Cadence, AverageBackend::Nccl);
+
+        // Phase 1: calibrate ElChe (uncalibrated uses batch-count fallback).
+        // Send 10 batches per rank to trigger initial averaging.
+        for _ in 0..10 {
+            h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
+            h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0 }).unwrap();
+        }
+        h.coord.drain_timing();
+        assert!(h.coord.should_average()); // batch-count fallback: 10 >= 10
+        h.coord.trigger_averaging().unwrap();
+        for rx in &h.control_rxs { while rx.try_recv().is_ok() {} }
+
+        assert!(h.coord.is_calibrated());
+        let target = h.coord.el_che.anchor_wall_ms();
+        assert!(target > 0.0, "anchor_wall_ms should be positive after calibration");
+
+        // Phase 2: wall-time trigger. The slow rank needs target ms of compute.
+        // Feed batches until slow rank reaches target, but NOT until batch_counts
+        // are met. This proves wall time triggers, not batch counts.
+        //
+        // After calibration with 2:1 ratio, batch_counts ≈ [20, 10].
+        // If we feed 10 batches to each: wall_ms_accum = [50, 100].
+        // min(50, 100) = 50 < 100 → no trigger (fast rank hasn't accumulated enough).
+        for _ in 0..10 {
+            h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
+            h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0 }).unwrap();
+        }
+        h.coord.drain_timing();
+        assert!(!h.coord.should_average(), "fast rank wall time < target");
+
+        // Feed 10 more to rank 0 only (simulating fast GPU running ahead).
+        // wall_ms_accum = [100, 100]. min = 100 >= target → trigger!
+        for _ in 0..10 {
+            h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
+        }
+        h.coord.drain_timing();
+        assert!(h.coord.should_average(), "both ranks at target wall time");
+    }
+
+    #[test]
+    fn test_async_uses_batch_count_not_wall_time() {
+        // Async keeps batch-count trigger even after calibration.
+        // The divergence between replicas IS the feature (exploration diversity).
+        let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Nccl);
+
+        // Calibrate: 10 batches each at 2:1 speed ratio.
+        for _ in 0..10 {
+            h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
+            h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0 }).unwrap();
+        }
+        h.coord.drain_timing();
+        assert!(h.coord.should_average());
+        h.coord.trigger_averaging().unwrap();
+        for rx in &h.control_rxs { while rx.try_recv().is_ok() {} }
+        assert!(h.coord.is_calibrated());
+
+        // After calibration, batch_counts ≈ [20, 10].
+        // Feed exactly those counts. With wall-time trigger this would NOT
+        // fire (fast rank wall = 100ms, slow = 100ms, but batch counts would
+        // differ). With batch-count trigger it fires immediately.
+        let counts = h.coord.el_che.batch_counts();
+        for _ in 0..counts[0] {
+            h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
+        }
+        for _ in 0..counts[1] {
+            h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0 }).unwrap();
+        }
+        h.coord.drain_timing();
+        assert!(h.coord.should_average(), "async triggers on batch counts, not wall time");
+    }
+
+    #[test]
     fn test_coordinator_trigger_nccl() {
         let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Nccl);
 

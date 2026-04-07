@@ -371,9 +371,25 @@ need `impl Module for YourType { ... }`.
 
 ---
 
+## Multi-GPU / DDP
+
+For DDP-specific troubleshooting (NCCL init failure, parameter mismatch,
+CUDA context corruption, NCCL deadlock, OOM on smaller GPU, CPU averaging
+timeout), see the dedicated [DDP Reference -- Troubleshooting](ddp.md#troubleshooting)
+section.
+
+Common quick fixes:
+- **NCCL init fails**: Check `nvidia-smi topo -m`. Try `AverageBackend::Cpu`.
+- **CUBLAS_STATUS_EXECUTION_FAILED after NCCL**: Use `NcclComms::new()` + `split()` on main thread, not `init_rank()` from worker threads.
+- **Training hangs**: A worker died mid-collective. `DdpHandle` auto-aborts via `NcclAbortHandle`.
+- **OOM on one GPU**: Use `Cadence` policy (El Che assigns fewer batches to smaller GPU).
+
+---
+
 ## Getting Help
 
 - **Examples:** `cargo run --example quickstart` and `cargo run --example sine_wave`
 - **Tutorials:** Start with [Rust for PyTorch Users](tutorials/00-rust-primer.md)
-- **Migration guide:** [PyTorch → floDl](pytorch_migration.md)
+- **Multi-GPU:** [DDP Reference](ddp.md) and [Multi-GPU Tutorial](tutorials/11-multi-gpu.md)
+- **Migration guide:** [PyTorch -> floDl](pytorch_migration.md)
 - **Issues:** [github.com/fab2s/floDl/issues](https://github.com/fab2s/floDl/issues)

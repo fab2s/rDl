@@ -72,12 +72,19 @@ let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
     .backend(AverageBackend::Nccl)         // default: Nccl
     .overhead_target(0.10)                 // AllReduce < 10% of compute
     .max_anchor(200)                       // gradient staleness cap
+    .anchor(10)                            // initial anchor count
     .max_batch_diff(50)                    // max lead of fastest over slowest
     .divergence_threshold(0.05)            // Async mode: tighten at 5% divergence
+    .progressive_dispatch(true)            // stream work in small chunks
     .checkpoint_every(5)                   // save every 5 averaging events
     .checkpoint_fn(|ver, model| {
         // save model checkpoint
         Ok(())
+    })
+    .epoch_fn(|epoch, worker| {
+        // learning rate schedule, noise curriculum, etc.
+        let lr = 0.001 * (0.95_f64).powi(epoch as i32);
+        worker.set_lr(lr);
     })
     .run()?;
 ```
@@ -138,6 +145,22 @@ utilization at the cost of some gradient staleness.
 
 **Use when**: large models where each batch is expensive and
 synchronization overhead matters. Monitor loss curves.
+
+### Why Cadence and Async use different triggers
+
+**Cadence** uses a **wall-time trigger**: averaging fires when the slowest
+rank's accumulated wall time reaches the anchor's wall-time. This gives
+predictable, stable rendezvous points for the AllReduce barrier.
+
+**Async** uses a **batch-count trigger**: averaging fires when all ranks
+complete their assigned batch counts. This is intentional: the slight
+overshoot between averaging events means each replica explores a slightly
+different parameter neighborhood. This diversity benefits convergence
+(like implicit meta-learning).
+
+Benchmark evidence confirms this: async with wall-time trigger gave worse
+convergence than batch-count trigger, because cutting off the overshoot
+eliminates the exploration diversity that makes async work.
 
 ### Decision summary
 
@@ -327,6 +350,122 @@ It must return a scalar `Variable` representing the loss:
 The worker handles everything after the loss is returned: `backward()`,
 `optimizer.step()`, `zero_grad()`, and timing reports.
 
+## Custom metrics
+
+Record named scalars inside the train function using `record_scalar()`.
+These are aggregated per rank per epoch and available via
+`DdpHandle::poll_metrics()`:
+
+```rust
+use flodl::nn::record_scalar;
+
+let ddp = Ddp::builder(
+    model_factory,
+    optim_factory,
+    |model, batch| {
+        let input = Variable::new(batch[0].clone(), false);
+        let target = Variable::new(batch[1].clone(), false);
+        let pred = model.forward(&input)?;
+        let loss = pred.mse(&target)?.mean()?;
+
+        // Record custom metrics (thread-local, aggregated per epoch)
+        let correct = pred.argmax(-1, false)?.eq_tensor(&target.tensor())?.sum()?;
+        let accuracy = correct.item::<f64>()? / batch[0].size()[0] as f64;
+        record_scalar("accuracy", accuracy);
+
+        Ok(loss)
+    },
+)
+.dataset(dataset)
+.batch_size(32)
+.num_epochs(50)
+.run()?;
+
+// Consume metrics from outside
+while let Some(m) = ddp.next_metrics() {
+    println!(
+        "epoch {} | loss={:.4} | acc={:.3} | {:.0}ms",
+        m.epoch, m.avg_loss,
+        m.scalars.get("accuracy").unwrap_or(&0.0),
+        m.epoch_ms,
+    );
+}
+let state = ddp.join()?;
+```
+
+`EpochMetrics` includes per-rank breakdowns (`per_rank_loss`,
+`per_rank_time_ms`, `per_rank_scalars`) alongside aggregated values.
+
+## Monitor integration
+
+Wire the DDP handle into a training `Monitor` for the live dashboard
+and HTML archive:
+
+```rust
+let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
+    .dataset(dataset)
+    .batch_size(32)
+    .num_epochs(100)
+    .run()?;
+
+let mut monitor = Monitor::new(100);
+ddp.setup_monitor(&mut monitor);  // graph identity + architecture SVG
+monitor.serve(3000)?;              // live dashboard at http://localhost:3000
+
+while let Some(metrics) = ddp.next_metrics() {
+    let elapsed = std::time::Duration::from_millis(metrics.epoch_ms as u64);
+    monitor.log(metrics.epoch, elapsed, &metrics);
+}
+
+let state = ddp.join()?;
+monitor.finish();
+monitor.save_html("training.html");
+```
+
+The dashboard shows per-GPU tabs with VRAM, throughput, and batch share
+charts automatically when 2+ GPUs are detected.
+
+## Epoch callbacks
+
+Use `epoch_fn` for per-epoch logic that runs inside each worker thread:
+
+```rust
+.epoch_fn(|epoch, worker| {
+    // Cosine annealing
+    let lr = 0.001 * 0.5 * (1.0 + (std::f64::consts::PI * epoch as f64 / 100.0).cos());
+    worker.set_lr(lr);
+})
+```
+
+The callback receives `(epoch: usize, worker: &mut GpuWorker<M>)` and
+runs before the epoch's training begins. Available methods on `worker`:
+
+| Method | Description |
+|--------|-------------|
+| `worker.set_lr(f64)` | Set learning rate on this worker's optimizer |
+| `worker.current_epoch()` | Current epoch number (0-based) |
+| `worker.rank()` | This worker's rank |
+| `worker.device()` | This worker's CUDA device |
+| `worker.model()` | Reference to the concrete model |
+
+## Progressive dispatch
+
+By default, Cadence and Async modes use progressive dispatch: the
+coordinator sends work in small chunks rather than full epoch partitions.
+This lets the system adapt to throughput changes mid-epoch.
+
+```rust
+// Explicit control (auto for Cadence/Async)
+.progressive_dispatch(true)
+
+// Sync mode: disabled by default (full partitions upfront)
+.progressive_dispatch(false)
+```
+
+Progressive dispatch adds slight coordination overhead but gives better
+throughput on heterogeneous hardware where speed ratios may shift during
+training (thermal throttling, competing workloads).
+
 ## Quick reference
 
 ### Types
@@ -339,7 +478,10 @@ The worker handles everything after the loss is returned: `backward()`,
 | `ApplyPolicy` | Sync / Cadence / Async |
 | `AverageBackend` | Nccl / Cpu |
 | `TrainedState` | Final params + buffers (CPU tensors) |
+| `EpochMetrics` | Aggregated metrics for one completed epoch |
+| `GpuWorker<M>` | Per-GPU worker (available in epoch_fn callback) |
 | `CheckpointFn<M>` | `Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>` |
+| `EpochFn<M>` | `Arc<dyn Fn(usize, &mut GpuWorker<M>) + Send + Sync>` |
 
 ### DdpHandle methods
 
@@ -349,6 +491,10 @@ The worker handles everything after the loss is returned: `backward()`,
 | `.join()` | Block until done, return TrainedState |
 | `.world_size()` | Number of GPUs |
 | `.devices()` | Device list |
+| `.poll_metrics()` | Non-blocking: return all pending EpochMetrics |
+| `.next_metrics()` | Blocking: return next EpochMetrics |
+| `.setup_monitor(&mut Monitor)` | Wire graph identity + config into monitor |
+| `.architecture_svg()` | Graph architecture SVG (if model is a Graph) |
 
 ### DdpRunConfig methods
 
@@ -361,8 +507,10 @@ The worker handles everything after the loss is returned: `backward()`,
 | `.with_max_batch_diff(usize)` | None | Max batch lead |
 | `.with_checkpoint_every(usize)` | None | Checkpoint interval |
 | `.with_snapshot_timeout(u64)` | 5 | CPU averaging timeout (seconds) |
+| `.with_partition_ratios(Vec<f64>)` | None | Fixed per-rank data splits |
+| `.with_progressive_dispatch(bool)` | Auto | Stream work in small chunks |
 
 ---
 
 Previous: [Multi-GPU Training](11-multi-gpu.md) |
-Next: [DDP Reference](../ddp.md)
+Next: [Data Loading](13-data-loading.md)
