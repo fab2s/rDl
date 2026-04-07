@@ -56,8 +56,9 @@ enum CpuAvgState {
 /// Result from the CPU averaging compute thread.
 struct CpuAvgResult {
     averaged: AveragedParams,
-    /// For Async policy: new averaging interval and param norms.
-    cadence_update: Option<(usize, Vec<f64>)>,
+    /// Relative divergence across replicas (for anchor correction).
+    /// None if all norms are zero.
+    divergence: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +158,7 @@ impl ChunkPool {
 /// NOT an optimizer. Each GPU runs its own Adam. The coordinator:
 /// 1. Collects timing from workers (for ElChe throughput ratios)
 /// 2. Triggers periodic parameter averaging (NCCL or CPU path)
-/// 3. Monitors divergence to auto-tune averaging interval
+/// 3. Monitors divergence to correct ElChe's anchor (tighten-only)
 /// 4. Rebalances data partitions after ElChe calibrates
 ///
 /// All fields are Send. Runs on a dedicated CPU thread.
@@ -183,11 +184,8 @@ pub struct Coordinator {
     /// Per-rank steps since last averaging.
     steps_since_avg: Vec<usize>,
 
-    // Divergence monitoring (Async mode)
-    last_param_norms: Vec<f64>,
+    // Divergence monitoring (correction mechanism)
     divergence_threshold: f64,
-    /// Current adaptive averaging interval (Async mode).
-    pub(super) avg_interval: usize,
     /// Has ElChe been calibrated (first timing report received)?
     calibrated: bool,
 
@@ -294,8 +292,8 @@ impl CoordinatorBuilder {
         self
     }
 
-    /// Set the divergence threshold for adaptive averaging interval (Async mode).
-    /// Default: 0.05 (5% relative norm difference triggers tightening).
+    /// Set the divergence threshold for anchor correction.
+    /// Default: 0.05 (5% relative norm difference nudges ElChe's anchor down).
     pub fn divergence_threshold(mut self, threshold: f64) -> Self {
         self.divergence_threshold = threshold;
         self
@@ -366,9 +364,7 @@ impl CoordinatorBuilder {
             el_che: self.el_che,
             version: 0,
             steps_since_avg: vec![0; self.world_size],
-            last_param_norms: vec![0.0; self.world_size],
             divergence_threshold: self.divergence_threshold,
-            avg_interval: 1, // start conservative
             calibrated: false,
             active_count: self.world_size,
             wall_ms_accum: vec![0.0; self.world_size],
@@ -438,11 +434,6 @@ impl Coordinator {
     /// Current model version (bumped after each averaging).
     pub fn version(&self) -> u64 {
         self.version
-    }
-
-    /// Current averaging interval (K).
-    pub fn avg_interval(&self) -> usize {
-        self.avg_interval
     }
 
     /// Whether ElChe has been calibrated.
@@ -727,13 +718,19 @@ impl Coordinator {
                 self.send_all_plans(next_global);
             }
             ApplyPolicy::Async => {
-                // Per-rank dispatch already happened in on_rank_done.
-                // Unblock ranks that were waiting due to lookahead.
-                for rank in 0..self.world_size {
-                    if self.rank_waiting[rank] {
-                        let next = self.rank_epoch[rank] + 1;
-                        if next < self.num_epochs {
-                            self.send_rank_plan(rank, next);
+                if self.progressive {
+                    // Progressive handles chunk dispatch; start the next
+                    // epoch's pool the same way Sync/Cadence does.
+                    self.send_all_plans(next_global);
+                } else {
+                    // Legacy per-rank dispatch already happened in on_rank_done.
+                    // Unblock ranks that were waiting due to lookahead.
+                    for rank in 0..self.world_size {
+                        if self.rank_waiting[rank] {
+                            let next = self.rank_epoch[rank] + 1;
+                            if next < self.num_epochs {
+                                self.send_rank_plan(rank, next);
+                            }
                         }
                     }
                 }
@@ -889,13 +886,14 @@ impl Coordinator {
             ApplyPolicy::Sync => {
                 self.steps_since_avg.iter().all(|&s| s >= 1)
             }
-            ApplyPolicy::Cadence => {
+            ApplyPolicy::Cadence | ApplyPolicy::Async => {
+                // Both use ElChe's proportional batch counts. The slow GPU
+                // anchors the cadence; faster GPUs get proportionally more.
+                // Async differs from Cadence only in epoch dispatch, not
+                // in sync timing.
                 let counts = self.el_che.batch_counts();
                 self.steps_since_avg.iter().enumerate()
                     .all(|(r, &s)| s >= counts[r])
-            }
-            ApplyPolicy::Async => {
-                self.steps_since_avg.iter().all(|&s| s >= self.avg_interval)
             }
         }
     }
@@ -987,13 +985,14 @@ impl Coordinator {
     }
 
     /// Common tail for CPU averaging: report snapshot counters to ElChe,
-    /// subtract snapshots from current counters (preserve during-averaging batches).
-    fn finish_averaging_cpu(
+    /// apply divergence correction, subtract snapshots from current counters
+    /// (preserve during-averaging batches).
+    pub(super) fn finish_averaging_cpu(
         &mut self,
         avg_ms: f64,
         steps_snapshot: &[usize],
         wall_ms_snapshot: &[f64],
-        cadence_update: Option<(usize, Vec<f64>)>,
+        divergence: Option<f64>,
     ) {
         self.last_avg_ms = avg_ms;
 
@@ -1007,10 +1006,18 @@ impl Coordinator {
             }
         }
 
-        // Apply cadence update from the compute thread (Async policy).
-        if let Some((new_interval, norms)) = cadence_update {
-            self.avg_interval = new_interval;
-            self.last_param_norms = norms;
+        // Divergence correction: if replicas drifted apart, nudge ElChe's
+        // anchor down (tighter sync). One-directional pressure only; ElChe's
+        // overhead auto-tune handles loosening.
+        if let Some(div) = divergence {
+            if div > self.divergence_threshold {
+                let old_anchor = self.el_che.anchor();
+                self.el_che.nudge_anchor_down(0.5);
+                eprintln!(
+                    "  ddp: divergence {div:.4} > {:.4}, anchor {} -> {}",
+                    self.divergence_threshold, old_anchor, self.el_che.anchor()
+                );
+            }
         }
 
         self.version += 1;
@@ -1129,16 +1136,12 @@ impl Coordinator {
                 if snapshots.len() >= self.world_size {
                     // All snapshots collected. Spawn compute thread.
                     let version = self.version + 1;
-                    let policy = self.policy;
-                    let avg_interval = self.avg_interval;
-                    let div_threshold = self.divergence_threshold;
 
                     let handle = std::thread::Builder::new()
                         .name("cpu-avg-compute".into())
                         .spawn(move || {
-                            Self::compute_average_and_cadence(
-                                snapshots, version, policy,
-                                avg_interval, div_threshold,
+                            Self::compute_average_and_divergence(
+                                snapshots, version,
                             )
                         })
                         .map_err(|e| TensorError::new(
@@ -1203,7 +1206,7 @@ impl Coordinator {
                         avg_ms,
                         &steps_snapshot,
                         &wall_ms_snapshot,
-                        result.cadence_update,
+                        result.divergence,
                     );
                     // avg_state is already Idle from the mem::replace.
                 } else {
@@ -1287,19 +1290,20 @@ impl Coordinator {
         })
     }
 
-    /// Monitor parameter divergence across replicas and adjust averaging interval.
+    /// Compute weighted average and divergence on a background thread.
     ///
-    /// Computes relative norm difference: `sum(|norm_i - mean|) / mean`.
-    /// If divergence > threshold, halve the interval (more frequent averaging).
-    /// If divergence < threshold/2, double the interval (less frequent averaging).
-    ///
-    /// Note: the production path uses [`compute_average_and_cadence`] on a
-    /// background thread. This method is kept for direct testing.
-    #[cfg(test)]
-    pub(super) fn update_cadence(&mut self, snapshots: &[ParamSnapshot]) -> Result<()> {
-        // Compute per-rank parameter L2 norm (sum of all param norms)
+    /// Static method: captures only the data it needs, no `&self` borrow.
+    /// Returns `CpuAvgResult` with the averaged params and the relative
+    /// divergence across replicas (for anchor correction by ElChe).
+    fn compute_average_and_divergence(
+        snapshots: Vec<ParamSnapshot>,
+        version: u64,
+    ) -> Result<CpuAvgResult> {
+        let averaged = Self::average_params(&snapshots, version)?;
+
+        // Compute per-rank parameter L2 norm for divergence monitoring.
         let mut norms = Vec::with_capacity(snapshots.len());
-        for snap in snapshots {
+        for snap in &snapshots {
             let mut total_norm_sq = 0.0f64;
             for p in &snap.params {
                 let n: f64 = p.norm()?.item()?;
@@ -1309,74 +1313,15 @@ impl Coordinator {
         }
 
         let mean_norm: f64 = norms.iter().sum::<f64>() / norms.len() as f64;
-        if mean_norm < 1e-10 {
-            return Ok(()); // all zeros, nothing to do
-        }
-
-        let divergence: f64 = norms.iter()
-            .map(|n| (n - mean_norm).abs())
-            .sum::<f64>() / mean_norm;
-
-        if divergence > self.divergence_threshold {
-            // Tighten: halve the interval (min 1)
-            self.avg_interval = (self.avg_interval / 2).max(1);
-        } else if divergence < self.divergence_threshold / 2.0 {
-            // Back off: double the interval
-            self.avg_interval = (self.avg_interval * 2).min(1000);
-        }
-
-        self.last_param_norms = norms;
-        Ok(())
-    }
-
-    /// Compute weighted average and (optionally) cadence update on a background thread.
-    ///
-    /// Static method: captures only the data it needs, no `&self` borrow.
-    /// Returns `CpuAvgResult` with the averaged params and an optional
-    /// `(new_interval, norms)` tuple for Async policy.
-    fn compute_average_and_cadence(
-        snapshots: Vec<ParamSnapshot>,
-        version: u64,
-        policy: ApplyPolicy,
-        avg_interval: usize,
-        divergence_threshold: f64,
-    ) -> Result<CpuAvgResult> {
-        let averaged = Self::average_params(&snapshots, version)?;
-
-        let cadence_update = if policy == ApplyPolicy::Async {
-            // Inline the divergence computation (same logic as update_cadence
-            // but without &mut self, returns the result instead of mutating).
-            let mut norms = Vec::with_capacity(snapshots.len());
-            for snap in &snapshots {
-                let mut total_norm_sq = 0.0f64;
-                for p in &snap.params {
-                    let n: f64 = p.norm()?.item()?;
-                    total_norm_sq += n * n;
-                }
-                norms.push(total_norm_sq.sqrt());
-            }
-
-            let mean_norm: f64 = norms.iter().sum::<f64>() / norms.len() as f64;
-            let new_interval = if mean_norm < 1e-10 {
-                avg_interval // all zeros, no change
-            } else {
-                let divergence: f64 = norms.iter()
-                    .map(|n| (n - mean_norm).abs())
-                    .sum::<f64>() / mean_norm;
-                if divergence > divergence_threshold {
-                    (avg_interval / 2).max(1)
-                } else if divergence < divergence_threshold / 2.0 {
-                    (avg_interval * 2).min(1000)
-                } else {
-                    avg_interval
-                }
-            };
-            Some((new_interval, norms))
+        let divergence = if mean_norm < 1e-10 {
+            None // all zeros, no meaningful divergence
         } else {
-            None
+            Some(norms.iter()
+                .map(|n| (n - mean_norm).abs())
+                .sum::<f64>() / mean_norm)
         };
 
-        Ok(CpuAvgResult { averaged, cadence_update })
+        Ok(CpuAvgResult { averaged, divergence })
     }
 
     /// Throttle workers that have run too far ahead of the slowest rank.

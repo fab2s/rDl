@@ -635,6 +635,14 @@ impl<M: Module> GpuWorker<M> {
             return Ok(false);
         }
 
+        // Defragment CUDA allocator between chunks. The caching allocator
+        // holds freed blocks from the previous chunk's activations and NCCL
+        // buffers, which fragment VRAM. Without this, follow-up chunks can
+        // OOM even though enough total VRAM exists (just not contiguous).
+        if self.device.is_cuda() {
+            crate::tensor::cuda_empty_cache();
+        }
+
         // Recalculate prefetch depth at each plan boundary (VRAM may vary).
         // Cap at num_batches: no point buffering more than the chunk contains.
         // Depth 0 means VRAM is too tight for any prefetch buffer.

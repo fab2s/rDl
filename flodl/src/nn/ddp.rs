@@ -1017,6 +1017,28 @@ impl ElChe {
         self.anchor
     }
 
+    /// Reduce the anchor by `factor` (e.g. 0.5 = halve).
+    ///
+    /// One-directional correction for parameter divergence: tightens sync
+    /// cadence when replicas drift apart. Does NOT loosen; ElChe's overhead
+    /// auto-tune handles upward adjustment.
+    ///
+    /// Bypasses `min_anchor` (clamped to 1) because divergence is a stronger
+    /// signal than the overhead floor. The overhead auto-tune will recover
+    /// the anchor upward once divergence subsides.
+    pub fn nudge_anchor_down(&mut self, factor: f64) {
+        let new = (self.anchor as f64 * factor.clamp(0.1, 1.0)).ceil() as usize;
+        self.anchor = new.max(1).min(self.anchor);
+        // Recompute batch counts from the reduced anchor.
+        let slow_ms = self.ms_per_batch
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        if slow_ms > 0.0 {
+            self.recompute_batch_counts(slow_ms);
+        }
+    }
+
     /// Whether at least one timing measurement has been reported.
     pub fn is_calibrated(&self) -> bool {
         self.calibrated
@@ -2105,6 +2127,46 @@ mod tests {
         // High overhead won't increase anchor past 1
         let bc = c.batch_counts().to_vec(); c.report_timing(&[100.0, 200.0], &bc, 500.0);
         assert_eq!(c.anchor(), 1);
+    }
+
+    #[test]
+    fn test_nudge_anchor_down() {
+        // Need calibrated ElChe so recompute_batch_counts works.
+        let mut c = ElChe::new(2, 20)
+            .with_overhead_target(0.50); // high target to avoid auto-tune interference
+        // Calibrate with 2:1 speed ratio (rank 1 slow).
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[50.0, 100.0], &bc, 0.0);
+        assert!(c.is_calibrated());
+        assert_eq!(c.anchor(), 20);
+        assert_eq!(c.batches(0), 40); // fast rank
+        assert_eq!(c.batches(1), 20); // slow rank (anchor)
+
+        // Halve the anchor
+        c.nudge_anchor_down(0.5);
+        assert_eq!(c.anchor(), 10);
+        // Batch counts recomputed proportionally
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_nudge_anchor_down_clamped_to_one() {
+        // Nudging can go below min_anchor but never below 1.
+        let mut c = ElChe::new(2, 5);
+        assert_eq!(c.anchor(), 5);
+
+        // factor=0.1 -> ceil(5 * 0.1) = 1
+        c.nudge_anchor_down(0.1);
+        assert_eq!(c.anchor(), 1, "should clamp to 1");
+    }
+
+    #[test]
+    fn test_nudge_anchor_down_never_increases() {
+        let mut c = ElChe::new(2, 10);
+        // factor > 1.0 is clamped to 1.0
+        c.nudge_anchor_down(2.0);
+        assert_eq!(c.anchor(), 10, "should never increase");
     }
 
     #[test]

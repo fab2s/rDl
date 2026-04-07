@@ -232,10 +232,10 @@ pub struct EpochMetrics {
 /// - `Cadence`: K=N (ElChe anchor count). The slow GPU anchors the cadence,
 ///   fast GPUs fill the wall time with extra batches. Recommended for
 ///   heterogeneous hardware (e.g. mixing GPU generations).
-/// - `Async`: K=adaptive. ElChe starts conservative (K=1), then backs off
-///   as parameter divergence stays low. Maximizes GPU utilization at the
-///   cost of some gradient staleness. Best for large models where each
-///   batch is expensive and synchronization overhead matters.
+/// - `Async`: same proportional scheduling as Cadence (ElChe batch counts),
+///   but with divergence correction: if replicas drift apart, the anchor
+///   is nudged down (tighter sync). Differs from Cadence only in epoch
+///   dispatch (per-rank vs broadcast) in non-progressive mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ApplyPolicy {
     /// Average after every batch (K=1). Equivalent to standard synchronous DDP.
@@ -245,11 +245,10 @@ pub enum ApplyPolicy {
     /// The slow device sets the pace; fast devices process proportionally more
     /// batches per averaging window. Good default for mixed GPU setups.
     Cadence,
-    /// ElChe auto-tunes the averaging interval based on observed parameter
-    /// divergence. Starts conservative (K=1), backs off as convergence
-    /// stabilizes. Tightens again if replicas drift apart. Best throughput,
-    /// requires monitoring. Pair with [`DdpRunConfig::with_max_batch_diff`]
-    /// for a safety bound.
+    /// Same proportional scheduling as Cadence, plus divergence correction:
+    /// if parameter norms drift apart, ElChe's anchor is nudged down
+    /// (tighter sync). Differs from Cadence only in epoch dispatch
+    /// (per-rank in non-progressive, identical in progressive mode).
     Async,
 }
 
@@ -1137,7 +1136,6 @@ mod tests {
     fn test_coordinator_initial_state() {
         let h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Nccl);
         assert_eq!(h.coord.version(), 0);
-        assert_eq!(h.coord.avg_interval(), 1);
         assert!(!h.coord.is_calibrated());
         assert_eq!(h.coord.steps_since_avg(), &[0, 0]);
     }
@@ -1176,14 +1174,19 @@ mod tests {
     fn test_coordinator_should_average_async() {
         let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Nccl);
 
-        // avg_interval starts at 1
-        assert_eq!(h.coord.avg_interval(), 1);
+        // Async now uses batch_counts() same as Cadence (anchor=10 from harness).
+        // Feed 9 steps per rank: not enough yet.
+        for _ in 0..9 {
+            h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1 }).unwrap();
+            h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1 }).unwrap();
+        }
+        h.coord.drain_timing();
+        assert!(!h.coord.should_average());
 
-        // Feed one step per rank
+        // 10th step: both ranks reach batch_counts (anchor=10, uncalibrated so equal).
         h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1 }).unwrap();
         h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1 }).unwrap();
         h.coord.drain_timing();
-
         assert!(h.coord.should_average());
     }
 
@@ -1357,65 +1360,47 @@ mod tests {
     }
 
     #[test]
-    fn test_coordinator_update_cadence_divergent() {
-        let dev = test_device();
-        let opts = TensorOptions { dtype: DType::Float32, device: dev };
-
+    fn test_divergence_correction_nudges_anchor_down() {
+        // High divergence should nudge ElChe's anchor down after timing
+        // calibration. Use zero sync_ms to avoid overhead auto-tune.
         let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Cpu);
-        h.coord.avg_interval = 10; // start with wide interval
 
-        // Highly divergent snapshots
-        let snapshots = vec![
-            ParamSnapshot {
-                rank: 0,
-                params: vec![Tensor::ones(&[100], opts).unwrap()],
-                buffers: vec![],
-                batch_count: 1,
-            },
-            ParamSnapshot {
-                rank: 1,
-                params: vec![Tensor::full(&[100], 100.0, opts).unwrap()],
-                buffers: vec![],
-                batch_count: 1,
-            },
-        ];
+        // Calibrate first so we have a stable anchor baseline.
+        let steps = vec![10; 2];
+        let wall_ms = vec![100.0; 2];
+        h.coord.finish_averaging_cpu(0.0, &steps, &wall_ms, None);
+        let anchor_after_calibration = h.coord.el_che.anchor();
+        assert!(anchor_after_calibration >= 10);
 
-        h.coord.update_cadence(&snapshots).unwrap();
+        // Now apply with high divergence (same timing, zero sync_ms).
+        let steps2 = vec![10; 2];
+        let wall_ms2 = vec![100.0; 2];
+        h.coord.finish_averaging_cpu(0.0, &steps2, &wall_ms2, Some(0.20));
 
-        // High divergence should have halved the interval
-        assert!(h.coord.avg_interval() < 10,
-            "interval should decrease, got {}", h.coord.avg_interval());
+        // Anchor should have decreased from calibrated value.
+        assert!(h.coord.el_che.anchor() < anchor_after_calibration,
+            "anchor should decrease from {}, got {}",
+            anchor_after_calibration, h.coord.el_che.anchor());
     }
 
     #[test]
-    fn test_coordinator_update_cadence_converged() {
-        let dev = test_device();
-        let opts = TensorOptions { dtype: DType::Float32, device: dev };
-
+    fn test_divergence_below_threshold_no_correction() {
+        // Low divergence should NOT change the anchor.
         let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Cpu);
-        h.coord.avg_interval = 4;
 
-        // Nearly identical snapshots (low divergence)
-        let snapshots = vec![
-            ParamSnapshot {
-                rank: 0,
-                params: vec![Tensor::ones(&[100], opts).unwrap()],
-                buffers: vec![],
-                batch_count: 1,
-            },
-            ParamSnapshot {
-                rank: 1,
-                params: vec![Tensor::full(&[100], 1.001, opts).unwrap()],
-                buffers: vec![],
-                batch_count: 1,
-            },
-        ];
+        // Calibrate with zero sync_ms.
+        let steps = vec![10; 2];
+        let wall_ms = vec![100.0; 2];
+        h.coord.finish_averaging_cpu(0.0, &steps, &wall_ms, None);
+        let anchor_after_calibration = h.coord.el_che.anchor();
 
-        h.coord.update_cadence(&snapshots).unwrap();
+        // Apply with low divergence.
+        let steps2 = vec![10; 2];
+        let wall_ms2 = vec![100.0; 2];
+        h.coord.finish_averaging_cpu(0.0, &steps2, &wall_ms2, Some(0.01));
 
-        // Low divergence should have doubled the interval
-        assert!(h.coord.avg_interval() > 4,
-            "interval should increase, got {}", h.coord.avg_interval());
+        // Divergence 0.01 < threshold 0.05: no correction applied.
+        assert_eq!(h.coord.el_che.anchor(), anchor_after_calibration);
     }
 
     // -----------------------------------------------------------------------
@@ -2147,58 +2132,63 @@ mod tests {
     }
 
     #[test]
-    fn test_async_adaptive_k_increase() {
-        // With Async policy and low divergence, K should increase.
+    fn test_cpu_averaging_divergence_correction() {
+        // Full pipeline: high divergence during CPU averaging triggers
+        // anchor correction via nudge_anchor_down.
         let dev = test_device();
         let opts = TensorOptions { dtype: DType::Float32, device: dev };
         let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Cpu);
 
-        // Start at K=1
-        assert_eq!(h.coord.avg_interval(), 1);
+        assert_eq!(h.coord.el_che.anchor(), 10);
 
-        // Feed timing so trigger fires, with nearly identical params
-        for _ in 0..5 {
+        // Feed enough timing to reach batch_counts (anchor=10, uncalibrated).
+        for _ in 0..10 {
             h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
             h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 0 }).unwrap();
-            h.coord.drain_timing();
+        }
+        h.coord.drain_timing();
+        assert!(h.coord.should_average());
 
-            if h.coord.should_average() {
-                // Non-blocking trigger enters Collecting state
-                h.coord.trigger_averaging().unwrap();
+        // Trigger CPU averaging with highly divergent snapshots.
+        h.coord.trigger_averaging().unwrap();
+        h.param_tx.send(ParamSnapshot {
+            rank: 0,
+            params: vec![Tensor::ones(&[100], opts).unwrap()],
+            buffers: vec![],
+            batch_count: 1,
+        }).unwrap();
+        h.param_tx.send(ParamSnapshot {
+            rank: 1,
+            params: vec![Tensor::full(&[100], 100.0, opts).unwrap()],
+            buffers: vec![],
+            batch_count: 1,
+        }).unwrap();
 
-                // Supply snapshots
-                h.param_tx.send(ParamSnapshot {
-                    rank: 0,
-                    params: vec![Tensor::ones(&[10], opts).unwrap()],
-                    buffers: vec![],
-                    batch_count: 1,
-                }).unwrap();
-                h.param_tx.send(ParamSnapshot {
-                    rank: 1,
-                    params: vec![Tensor::full(&[10], 1.001, opts).unwrap()],
-                    buffers: vec![],
-                    batch_count: 1,
-                }).unwrap();
-
-                // Poll until averaging completes
-                let v_before = h.coord.version();
-                for _ in 0..100 {
-                    h.coord.poll_cpu_averaging().unwrap();
-                    if h.coord.version() > v_before {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-
-                for rx in &h.control_rxs {
-                    while rx.try_recv().is_ok() {}
-                }
+        // Poll until averaging completes.
+        let v_before = h.coord.version();
+        for _ in 0..100 {
+            h.coord.poll_cpu_averaging().unwrap();
+            if h.coord.version() > v_before {
+                break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(h.coord.version() > v_before, "averaging should have completed");
+
+        // Drain control messages.
+        for rx in &h.control_rxs {
+            while rx.try_recv().is_ok() {}
         }
 
-        // Low divergence should have increased K beyond initial 1
-        assert!(h.coord.avg_interval() > 1,
-            "K should increase with low divergence, got {}", h.coord.avg_interval());
+        // After one round: report_timing auto-tunes anchor up (from overhead),
+        // then divergence correction halves it. Final anchor should be lower
+        // than the post-overhead-auto-tune value. We verify it completed and
+        // the anchor is reasonable (not at max_anchor=200).
+        let anchor = h.coord.el_che.anchor();
+        assert!(anchor < 200,
+            "divergence correction should have kept anchor below max, got {}", anchor);
+        // Verify calibration happened.
+        assert!(h.coord.is_calibrated());
     }
 
     // -----------------------------------------------------------------------
