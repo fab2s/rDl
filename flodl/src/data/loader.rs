@@ -55,7 +55,8 @@ const BOOTSTRAP_PREFETCH: usize = 4;
 ///
 /// `max_usage` is the fraction of **total** VRAM to use (default 0.90).
 /// The prefetch budget is the gap between current usage and the cap,
-/// leaving room for activations, gradients, and CUDA allocator overhead.
+/// minus `activation_reserve` bytes reserved for forward/backward
+/// activation memory and gradients.
 ///
 /// Called at each `epoch()` boundary. By that point the model, optimizer,
 /// and any other allocations are done, so current usage is the real baseline.
@@ -64,6 +65,7 @@ pub(crate) fn prefetch_depth_from_vram(
     batch_size: usize,
     device: Device,
     max_usage: f64,
+    activation_reserve: usize,
 ) -> usize {
     if !device.is_cuda() {
         return 2; // CPU: just double-buffer
@@ -80,7 +82,7 @@ pub(crate) fn prefetch_depth_from_vram(
 
     let used = (total as usize).saturating_sub(free as usize);
     let cap = (total as f64 * max_usage.clamp(0.5, 0.99)) as usize;
-    let budget = cap.saturating_sub(used);
+    let budget = cap.saturating_sub(used + activation_reserve);
 
     budget / batch_bytes
 }
@@ -603,7 +605,7 @@ impl DataLoader {
         match &mut self.inner {
             LoaderInner::Resident(_) => 0,
             LoaderInner::Streaming(l) => {
-                let depth = prefetch_depth_from_vram(l.per_sample_bytes, l.batch_size, l.device, l.vram_max_usage);
+                let depth = prefetch_depth_from_vram(l.per_sample_bytes, l.batch_size, l.device, l.vram_max_usage, 0);
                 l.worker.set_prefetch_depth(depth);
                 l.user_set_depth = true;
                 depth
@@ -613,7 +615,7 @@ impl DataLoader {
                 let mut max_depth = 0;
                 for backend in &mut l.backends {
                     if let DeviceBackend::Streaming { worker, device, per_sample_bytes } = backend {
-                        let depth = prefetch_depth_from_vram(*per_sample_bytes, bs, *device, VRAM_MAX_USAGE);
+                        let depth = prefetch_depth_from_vram(*per_sample_bytes, bs, *device, VRAM_MAX_USAGE, 0);
                         worker.set_prefetch_depth(depth);
                         max_depth = max_depth.max(depth);
                     }
@@ -814,7 +816,7 @@ impl StreamingLoader {
         // At epoch N>0: re-probe in case conditions changed.
         if !self.user_set_depth {
             let depth = prefetch_depth_from_vram(
-                self.per_sample_bytes, self.batch_size, self.device, self.vram_max_usage,
+                self.per_sample_bytes, self.batch_size, self.device, self.vram_max_usage, 0,
             );
             self.worker.set_prefetch_depth(depth);
         }
@@ -2292,19 +2294,19 @@ mod tests {
     #[test]
     fn test_prefetch_depth_from_vram_cpu() {
         // CPU always returns 2 (double-buffer)
-        let depth = prefetch_depth_from_vram(100, 32, Device::CPU, 0.90);
+        let depth = prefetch_depth_from_vram(100, 32, Device::CPU, 0.90, 0);
         assert_eq!(depth, 2);
     }
 
     #[test]
     fn test_prefetch_depth_from_vram_zero_batch() {
-        let depth = prefetch_depth_from_vram(0, 32, Device::CPU, 0.90);
+        let depth = prefetch_depth_from_vram(0, 32, Device::CPU, 0.90, 0);
         assert_eq!(depth, 2);
     }
 
     #[test]
     fn test_prefetch_depth_from_vram_zero_bytes() {
-        let depth = prefetch_depth_from_vram(100, 0, Device::CPU, 0.90);
+        let depth = prefetch_depth_from_vram(100, 0, Device::CPU, 0.90, 0);
         assert_eq!(depth, 2);
     }
 

@@ -89,6 +89,11 @@ pub struct GpuWorker<M: Module> {
     prefetch: Option<crate::data::prefetch::PrefetchWorker>,
     /// Bytes per sample (for VRAM gauge depth calculation).
     per_sample_bytes: usize,
+    /// Measured activation peak (activations + gradients) from training.
+    /// Used as a reserve in the VRAM gauge so prefetch doesn't fill
+    /// memory that forward/backward will need. Zero = not yet measured;
+    /// first chunk runs sync to calibrate.
+    activation_peak_bytes: usize,
 }
 
 /// Channels bundle returned by [`GpuWorker::channels`] for wiring into the coordinator.
@@ -211,13 +216,19 @@ impl<M: Module> GpuWorker<M> {
         // Cap depth at 512 to avoid huge channel allocations when
         // batch_bytes is tiny (e.g. toy test datasets).
         // Depth 0 = skip prefetch entirely (sync fallback for tight VRAM).
+        //
+        // Note: activation_reserve=0 here because we haven't measured the
+        // training activation peak yet. The first run_epoch_plan() will
+        // force depth=0 (sync) to calibrate, then adjust on subsequent chunks.
         let (prefetch, per_sample_bytes) = if config.device.is_cuda() {
             let sample = dataset.get_batch(&[0])?;
             let psb: usize = sample.iter().map(|t| t.nbytes()).sum();
             drop(sample);
             let depth = crate::data::prefetch_depth_from_vram(
-                psb, config.batch_size, config.device, 0.90,
+                psb, config.batch_size, config.device, 0.90, 0,
             ).min(512);
+            // Reset peak stats so first run_epoch_plan gets a clean baseline.
+            crate::tensor::cuda_reset_peak_stats_idx(config.device.index() as i32);
             if depth > 0 {
                 let pw = crate::data::prefetch::PrefetchWorker::new(
                     Arc::clone(&dataset), config.device, depth,
@@ -258,6 +269,7 @@ impl<M: Module> GpuWorker<M> {
             checkpoint_fn,
             prefetch,
             per_sample_bytes,
+            activation_peak_bytes: 0,
         })
     }
 
@@ -643,16 +655,43 @@ impl<M: Module> GpuWorker<M> {
             crate::tensor::cuda_empty_cache();
         }
 
+        // Update activation peak from the previous chunk's high-water mark.
+        // Uses max() so the budget never grows beyond the worst observed peak.
+        // Sync first so all async work (NCCL on comm_stream, etc.) completes
+        // and deferred frees are processed before reading the baseline.
+        if self.device.is_cuda() && self.activation_peak_bytes > 0 {
+            let idx = self.device.index() as i32;
+            crate::tensor::cuda_synchronize(idx as u8);
+            if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
+                if let Ok(baseline) = crate::tensor::cuda_active_bytes_idx(idx) {
+                    let overhead = (peak as usize).saturating_sub(baseline as usize);
+                    let batch_bytes = self.per_sample_bytes * self.batch_size;
+                    let activation = overhead.saturating_sub(batch_bytes);
+                    self.activation_peak_bytes = self.activation_peak_bytes.max(activation);
+                }
+            }
+            crate::tensor::cuda_reset_peak_stats_idx(idx);
+        }
+
         // Recalculate prefetch depth at each plan boundary (VRAM may vary).
         // Cap at num_batches: no point buffering more than the chunk contains.
         // Depth 0 means VRAM is too tight for any prefetch buffer.
+        //
+        // If activation peak hasn't been measured yet, force depth=0 (sync
+        // fallback) so the first chunk can calibrate safely.
         let use_prefetch = if let Some(ref mut pw) = self.prefetch {
-            let vram_depth = crate::data::prefetch_depth_from_vram(
-                self.per_sample_bytes, self.batch_size, self.device, 0.90,
-            );
-            let depth = vram_depth.min(num_batches);
-            pw.set_prefetch_depth(depth);
-            depth > 0
+            if self.activation_peak_bytes == 0 && self.device.is_cuda() {
+                pw.set_prefetch_depth(0);
+                false
+            } else {
+                let vram_depth = crate::data::prefetch_depth_from_vram(
+                    self.per_sample_bytes, self.batch_size, self.device, 0.90,
+                    self.activation_peak_bytes,
+                );
+                let depth = vram_depth.min(num_batches);
+                pw.set_prefetch_depth(depth);
+                depth > 0
+            }
         } else {
             false
         };
@@ -698,6 +737,8 @@ impl<M: Module> GpuWorker<M> {
         } else {
             // Sync path: load one batch at a time, move to device if needed.
             // Used for CPU devices, or CUDA when VRAM is too tight for prefetch.
+            let measuring_peak = self.activation_peak_bytes == 0 && self.device.is_cuda();
+
             for batch_idx in 0..num_batches {
                 let start = batch_idx * self.batch_size;
                 let end = start + self.batch_size;
@@ -714,6 +755,26 @@ impl<M: Module> GpuWorker<M> {
 
                 let (loss, ms) = self.train_step(&batch, train_fn)?;
                 total_loss += loss;
+
+                // After first batch: measure activation peak from CUDA stats.
+                // The peak includes model + batch + activations + gradients.
+                // Subtract baseline (model/optimizer/NCCL) and one batch to
+                // isolate the activation + gradient overhead. This is the
+                // reserve that prefetch_depth_from_vram must account for.
+                if measuring_peak && batch_idx == 0 {
+                    let idx = self.device.index() as i32;
+                    crate::tensor::cuda_synchronize(idx as u8);
+                    if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
+                        if let Ok(current) = crate::tensor::cuda_active_bytes_idx(idx) {
+                            let overhead = (peak as usize).saturating_sub(current as usize);
+                            let batch_bytes = self.per_sample_bytes * self.batch_size;
+                            self.activation_peak_bytes = overhead.saturating_sub(batch_bytes);
+                        }
+                    }
+                    // Reset for ongoing monitoring in subsequent chunks.
+                    crate::tensor::cuda_reset_peak_stats_idx(idx);
+                }
+
                 let _ = self.report_timing(ms);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
