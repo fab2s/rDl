@@ -291,6 +291,22 @@ impl Monitor {
         }
     }
 
+    /// Set the graph label and structural hash for the dashboard header.
+    ///
+    /// This is the standalone equivalent of what [`watch()`](Self::watch) does
+    /// via `capture_graph_identity`. Use when you have the identity strings
+    /// but not a `&Graph` reference (e.g. from [`DdpHandle::setup_monitor()`]).
+    pub fn set_identity(&mut self, label: Option<&str>, hash: Option<&str>) {
+        self.graph_label = label.map(|s| s.to_string());
+        self.graph_hash = hash.map(|s| s.to_string());
+        if let Some(ref srv) = self.server {
+            srv.set_label_hash(
+                self.graph_label.clone(),
+                self.graph_hash.clone(),
+            );
+        }
+    }
+
     fn capture_graph_identity(&mut self, graph: &Graph) {
         self.graph_label = graph.label().map(|s| s.to_string());
         self.graph_hash = Some(graph.structural_hash().to_string());

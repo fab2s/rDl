@@ -1503,27 +1503,55 @@ fn ratio_to_sizes(ratios: &[f64], total: usize) -> Vec<usize> {
 ///
 /// Loss and scalars are averaged weighted by batch count (proportional
 /// to each rank's contribution). Epoch time is the max across ranks.
+///
+/// In progressive dispatch mode, each rank sends one [`MetricsMsg`] per
+/// chunk (not per epoch), so there may be many more messages than ranks.
+/// This function aggregates by rank first so the output always has
+/// exactly `world_size` entries per vector.
 pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_indices: &[u8]) -> super::EpochMetrics {
-    let total_batches: usize = msgs.iter().map(|m| m.batches_processed).sum();
+    let world_size = device_indices.len();
+
+    // --- Step 1: Aggregate per-chunk messages by rank ---
+    let mut rank_batches: Vec<usize> = vec![0; world_size];
+    let mut rank_samples: Vec<usize> = vec![0; world_size];
+    let mut rank_loss_sum: Vec<f64> = vec![0.0; world_size];
+    let mut rank_time_ms: Vec<f64> = vec![0.0; world_size];
+    // Per-rank scalar accumulators: (sum, count) per key
+    let mut rank_scalars: Vec<std::collections::HashMap<String, (f64, usize)>> =
+        (0..world_size).map(|_| std::collections::HashMap::new()).collect();
+
+    for m in msgs {
+        let r = m.rank.min(world_size - 1);
+        rank_batches[r] += m.batches_processed;
+        rank_samples[r] += m.samples_processed;
+        rank_loss_sum[r] += m.avg_loss * m.batches_processed as f64;
+        // Max time across chunks (sequential within a rank)
+        rank_time_ms[r] = rank_time_ms[r].max(m.epoch_ms);
+        for (k, (sum, count)) in &m.scalars {
+            let entry = rank_scalars[r].entry(k.clone()).or_insert((0.0, 0));
+            entry.0 += sum;
+            entry.1 += count;
+        }
+    }
+
+    // --- Step 2: Compute aggregated metrics ---
+    let total_batches: usize = rank_batches.iter().sum();
 
     // Batch-weighted average loss
     let avg_loss = if total_batches > 0 {
-        msgs.iter()
-            .map(|m| m.avg_loss * m.batches_processed as f64)
-            .sum::<f64>()
-            / total_batches as f64
+        rank_loss_sum.iter().sum::<f64>() / total_batches as f64
     } else {
         0.0
     };
 
     // Max epoch_ms across ranks
-    let epoch_ms = msgs.iter().map(|m| m.epoch_ms).fold(0.0_f64, f64::max);
+    let epoch_ms = rank_time_ms.iter().copied().fold(0.0_f64, f64::max);
 
-    // Per-rank scalar means
-    let per_rank: Vec<std::collections::HashMap<String, f64>> = msgs
+    // Per-rank scalar means (each rank's sum/count)
+    let per_rank: Vec<std::collections::HashMap<String, f64>> = rank_scalars
         .iter()
-        .map(|m| {
-            m.scalars
+        .map(|scalars| {
+            scalars
                 .iter()
                 .map(|(k, (sum, count))| {
                     (k.clone(), if *count > 0 { sum / *count as f64 } else { 0.0 })
@@ -1535,9 +1563,9 @@ pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_
     // Weighted-average scalars across ranks
     let mut scalars: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     let mut weights: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    for m in msgs {
-        let w = m.batches_processed as f64;
-        for (k, (sum, count)) in &m.scalars {
+    for (r, rank_sc) in rank_scalars.iter().enumerate() {
+        let w = rank_batches[r] as f64;
+        for (k, (sum, count)) in rank_sc {
             if *count > 0 {
                 let mean = sum / *count as f64;
                 *scalars.entry(k.clone()).or_default() += mean * w;
@@ -1554,23 +1582,17 @@ pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_
     }
 
     // Per-rank throughput (samples/ms) and batch share
-    let total_samples: usize = msgs.iter().map(|m| m.samples_processed).sum();
-    let per_rank_throughput: Vec<f64> = msgs.iter().map(|m| {
-        if m.epoch_ms > 0.0 { m.samples_processed as f64 / m.epoch_ms } else { 0.0 }
+    let total_samples: usize = rank_samples.iter().sum();
+    let per_rank_throughput: Vec<f64> = (0..world_size).map(|r| {
+        if rank_time_ms[r] > 0.0 { rank_samples[r] as f64 / rank_time_ms[r] } else { 0.0 }
     }).collect();
-    let per_rank_batch_share: Vec<f64> = msgs.iter().map(|m| {
-        if total_samples > 0 { m.samples_processed as f64 / total_samples as f64 } else { 0.0 }
+    let per_rank_batch_share: Vec<f64> = (0..world_size).map(|r| {
+        if total_samples > 0 { rank_samples[r] as f64 / total_samples as f64 } else { 0.0 }
     }).collect();
-
-    let dev_indices = if device_indices.len() >= msgs.len() {
-        device_indices[..msgs.len()].to_vec()
-    } else {
-        (0..msgs.len() as u8).collect()
-    };
 
     super::EpochMetrics {
         epoch, scalars, per_rank, avg_loss, epoch_ms,
-        per_rank_throughput, per_rank_batch_share, device_indices: dev_indices,
+        per_rank_throughput, per_rank_batch_share, device_indices: device_indices.to_vec(),
     }
 }
 

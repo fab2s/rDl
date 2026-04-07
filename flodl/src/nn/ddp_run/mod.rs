@@ -2891,6 +2891,76 @@ mod tests {
         assert_eq!(m.device_indices, vec![0, 1]);
     }
 
+    /// Progressive dispatch: multiple MetricsMsg per rank should be aggregated
+    /// into exactly world_size entries, not one entry per message.
+    #[test]
+    fn test_aggregate_epoch_metrics_progressive() {
+        use super::coordinator::aggregate_epoch_metrics;
+
+        // Simulate 2 ranks, 3 chunks from rank 0, 2 chunks from rank 1
+        let msgs = vec![
+            // Rank 0 chunk 1
+            MetricsMsg {
+                rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 20,
+                epoch_ms: 300.0, samples_processed: 640,
+                scalars: [("loss".to_string(), (2.0, 2_usize))].into(),
+            },
+            // Rank 0 chunk 2
+            MetricsMsg {
+                rank: 0, epoch: 0, avg_loss: 0.4, batches_processed: 20,
+                epoch_ms: 600.0, samples_processed: 640,
+                scalars: [("loss".to_string(), (1.6, 2_usize))].into(),
+            },
+            // Rank 0 chunk 3
+            MetricsMsg {
+                rank: 0, epoch: 0, avg_loss: 0.6, batches_processed: 20,
+                epoch_ms: 900.0, samples_processed: 640,
+                scalars: [("loss".to_string(), (1.8, 2_usize))].into(),
+            },
+            // Rank 1 chunk 1
+            MetricsMsg {
+                rank: 1, epoch: 0, avg_loss: 0.7, batches_processed: 20,
+                epoch_ms: 500.0, samples_processed: 640,
+                scalars: [("loss".to_string(), (2.8, 2_usize))].into(),
+            },
+            // Rank 1 chunk 2
+            MetricsMsg {
+                rank: 1, epoch: 0, avg_loss: 0.8, batches_processed: 20,
+                epoch_ms: 1000.0, samples_processed: 640,
+                scalars: [("loss".to_string(), (3.2, 2_usize))].into(),
+            },
+        ];
+
+        let dev_indices = vec![0_u8, 1];
+        let m = aggregate_epoch_metrics(0, &msgs, &dev_indices);
+
+        // Must have exactly 2 entries (world_size), not 5 (one per msg)
+        assert_eq!(m.per_rank_throughput.len(), 2, "should have world_size entries");
+        assert_eq!(m.per_rank_batch_share.len(), 2);
+        assert_eq!(m.per_rank.len(), 2);
+        assert_eq!(m.device_indices, vec![0, 1]);
+
+        // Rank 0: 60 batches, 1920 samples, max time 900ms
+        // Rank 1: 40 batches, 1280 samples, max time 1000ms
+        assert!((m.per_rank_throughput[0] - 1920.0 / 900.0).abs() < 1e-6);
+        assert!((m.per_rank_throughput[1] - 1280.0 / 1000.0).abs() < 1e-6);
+
+        // Total samples = 3200
+        assert!((m.per_rank_batch_share[0] - 0.6).abs() < 1e-9);
+        assert!((m.per_rank_batch_share[1] - 0.4).abs() < 1e-9);
+
+        // Max epoch_ms across ranks
+        assert_eq!(m.epoch_ms, 1000.0);
+
+        // Scalars: rank 0 loss mean = (2.0+1.6+1.8)/(2+2+2) = 5.4/6 = 0.9
+        assert!((m.per_rank[0]["loss"] - 0.9).abs() < 1e-9);
+        // Rank 1 loss mean = (2.8+3.2)/(2+2) = 6.0/4 = 1.5
+        assert!((m.per_rank[1]["loss"] - 1.5).abs() < 1e-9);
+
+        // Weighted average: (0.9*60 + 1.5*40)/100 = (54+60)/100 = 1.14
+        assert!((m.scalars["loss"] - 1.14).abs() < 1e-9);
+    }
+
     // -----------------------------------------------------------------------
     // Regression: NCCL safety during shutdown (progressive dispatch deadlock)
     // -----------------------------------------------------------------------

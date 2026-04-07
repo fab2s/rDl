@@ -95,6 +95,9 @@ user-select:none;font-weight:500}
 .tab-view.active{display:block}
 
 /* GPU summary (Home tab) */
+.gpu-summary-wrap{max-height:280px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.gpu-summary-wrap::-webkit-scrollbar{width:6px}
+.gpu-summary-wrap::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 .gpu-summary{display:grid;gap:10px}
 .gpu-row{display:flex;align-items:center;gap:12px;padding:8px 12px;
 background:rgba(42,45,58,0.4);border-radius:6px;font-size:12px}
@@ -187,7 +190,9 @@ overflow:hidden;min-width:80px}
 
   <div class="card full-width" id="gpuSummaryCard" style="display:none">
     <h2>GPU Overview</h2>
-    <div class="gpu-summary" id="gpuSummary"></div>
+    <div class="gpu-summary-wrap">
+      <div class="gpu-summary" id="gpuSummary"></div>
+    </div>
   </div>
 
   <div class="card full-width" id="svgCard" style="display:none">

@@ -77,6 +77,14 @@ pub struct DdpHandle {
     final_state: Option<TrainedState>,
     /// Receiver for aggregated epoch metrics from the coordinator.
     metrics_rx: Option<mpsc::Receiver<super::EpochMetrics>>,
+    /// Graph architecture SVG captured from the model (if it implements as_graph).
+    architecture_svg: Option<String>,
+    /// Graph label (from as_graph().label()).
+    graph_label: Option<String>,
+    /// Structural hash (from as_graph().structural_hash()).
+    graph_hash: Option<String>,
+    /// Training config snapshot for monitor metadata.
+    training_meta: Option<serde_json::Value>,
 }
 
 impl DdpHandle {
@@ -189,10 +197,25 @@ impl DdpHandle {
         let initial_buffers: Vec<Tensor> = tmp_model.buffers().iter()
             .map(|b| b.get().to_device(Device::CPU).and_then(|t| t.pin_memory()))
             .collect::<Result<Vec<_>>>()?;
+        // Capture graph identity before dropping (for monitor/dashboard)
+        let graph_ref = tmp_model.as_graph();
+        let architecture_svg = graph_ref
+            .and_then(|g| g.svg(None).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        let graph_label = graph_ref.and_then(|g| g.label().map(|s| s.to_string()));
+        let graph_hash = graph_ref.map(|g| g.structural_hash().to_string());
         drop(tmp_model);
 
         let world_size = devices.len();
         let total_samples = dataset.len();
+
+        // Build training config snapshot for monitor metadata
+        let progressive = config.progressive_dispatch
+            .unwrap_or(!matches!(policy, ApplyPolicy::Sync));
+        let training_meta = Some(Self::build_training_meta(
+            &devices, &policy, &backend, batch_size, num_epochs,
+            total_samples, progressive, &config,
+        ));
 
         // Step 2: Create channels
         let (timing_tx_main, timing_rx) = mpsc::channel();
@@ -255,8 +278,6 @@ impl DdpHandle {
         let ckpt_every = config.checkpoint_every;
         let snap_timeout = config.snapshot_timeout_secs;
         let partition_ratios = config.partition_ratios.clone();
-        let progressive = config.progressive_dispatch
-            .unwrap_or(!matches!(policy, ApplyPolicy::Sync));
         let coord_batch_size = batch_size;
         let seed: u64 = 42;
 
@@ -500,6 +521,10 @@ impl DdpHandle {
             nccl_abort_handles,
             final_state: None,
             metrics_rx: Some(epoch_metrics_rx),
+            architecture_svg,
+            graph_label,
+            graph_hash,
+            training_meta,
         })
     }
 
@@ -539,7 +564,22 @@ impl DdpHandle {
         let initial_buffers: Vec<Tensor> = tmp_model.buffers().iter()
             .map(|b| b.get())
             .collect();
+        let graph_ref = tmp_model.as_graph();
+        let architecture_svg = graph_ref
+            .and_then(|g| g.svg(None).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        let graph_label = graph_ref.and_then(|g| g.label().map(|s| s.to_string()));
+        let graph_hash = graph_ref.map(|g| g.structural_hash().to_string());
         drop(tmp_model);
+
+        let training_meta = Some(serde_json::json!({
+            "gpus": 1,
+            "device": format!("{device:?}"),
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "total_samples": total_samples,
+            "mode": "single-gpu fallback",
+        }));
 
         let config = WorkerConfig {
             rank: 0,
@@ -613,6 +653,10 @@ impl DdpHandle {
             nccl_abort_handles: Vec::new(),
             final_state: Some(final_state),
             metrics_rx: None,
+            architecture_svg,
+            graph_label,
+            graph_hash,
+            training_meta,
         })
     }
 
@@ -624,6 +668,52 @@ impl DdpHandle {
     /// Devices in use.
     pub fn devices(&self) -> &[Device] {
         &self.devices
+    }
+
+    /// Graph architecture SVG, if the model implements [`Module::as_graph()`].
+    ///
+    /// Captured automatically from the model factory at launch time.
+    /// Pass to [`Monitor::set_svg()`](crate::monitor::Monitor::set_svg) to
+    /// display the graph in the dashboard:
+    ///
+    /// ```ignore
+    /// if let Some(svg) = handle.architecture_svg() {
+    ///     monitor.set_svg(svg);
+    /// }
+    /// ```
+    pub fn architecture_svg(&self) -> Option<&str> {
+        self.architecture_svg.as_deref()
+    }
+
+    /// Wire this handle's graph identity, architecture SVG, and training
+    /// config into a [`Monitor`](crate::monitor::Monitor).
+    ///
+    /// Call once after [`run()`](super::DdpBuilder::run), before the metrics
+    /// loop. This is the DDP equivalent of calling `monitor.watch(&graph)`
+    /// in single-GPU training.
+    ///
+    /// ```ignore
+    /// let handle = Ddp::builder(factory, optim, train_fn)
+    ///     .dataset(ds).batch_size(32).num_epochs(10)
+    ///     .run()?;
+    /// handle.setup_monitor(&mut monitor);
+    ///
+    /// while let Some(m) = handle.next_metrics() {
+    ///     monitor.log(m.epoch, Duration::from_millis(m.epoch_ms as u64), &m);
+    /// }
+    /// monitor.finish();
+    /// ```
+    pub fn setup_monitor(&self, monitor: &mut crate::monitor::Monitor) {
+        if let Some(svg) = &self.architecture_svg {
+            monitor.set_svg(svg);
+        }
+        monitor.set_identity(
+            self.graph_label.as_deref(),
+            self.graph_hash.as_deref(),
+        );
+        if let Some(meta) = &self.training_meta {
+            monitor.set_metadata(meta.clone());
+        }
     }
 
     /// Non-blocking: drain all available aggregated epoch metrics.
@@ -771,6 +861,69 @@ impl DdpHandle {
             "  ddp: {} GPUs ({}) | {} | policy={} backend={}",
             devices.len(), mode, parts.join(" | "), policy_str, backend_str,
         );
+    }
+
+    /// Build a training config snapshot as JSON for monitor metadata.
+    #[allow(clippy::too_many_arguments)]
+    fn build_training_meta(
+        devices: &[Device],
+        policy: &ApplyPolicy,
+        backend: &AverageBackend,
+        batch_size: usize,
+        num_epochs: usize,
+        total_samples: usize,
+        progressive: bool,
+        config: &DdpRunConfig,
+    ) -> serde_json::Value {
+        use crate::tensor::cuda_device_name_idx;
+
+        let gpu_names: Vec<String> = devices.iter().map(|d| {
+            if let Device::CUDA(idx) = d {
+                cuda_device_name_idx(*idx as i32)
+                    .unwrap_or_else(|| format!("CUDA({})", idx))
+            } else {
+                format!("{d:?}")
+            }
+        }).collect();
+
+        let policy_str = match policy {
+            ApplyPolicy::Sync => "sync",
+            ApplyPolicy::Cadence => "cadence",
+            ApplyPolicy::Async => "async",
+        };
+        let backend_str = match backend {
+            AverageBackend::Nccl => "nccl",
+            AverageBackend::Cpu => "cpu",
+        };
+
+        let mut meta = serde_json::json!({
+            "gpus": devices.len(),
+            "gpu_names": gpu_names,
+            "policy": policy_str,
+            "backend": backend_str,
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "total_samples": total_samples,
+            "progressive_dispatch": progressive,
+        });
+
+        if let Some(anchor) = config.anchor {
+            meta["anchor"] = serde_json::json!(anchor);
+        }
+        if let Some(target) = config.overhead_target {
+            meta["overhead_target"] = serde_json::json!(target);
+        }
+        if let Some(max) = config.max_anchor {
+            meta["max_anchor"] = serde_json::json!(max);
+        }
+        if let Some(diff) = config.max_batch_diff {
+            meta["max_batch_diff"] = serde_json::json!(diff);
+        }
+        if let Some(dt) = config.divergence_threshold {
+            meta["divergence_threshold"] = serde_json::json!(dt);
+        }
+
+        meta
     }
 }
 
