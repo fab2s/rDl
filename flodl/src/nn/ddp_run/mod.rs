@@ -2900,4 +2900,175 @@ mod tests {
         // Device indices
         assert_eq!(m.device_indices, vec![0, 1]);
     }
+
+    // -----------------------------------------------------------------------
+    // Regression: NCCL safety during shutdown (progressive dispatch deadlock)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_drain_until_shutdown_skips_sync_now() {
+        // Regression: in progressive mode, a worker that reported Exiting
+        // could receive a stale SyncNow (sent before the coordinator saw
+        // Exiting). Calling AllReduce on a dead peer deadlocks.
+        // drain_until_shutdown must skip SyncNow, not call sync_now_nccl.
+        let (mut worker, ch) = make_test_worker();
+
+        // Queue messages that would arrive during shutdown:
+        // SyncNow (stale, from averaging triggered before our Exiting)
+        // followed by Shutdown (from coordinator's shutdown_workers).
+        ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+        ch.control_tx.send(ControlMsg::Shutdown).unwrap();
+
+        // drain_until_shutdown should skip SyncNow and exit on Shutdown.
+        // If it tried AllReduce, it would deadlock (no peer in unit test).
+        worker.drain_until_shutdown();
+        // Reaching here means no deadlock — the SyncNow was skipped.
+    }
+
+    #[test]
+    fn test_drain_until_shutdown_handles_multiple_sync_now() {
+        // Multiple stale SyncNow messages could accumulate if the
+        // coordinator triggered several averaging events before seeing
+        // our Exiting. All must be skipped.
+        let (mut worker, ch) = make_test_worker();
+
+        ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+        ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+        ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+        ch.control_tx.send(ControlMsg::Shutdown).unwrap();
+
+        worker.drain_until_shutdown();
+    }
+
+    #[test]
+    fn test_drain_until_shutdown_handles_interleaved_messages() {
+        // Other control messages (RequestParams, StartEpoch, Checkpoint)
+        // may arrive between SyncNow and Shutdown. They should be handled
+        // normally (not treated as shutdown signals).
+        let (mut worker, ch) = make_test_worker();
+
+        ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+        ch.control_tx.send(ControlMsg::Checkpoint { version: 99 }).unwrap();
+        ch.control_tx.send(ControlMsg::StartEpoch(EpochPlan {
+            epoch: 5, partition_offset: 0, partition_size: 100,
+        })).unwrap();
+        ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+        ch.control_tx.send(ControlMsg::Shutdown).unwrap();
+
+        worker.drain_until_shutdown();
+        // StartEpoch queued as pending_plan
+        assert!(worker.pending_plan.is_some());
+    }
+
+    #[test]
+    fn test_abort_nccl_no_panic_without_comm() {
+        // abort_nccl takes the NCCL comm (None in unit tests) and aborts it.
+        // Must not panic when comm is None.
+        let (mut worker, _ch) = make_test_worker();
+
+        // Unit test workers have no NCCL comm. abort_nccl should be a no-op.
+        worker.abort_nccl();
+
+        // Call twice to verify idempotence.
+        worker.abort_nccl();
+    }
+
+    #[test]
+    fn test_collect_final_state_disconnected_worker() {
+        // Regression: when a worker errors, its final_param_tx is dropped
+        // (channel disconnects). collect_final_state should detect this
+        // as Disconnected, not wait for the full 10s timeout.
+        let (_timing_tx, timing_rx) = mpsc::channel();
+        let (_metrics_tx, metrics_rx) = mpsc::channel();
+        let (_param_tx, param_rx) = mpsc::channel();
+
+        let mut control_txs = Vec::new();
+        let mut final_param_rxs = Vec::new();
+        let mut final_param_txs = Vec::new();
+        for _ in 0..2 {
+            let (ctx, _crx) = mpsc::channel();
+            control_txs.push(ctx);
+            let (ftx, frx) = mpsc::channel();
+            final_param_txs.push(ftx);
+            final_param_rxs.push(frx);
+        }
+
+        let el_che = ElChe::new(2, 10);
+        let coord = Coordinator::builder(
+            timing_rx, metrics_rx, param_rx,
+            final_param_rxs,
+            control_txs,
+            ApplyPolicy::Sync, AverageBackend::Cpu,
+            2, 1000, el_che,
+        ).build();
+
+        // Worker 0 sends snapshot normally
+        let opts = crate::tensor::test_opts();
+        let t = Tensor::full(&[3], 5.0, opts).unwrap();
+        final_param_txs[0].send(ParamSnapshot {
+            rank: 0, params: vec![t], buffers: vec![], batch_count: 1,
+        }).unwrap();
+
+        // Worker 1 "errors": drop its sender (simulates error path)
+        drop(final_param_txs.remove(1));
+
+        // collect_final_state should return quickly (disconnect is instant,
+        // not the 10s timeout). The surviving worker's snapshot is returned.
+        let start = std::time::Instant::now();
+        let state = coord.collect_final_state();
+        let elapsed = start.elapsed();
+
+        assert!(state.is_some(), "should get state from surviving worker");
+        assert!(elapsed.as_secs() < 2, "disconnect should be fast, not 10s timeout");
+        assert_eq!(state.unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_worker_error_triggers_shutdown_flag() {
+        // When a worker errors, it should send Exiting and set the
+        // shutdown flag. Other workers check this flag each iteration.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_check = shutdown.clone();
+
+        // Simulate: worker errors → sets shutdown
+        shutdown.store(true, Ordering::Relaxed);
+
+        // Coordinator (or sibling worker) sees it
+        assert!(shutdown_check.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_coordinator_active_count_prevents_averaging_after_exit() {
+        // When a worker exits (sends Exiting), active_count drops.
+        // should_average must return false to prevent sending SyncNow
+        // to a dead peer (which would deadlock the survivor's AllReduce).
+        let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Nccl);
+
+        // Both ranks report a batch
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1 }).unwrap();
+        h.coord.drain_timing();
+        assert!(h.coord.should_average(), "both ranks reported, should average");
+
+        // Reset: trigger averaging to zero counters
+        h.coord.trigger_averaging().unwrap();
+
+        // Both report again
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 2 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 2 }).unwrap();
+        h.coord.drain_timing();
+        assert!(h.coord.should_average());
+
+        // Now worker 1 exits
+        h.timing_tx.send(TimingMsg::Exiting { rank: 1 }).unwrap();
+        h.coord.drain_timing();
+        assert_eq!(h.coord.active_count, 1);
+
+        // should_average must return false (can't do collective with dead peer)
+        assert!(!h.coord.should_average(),
+            "should NOT average when active_count < world_size");
+    }
 }

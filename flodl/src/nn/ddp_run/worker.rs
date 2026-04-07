@@ -446,12 +446,24 @@ impl<M: Module> GpuWorker<M> {
     /// Block on control messages until Shutdown or channel disconnect.
     ///
     /// Called after training is done and `report_exiting()` has been sent.
-    /// Keeps the worker alive to participate in any NCCL collectives that
-    /// the coordinator triggered before seeing our Exiting message.
+    /// Skips NCCL collectives (SyncNow): since this worker has reported
+    /// Exiting, the coordinator may not send SyncNow to our peers, but
+    /// if it was already in-flight, calling AllReduce here would deadlock
+    /// if the peer has also exited or errored.
     pub fn drain_until_shutdown(&mut self) {
         while let Ok(msg) = self.control_rx.recv() {
-            if self.dispatch_control(msg).unwrap_or(true) {
-                break; // Shutdown
+            match msg {
+                ControlMsg::SyncNow => {
+                    // Skip: peer may be dead, AllReduce would deadlock.
+                    // The coordinator will stop triggering collectives
+                    // once it processes our Exiting message.
+                }
+                ControlMsg::Shutdown => break,
+                other => {
+                    if self.dispatch_control(other).unwrap_or(true) {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -526,6 +538,18 @@ impl<M: Module> GpuWorker<M> {
         let _ = self.final_param_tx.send(self.snapshot_params());
     }
 
+    /// Abort the NCCL communicator, unblocking any stuck collective.
+    ///
+    /// Must be called before [`send_final_snapshot`] when the training loop
+    /// exits due to shutdown. A pending AllReduce on `comm_stream` (from a
+    /// SyncNow whose peer died) would block `to_device(CPU)` in snapshot_params
+    /// because the CUDA default stream synchronizes with all other streams.
+    pub fn abort_nccl(&mut self) {
+        if let Some(comm) = self.nccl_comm.take() {
+            let _ = comm.abort_handle().abort();
+        }
+    }
+
     /// Notify the coordinator that this worker is about to exit.
     ///
     /// Must be called before the thread terminates so the coordinator
@@ -557,11 +581,13 @@ impl<M: Module> GpuWorker<M> {
     /// to prevent NCCL deadlock while waiting between epochs.
     /// Returns `Some(plan)` for the next epoch, or `None` on Shutdown/disconnect.
     pub fn wait_for_epoch_plan(&mut self) -> Result<Option<EpochPlan>> {
-        // Check if a plan was queued during handle_control
-        if let Some(plan) = self.pending_plan.take() {
-            return Ok(Some(plan));
-        }
         loop {
+            // Check if a plan was queued by dispatch_control (e.g. StartEpoch
+            // arrived during Throttle handler). Must be checked each iteration,
+            // not just at entry, because dispatch_control may set it mid-loop.
+            if let Some(plan) = self.pending_plan.take() {
+                return Ok(Some(plan));
+            }
             match self.control_rx.recv() {
                 Ok(ControlMsg::StartEpoch(plan)) => return Ok(Some(plan)),
                 Ok(ControlMsg::Shutdown) => return Ok(None),

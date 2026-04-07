@@ -121,6 +121,18 @@ impl ChunkPool {
     /// Record that a rank completed processing some samples.
     fn mark_completed(&mut self, rank: usize, samples: usize) {
         self.completed[rank] += samples;
+        debug_assert!(
+            self.completed[rank] <= self.dispatched[rank],
+            "rank {} completed {} samples but only {} were dispatched",
+            rank,
+            self.completed[rank],
+            self.dispatched[rank],
+        );
+    }
+
+    /// Samples dispatched but not yet completed for a given rank.
+    fn in_flight(&self, rank: usize) -> usize {
+        self.dispatched[rank].saturating_sub(self.completed[rank])
     }
 
     /// True when all samples have been dispatched AND all ranks have
@@ -539,7 +551,11 @@ impl Coordinator {
     /// Start a new epoch in progressive mode: create a chunk pool and
     /// dispatch initial chunks to all ranks.
     fn start_epoch_progressive(&mut self, epoch: usize) {
-        let pool = ChunkPool::new(epoch, self.total_samples, self.world_size);
+        // Align pool total to batch boundary. Sub-batch remainders can't form
+        // a full batch, so they're dropped (standard DataLoader behaviour).
+        // Without this, is_epoch_done never fires when total % batch_size != 0.
+        let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+        let pool = ChunkPool::new(epoch, batch_total, self.world_size);
         self.chunk_pool = Some(pool);
 
         let sizes: Vec<usize> = (0..self.world_size)
@@ -563,6 +579,10 @@ impl Coordinator {
             None => return,
         };
         let batches = self.compute_chunk_batches(rank);
+        let remaining = self.chunk_pool.as_ref().map_or(0, |p| p.remaining());
+        eprintln!(
+            "  ddp: chunk -> rank {rank} | {batches} batches | {remaining} samples left"
+        );
         self.dispatch_next_chunk_with_batches(rank, epoch, batches);
     }
 
@@ -589,10 +609,11 @@ impl Coordinator {
 
     /// Compute how many batches the next chunk for `rank` should contain.
     fn compute_chunk_batches(&self, rank: usize) -> usize {
-        let remaining_samples = match &self.chunk_pool {
-            Some(pool) => pool.remaining(),
+        let pool = match &self.chunk_pool {
+            Some(pool) => pool,
             None => return 0,
         };
+        let remaining_samples = pool.remaining();
         let remaining_batches = remaining_samples / self.batch_size;
         if remaining_batches == 0 {
             return 0;
@@ -613,7 +634,40 @@ impl Coordinator {
             return remaining_batches.min(self.min_chunk_batches);
         }
         let ratio = counts[rank] as f64 / total_counts as f64;
-        let target = (remaining_batches as f64 * ratio).ceil() as usize;
+        let mut target = (remaining_batches as f64 * ratio).ceil() as usize;
+
+        // Tail-balance: when remaining work won't fill a full round of
+        // chunks, size this chunk to finish when the slowest in-flight
+        // rank finishes, preventing fast-GPU idle at epoch end.
+        // Works in samples (not batches) to avoid truncation from
+        // non-batch-aligned tail chunks.
+        if remaining_batches < target * self.world_size {
+            let my_ms = self.last_batch_ms[rank];
+            if my_ms > 0.0 {
+                let ms_per_sample = my_ms / self.batch_size as f64;
+                let max_other_ms = (0..self.world_size)
+                    .filter(|&r| r != rank)
+                    .map(|r| {
+                        let in_flight = pool.in_flight(r);
+                        let r_ms = if self.last_batch_ms[r] > 0.0 {
+                            self.last_batch_ms[r] / self.batch_size as f64
+                        } else {
+                            ms_per_sample
+                        };
+                        in_flight as f64 * r_ms
+                    })
+                    .fold(0.0_f64, f64::max);
+
+                // Only tail-balance when the slowest rank has more than
+                // one batch worth of wall-time left — below that the
+                // overhead of a smaller chunk isn't worth it.
+                if max_other_ms > self.last_batch_ms[rank] {
+                    let fill = (max_other_ms / ms_per_sample).ceil() as usize;
+                    let fill_batches = fill.div_ceil(self.batch_size);
+                    target = target.min(fill_batches);
+                }
+            }
+        }
 
         target.max(self.min_chunk_batches).min(remaining_batches)
     }
@@ -1388,8 +1442,11 @@ impl Coordinator {
         for (rank, rx) in self.final_param_rxs.iter().enumerate() {
             match rx.recv_timeout(timeout) {
                 Ok(snap) => snapshots.push(snap),
-                Err(_) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
                     eprintln!("  ddp: timeout waiting for final snapshot from rank {rank}");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    eprintln!("  ddp: rank {rank} channel disconnected (worker errored)");
                 }
             }
         }

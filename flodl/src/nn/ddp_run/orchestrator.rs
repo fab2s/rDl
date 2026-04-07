@@ -292,12 +292,15 @@ impl DdpHandle {
                 let poll_timeout = std::time::Duration::from_micros(100);
                 let loop_err = loop {
                     if shutdown_coord.load(Ordering::Relaxed) {
+                        eprintln!("  ddp: coordinator exit: shutdown flag set (worker error?)");
                         break None;
                     }
                     if !coord.drain_timing_blocking(poll_timeout) {
+                        eprintln!("  ddp: coordinator exit: all timing channels disconnected");
                         break None;
                     }
                     if coord.active_count == 0 {
+                        eprintln!("  ddp: coordinator exit: all workers exited");
                         break None;
                     }
                     // on_epoch_aggregated sends Shutdown when last epoch completes.
@@ -447,22 +450,25 @@ impl DdpHandle {
                             }
                         }
 
+                        // Abort NCCL comm before snapshot: a pending AllReduce
+                        // from a SyncNow whose peer died would block to_device(CPU)
+                        // because the CUDA default stream waits for all streams.
+                        worker.abort_nccl();
+
                         // Send final snapshot on the dedicated channel before exiting.
                         // Uses final_param_tx (not param_tx) to avoid racing with
                         // CPU averaging snapshot collection.
                         worker.send_final_snapshot();
                         worker.report_exiting();
 
-                        // Keep handling control messages (especially SyncNow)
-                        // until the coordinator sends Shutdown or closes the
-                        // channel. Without this, the coordinator may send
-                        // SyncNow after our Exiting but before processing it,
-                        // leaving partner workers stuck in AllReduce.
+                        // Handle remaining control messages until Shutdown.
+                        // SyncNow is skipped (NCCL comm already aborted).
                         worker.drain_until_shutdown();
                         Ok(())
                     })();
 
-                    if result.is_err() {
+                    if let Err(ref e) = result {
+                        eprintln!("  ddp: worker {rank} error: {e}");
                         // Ensure coordinator knows this rank is gone even on
                         // error (prevents NCCL deadlock on surviving workers).
                         // Send directly on the raw channel since the worker
@@ -704,7 +710,15 @@ impl DdpHandle {
 
         if let Some(h) = self.coordinator_handle.take() {
             match h.join() {
-                Ok(Ok(state)) => return Ok(state),
+                Ok(Ok(state)) => {
+                    // Coordinator succeeded, but if a worker errored, warn.
+                    // Return the state (partial training is still useful) but
+                    // log the worker error so it's not silently swallowed.
+                    if let Some(ref e) = first_err {
+                        eprintln!("  ddp: WARNING: training state recovered but worker error occurred: {e}");
+                    }
+                    return Ok(state);
+                }
                 Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
                 Err(_) if first_err.is_none() => {
                     first_err = Some(TensorError::new("coordinator thread panicked"));
