@@ -5,6 +5,270 @@ All notable changes to floDl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-04-08 — Multi-GPU & Infrastructure
+
+### Added
+
+#### Async GPU-CPU Foundation
+- **`CudaEvent`**: Record/synchronize/elapsed_time on CUDA streams. `CudaEventFlags` (Default for timing, DisableTiming for pure sync). RAII Drop, Send. 14 FFI functions (7 event + 7 stream).
+- **`CudaStream`**: Pool-managed streams per device. Synchronize, wait_event, is_complete. RAII Drop, Send.
+- **`StreamGuard`**: RAII stream switching (sets on create, restores default on drop). Async copy pattern: `let _guard = StreamGuard::new(&stream); tensor.to_device_async(Device::CPU)?;`
+- Enables zero-stall GPU-to-CPU pipeline: `training stream -> CudaEvent -> copy stream -> CPU`
+
+#### NCCL Collective Operations
+- **`NcclComms`**: RAII communicator group for multi-GPU collectives. 5 FFI functions wrapping raw NCCL (ncclCommInitAll, AllReduce, Broadcast via GroupStart/End).
+- **`ReduceOp`**: Sum, Prod, Max, Min, Avg.
+- **`all_reduce()`** / **`all_reduce_on_streams()`**: In-place AllReduce across all devices (default or explicit streams).
+- **`broadcast()`** / **`broadcast_on_streams()`**: Broadcast from root rank to all devices.
+- Raw NCCL (not c10d) for minimal overhead in single-process multi-GPU.
+
+#### NCCL Per-Rank Communication
+- **`NcclRankComm`**: Per-rank communicator for multi-threaded DDP. Each GPU thread owns one comm, runs collectives independently. `Send` so it can be moved into spawned threads.
+  - `init_rank(rank, world_size, &uid)`: Direct per-rank init from a shared `NcclUniqueId`.
+  - `all_reduce(&[&Tensor], ReduceOp)` / `all_reduce_on_stream(...)`: Rank-local AllReduce.
+  - `broadcast(&[&Tensor], root)`: Rank-local broadcast.
+- **`NcclComms::split()`**: Extracts per-rank `NcclRankComm` from a group-initialized `NcclComms`. Preferred over per-thread `init_rank` because `ncclCommInitRank` from worker threads corrupts CUDA context on heterogeneous GPUs. Init-on-main + split is the safe pattern.
+- **`NcclAbortHandle`**: Arc-shared handle to abort a stuck `NcclRankComm`. Calling `abort()` unblocks any thread stuck in an AllReduce/Broadcast and makes the comm's Drop a no-op. Used by `DdpHandle` to recover from worker death without deadlocking surviving workers.
+- **`NcclUniqueId`**: 128-byte unique ID for coordinating per-rank init. `NcclUniqueId::new()` generates on rank 0, then shared to all ranks.
+- 7 per-rank FFI functions: `flodl_nccl_get_unique_id`, `flodl_nccl_init_rank`, `flodl_nccl_destroy_rank`, `flodl_nccl_all_reduce_rank`, `flodl_nccl_abort_rank`, `flodl_nccl_split_rank`.
+
+#### Transparent Multi-GPU Training
+- **`Graph::distribute()`**: Auto-detect GPUs, create replicas, broadcast params. Single line to enable multi-GPU. No-op on single GPU.
+- **`Graph::set_optimizer()`**: Creates per-replica optimizers when distributed.
+- **`Graph::step()`**: AllReduce gradients + sync buffers + optimizer step + zero_grad. One call replaces the manual loop.
+- **`Graph::set_lr()`** / **`world_size()`** / **`is_distributed()`**: Multi-GPU aware API.
+- **Cross-device autograd**: `Tensor::to_device()` preserves grad_fn (ToCopyBackward). Forward chunks input, forwards shards on their GPUs, gathers via to_device + cat. libtorch autograd naturally flows gradients back through device transfers.
+- **`Ddp`**: Manual DDP coordinator for complex training patterns (GAN, RL, progressive). Explicit sync_params, all_reduce_gradients, sync_buffers.
+- Training loop is identical for 1 or N GPUs; `distribute()` is the only difference.
+
+#### Async Data Loading Pipeline
+- **`DataSet` trait**: Per-item dataset (`get(index) -> Vec<Tensor>`). `Send + Sync` for background prefetch. Automatic batching via `DataSetAdapter` (pre-allocate + copy, O(1 sample) peak memory).
+- **`BatchDataSet` trait**: Per-batch dataset (`get_batch(indices) -> Vec<Tensor>`) for bulk-efficient sources (mmap, database). `Send + Sync`.
+- **`Sampler` trait**: Index ordering per epoch. Built-in: `RandomSampler` (deterministic per seed+epoch), `SequentialSampler`.
+- **`Batch`**: Named tensor wrapper with `Index<usize>` and `Index<&str>` for clean destructuring (`let images = &b["image"]` or `&b[0]`). `.names()`, `.has()`, `.get_named()` for introspection. Owns its tensors.
+- **`DataLoader`**: Builder pattern with auto-detection of resident vs streaming mode.
+  - **Resident mode**: Dataset fits in VRAM (75% headroom). Loaded once via `pin_memory()` + `to_device()`. Per-epoch: GPU-side `index_select` with shuffled permutation. Zero CPU-GPU transfer after warmup.
+  - **Streaming mode**: Persistent worker thread with dedicated `CudaStream`. Per-epoch fresh batch channel (no deadlock on mid-epoch drop). Worker: `get_batch` -> `pin_memory` -> `StreamGuard` + `to_device_async` -> `CudaEvent`. Consumer: `event.synchronize()` (typically instant due to prefetch depth).
+  - **CUDA OOM fallback**: If resident load fails with OOM, automatically retries with streaming mode.
+  - **Auto prefetch depth**: `clamp(free_vram * 10% / batch_bytes, 2, 4)`. Override with `.prefetch(n)` for high-latency cloud/NFS storage.
+  - `.streaming()` to force streaming mode (preserve VRAM headroom, benchmarking).
+  - `drop_last` defaults to `true` (BatchNorm safety: size-1 batches cause NaN variance).
+  - `EpochIterator` implements `Iterator<Item = Result<Batch>>` + `ExactSizeIterator`.
+- **`TensorError::is_cuda_oom()`**: Detect CUDA out-of-memory errors for graceful fallback.
+- **`.names()`**: Builder method for named batch fields (`["image", "letter", "case", "origin"]`). Auto-generated positional names ("0", "1", ...) when unspecified. Validates name count against dataset tensor count.
+- DDP-aware: loader yields pinned CPU data, `forward_distributed` scatters to devices efficiently.
+
+#### Resident DDP
+- **DDP-aware DataLoader**: Third internal mode `DistributedLoader` with per-device backends. Each GPU independently selects resident (data fits in VRAM) or streaming (prefetch worker) based on its own VRAM. No lowest-common-denominator constraint.
+- **`DeviceBackend`**: Per-device data strategy. Resident: full dataset on GPU, index_select per batch. Streaming: dedicated PrefetchWorker with async H2D transfers.
+- **`Graph::set_data_loader(loader, "input")`**: Attach DataLoader to model. When distributed: upgrades to per-device backends. Auto-wires batch names to graph `.input()` ports. Remaining names treated as targets for loss.
+- **`Graph::epoch(epoch)`**: Returns `GraphEpochIterator` that produces per-rank shards and user-facing Batch. When distributed: each backend produces on-device data, shards stored for presharded forward. When single-GPU: delegates to DataLoader.
+- **`Graph::forward_batch(&batch)`**: Batch-aware forward. Extracts named inputs, handles DDP presharding transparently. Coexists with `Module::forward(&Variable)`.
+- **Presharded forward path**: `forward_distributed_presharded()` consumes per-rank shards from DataLoader via `.take_shards()`. Each replica forwards its local shard (zero cross-device input transfer). Outputs gathered to gather device. CudaEvent timing for auto-balancer.
+- **Multi-input auto-wiring**: `set_data_loader()` precomputes `shard_input_map` matching graph `.input()` port names to batch tensor positions. `forward_distributed_presharded()` passes all inputs (primary + auxiliary) to each replica via `as_graph().forward_impl()`. Single-GPU `forward_batch()` also builds the full input vector. Enables multi-input models (FBRL with case/origin alongside image) in distributed training.
+- **Efficient distributed streaming**: `StartDistributedEpoch` + `LoadBatch` worker commands. One channel per epoch instead of per-batch channel creation. Flat state machine in `worker_loop` (no nested loops). `PrefetchWorker::start_distributed_epoch()` opens the channel once, `load_batch()` sends indices per batch.
+- **Gather device selection**: Prefers resident backend with most free VRAM. Falls back to CPU if all backends are streaming (targets fetched from dataset). No GPU 0 priority.
+- **Auto-balancing integration**: Epoch iterator reads chunk_ratios fresh per batch. Shard sizes adapt as ratios change every 50 steps. Mixed resident/streaming backends handle dynamic ratios correctly.
+- Training loop identical for 1 or N GPUs. `distribute()` + `set_data_loader()` are the only differences.
+
+#### `Ddp::setup()` — One-Liner DDP Setup
+- **`Ddp::setup(&model, builder, optimizer)`**: Single call to auto-detect GPUs, distribute the model, set per-replica optimizers, and enable training mode. No-op distribute for single GPU/CPU (still sets optimizer + training). Training loop identical for 1 or N GPUs.
+- **`Ddp::setup_with(&model, builder, optimizer, config)`**: Same as `setup()` but accepts a `DdpConfig` for explicit El Che configuration (speed hints, overhead target, max anchor).
+- **`Ddp::is_heterogeneous()`**: Detects mixed GPU models. `setup()` auto-enables El Che when heterogeneous GPUs are detected.
+- **Hardware diagnostics**: Always prints detected hardware to stderr on call:
+  - `ddp: 2 GPUs (heterogeneous) | RTX 5060 Ti (16.0 GB) | GTX 1060 (6.0 GB)`
+  - `ddp: 1 GPU | RTX 5060 Ti (16.0 GB) | single-device mode`
+  - `ddp: no CUDA available | CPU mode`
+
+#### Multi-GPU Dashboard
+- **Per-GPU tabs**: Tab bar appears when 2+ GPUs detected (hidden for single-GPU, zero visual regression). Each GPU tab shows 4 time-series charts: VRAM usage (bytes, with physical limit reference line), utilization (%), throughput (samples/ms), batch share (%).
+- **GPU Overview card** (Home tab): Compact row per GPU with VRAM bar, utilization, throughput, and batch share. Fastest GPU highlighted green, slowest yellow.
+- **JS data model**: `gpuSeries[deviceIndex]` with per-device VRAM, throughput, chunk, and utilization arrays. Populated from `d.gpus` in `processEpoch()`. Works in both live SSE and archive replay modes.
+
+#### Multi-GPU Dashboard Data Pipeline
+- **`GpuSnapshot`**: Per-device resource sampling (VRAM allocated/total, utilization, device name). `ResourceSampler` iterates all CUDA devices on each sample. Aggregate fields kept for backward compat with single-GPU dashboards.
+- **`GpuMetrics`**: DDP metrics per device (EMA throughput, chunk_ratio, shard_size). Exposed via `Metrics::gpu_metrics()` trait method with default empty impl.
+- **Per-GPU JSON in epoch records**: `"gpus":[...]` array merges hardware snapshots (from `GpuSnapshot`) with DDP metrics (from `GpuMetrics`). Flows through SSE live updates and HTML archives.
+- **`Graph::auto_distribute()`**: Auto-detect usable CUDA devices and distribute. No-op on single GPU. Keeps the builder closure for user-controlled model construction.
+- **`Graph::shard_sizes()`** / **`Graph::devices()`**: Public accessors for per-rank shard sizes and device list.
+
+#### Auto-Balancing
+- **Per-GPU throughput measurement**: CudaEvent-based timing around each replica's forward pass in `forward_distributed()`. Zero overhead (async GPU recording, no CPU sync).
+- **EMA throughput tracking**: Exponentially smoothed samples/ms per device (alpha=0.3). First measurement initializes directly, subsequent measurements blend.
+- **Adaptive batch sharding**: After 10 calibration steps with equal splits, `chunk_ratios` are recomputed proportional to measured throughput. Re-evaluated every 50 steps. `MIN_CHUNK_RATIO` (5%) prevents starving any GPU.
+- **Weighted gradient averaging**: When chunk ratios are unequal, each replica's gradient is scaled by `(shard_size / batch_size)` then AllReduce Sum, producing the mathematically correct mean gradient regardless of shard distribution.
+- **`Graph::chunk_ratios()`**: Query current batch distribution ratios (for logging/debugging).
+- **`Graph::throughput()`**: Query per-device EMA throughput (samples/ms).
+- All auto-balancing is internal to `forward_distributed()` and `step()`. Training loop is unchanged.
+
+#### NCCL Device Safety
+- **Device save/restore**: All `NcclComms` methods (`new`, `all_reduce`, `broadcast`, and stream variants) now save and restore the current CUDA device around FFI calls. Prevents NCCL operations from leaking device context changes to callers.
+- **Shared `NCCL_LOCK`**: Single `pub(crate)` mutex in `ddp` module, used by both `nccl::tests` and `ddp::tests` to serialize NCCL communicator operations.
+
+#### El Che — Heterogeneous DDP
+- **`ElChe`**: Cadence strategy for mixed-GPU training. Slow device anchors the sync cadence, fast devices range ahead processing more batches per sync. Named after Che Guevara's marching principle: "the column marches at the slowest one's pace."
+  - `ElChe::new(world_size, anchor)` with builder pattern.
+  - `with_speed_ratio(slow_rank, ratio)`: Seed initial batch distribution from known speed differential. Self-corrects after first `report_timing()`.
+  - `with_overhead_target(f64)`: Default 0.10 (10%). Auto-tunes anchor upward to keep AllReduce overhead below target.
+  - `with_max_anchor(usize)`: Gradient staleness cap. Prevents unbounded accumulation.
+  - `report_timing(&wall_ms, sync_ms)`: Discovers true speed ratios from CudaEvent measurements, recomputes batch counts, auto-tunes anchor.
+  - `batch_counts() -> &[usize]`: Per-device batch counts for the current cadence step.
+  - `clamp_total(max) -> Vec<usize>`: Proportional clamping for epoch-end alignment.
+- **`DdpConfig`**: Configuration struct for `Ddp::setup_with()`.
+  - `speed_hint(slow_rank, ratio)`: Initial speed estimate (optional, self-corrects).
+  - `overhead_target(f64)`: AllReduce overhead ceiling.
+  - `max_anchor(Option<usize>)`: `None` = auto (default), `Some(0)` = disable El Che (traditional DDP), `Some(n)` = fixed cap.
+  - `max_grad_norm(f64)`: Per-rank gradient clipping before normalize-by-count and weighted AllReduce. Bounds accumulated gradients on all ranks (including replicas the caller cannot reach). Uses fused C++ kernel (`clip_grad_norm_fused`).
+- **`Graph::step()` El Che branch**: Normalizes accumulated gradients by `1/count[rank]` (mean per device), weighted AllReduce by `count[rank]/total` (proportional contribution), reports timing to ElChe for adaptation. Per-rank gradient clipping when configured. Existing scatter and single-GPU paths unchanged.
+- **`Graph::has_el_che()`** / **`Graph::configure_el_che()`**: Query and configure El Che state.
+- **`weighted_all_reduce_gradients()`**: Scales each replica's gradient by batch contribution before AllReduce Sum. Produces the mathematically correct mean gradient regardless of per-device batch counts.
+
+#### El Che Forward Path
+- **`forward_distributed_el_che()`**: Multi-batch per-device forward. Each device processes `batch_counts[rank]` complete batches independently. Gradients accumulate naturally via libtorch autograd across all forward passes. CudaEvent timing per rank.
+- **Tagged output gathering**: After each forward pass, tagged outputs (`Graph::tag()`) are captured from each device and concatenated across all batches and all devices. Custom loss functions work transparently on gathered intermediates: `model.tagged("scan_locations")` returns the catted value from all devices.
+- **Loop trace gathering**: Per-step outputs from loop nodes (`trace_buf`) are gathered across all batches and all devices, keyed by `(tag_name, step_index)`. `model.traces("attn")` returns catted per-step traces. Enables transparent El Che training for models with loop-based attention (scan/read fixations, per-step losses). No-op when no loop nodes exist.
+- **El Che data routing**: `DistributedEpochIterator` pulls `sum(batch_counts)` complete batches per iteration (not shards). Routes whole batches to each device via `load_batch_on_device()` (supports both Resident index_select and Streaming prefetch worker). Proportional clamping near epoch boundaries.
+- **Epoch-end flush**: `ActiveGraphEpochIterator::drop()` detects accumulated un-synced gradients (forward without step) and forces a final `step()` to prevent silent gradient loss.
+- **`Graph::epoch()`** seeds initial batch counts from `ElChe::batch_counts()`. **`Graph::step()`** feeds updated counts back to the loader after `report_timing()`.
+- Training loop is identical for homogeneous and heterogeneous GPU setups. `Ddp::setup()` detects heterogeneous hardware and enables El Che automatically.
+
+#### DDP Builder — Thread-Per-GPU Training
+- **`DdpHandle`**: Thread-per-GPU training with Local SGD and adaptive parameter averaging. Each GPU runs its own training loop with a local optimizer. A lightweight coordinator thread triggers periodic parameter averaging. Two orthogonal knobs: [`ApplyPolicy`] (when to average) and [`AverageBackend`] (how to average).
+- **`DdpBuilder`** (recommended entry point): Fluent API for configuring and launching training. Required: `.dataset()`, `.batch_size()`, `.num_epochs()`. Optional: `.policy()`, `.backend()`, `.overhead_target()`, `.max_anchor()`, `.anchor()`, `.divergence_threshold()`, `.max_batch_diff()`, `.checkpoint_every()`, `.checkpoint_fn()`, `.epoch_fn()`, `.progressive_dispatch()`.
+  ```rust
+  let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
+      .dataset(dataset)
+      .batch_size(32)
+      .num_epochs(10)
+      .policy(ApplyPolicy::Cadence)
+      .backend(AverageBackend::Nccl)
+      .run()?;
+  let state = ddp.join()?;
+  ```
+- **`Ddp::builder()`**: Quick-start alternative (replaces the former `AsyncDdp::auto()`/`auto_with()`).
+- **`ApplyPolicy`**: Controls WHEN averaging occurs.
+  - `Sync`: K=1 (every batch). Equivalent to standard DDP. Best convergence.
+  - `Cadence`: K=N (ElChe anchor count). Slow GPU anchors the cadence, fast GPUs fill wall time. Uses wall-time trigger (fires when slowest rank's accumulated wall time reaches anchor wall-time). Recommended for heterogeneous hardware.
+  - `Async`: K=adaptive. Uses batch-count trigger (fires when all ranks complete their assigned counts). Overshooting is intentional: each replica explores slightly different parameter neighborhoods between averaging events, producing diversity that benefits convergence. Auto-tunes interval from divergence monitoring. Maximum throughput.
+- **`AverageBackend`**: Controls HOW averaging is performed. Orthogonal to policy, all combinations valid for A/B testing.
+  - `Nccl`: In-place AllReduce on GPU. Zero extra memory, GPU-to-GPU DMA. All GPUs sync at collective barrier.
+  - `Cpu`: Workers send parameter snapshots to coordinator, which averages on CPU and distributes. No GPU ever blocks. Uses O(world_size * model_size) CPU RAM. Non-blocking 3-phase state machine (Idle/Collecting/Computing) keeps coordinator responsive during averaging.
+- **`GpuWorker<M>`**: Generic worker bound to a single GPU. Thread-local model + optimizer (Rc-based, not Send). CUDA streams for overlapped compute/communication. Handles `SyncNow` (NCCL), `RequestParams`/`Update` (CPU), `Throttle`, `StartEpoch`, `Checkpoint`, `Shutdown`.
+- **`Coordinator`**: Lightweight scheduling thread. Collects timing from workers (for ElChe throughput ratios), triggers averaging, monitors divergence to auto-tune interval, rebalances data partitions. Builder pattern with configurable `divergence_threshold`, `overhead_target`, `max_anchor`, `checkpoint_every`, `snapshot_timeout_secs`.
+- **`TrainedState`**: Return type from `DdpHandle::join()`. Contains averaged `params` and `buffers` as CPU tensors, ready for inference or checkpoint.
+- **`DdpRunConfig`**: Configuration struct with builder methods: `with_overhead_target()`, `with_max_anchor()`, `with_anchor()`, `with_divergence_threshold()`, `with_max_batch_diff()`, `with_max_grad_norm()`, `with_checkpoint_every()`, `with_snapshot_timeout()`, `with_partition_ratios()`, `with_progressive_dispatch()`.
+- **Per-worker gradient clipping**: `DdpBuilder::max_grad_norm(f64)` clips gradients between `backward()` and `optimizer.step()` on each GPU worker. Prevents gradient spikes on any single GPU from propagating through AllReduce averaging. Same fused kernel as El Che path.
+- **`progressive_dispatch`**: When enabled, the coordinator streams work in small chunks instead of sending full epoch partitions, adapting to throughput continuously. Default: auto (true for Cadence/Async, false for Sync).
+- **Global epoch management**: Coordinator owns epochs globally. Workers are mode-agnostic (wait for `EpochPlan`, run partition, report metrics). `EpochPlan { epoch, partition_offset, partition_size }` ensures deterministic, non-overlapping sample coverage. Throughput-proportional partition sizing when ElChe is calibrated; `partition_ratios` for fixed splits. Auto lookahead in `Async` mode (fast ranks may run 1 epoch ahead).
+- **Single-GPU fallback**: With fewer than 2 CUDA devices, training runs on the main thread with no coordinator or averaging. API is identical; `join()` returns `TrainedState` in both cases.
+
+#### DDP Builder — Robustness
+- **`max_batch_diff`**: Hard limit on how far any GPU can run ahead of the slowest. Workers that exceed the limit are throttled (block on control channel) until the next averaging event. `Some(0)` = strict lockstep.
+- **`drain_until_shutdown`**: After training, workers keep handling control messages (especially `SyncNow`) until the coordinator sends `Shutdown`. Prevents NCCL deadlock when workers finish at different times.
+- **NCCL init-on-main + split()**: All NCCL communicators initialized from the main thread via `NcclComms::new()` then `split()` into per-rank `NcclRankComm`. Per-thread `ncclCommInitRank` corrupts CUDA context on heterogeneous GPUs.
+- **NCCL abort handles**: If a worker dies mid-collective, `DdpHandle::abort_nccl()` calls `ncclCommAbort` on all communicators, unblocking surviving workers. Also triggered in `Drop`.
+- **Worker error propagation**: Failed workers set the shared shutdown flag and send `TimingMsg::Exiting` so the coordinator stops including that rank in collectives.
+- **CPU averaging timeout**: Configurable `snapshot_timeout_secs` (default 5s). If not all worker snapshots arrive in time, the round is soft-aborted (logged with missing rank IDs and abort count), stale snapshots drained, and retried on the next cycle.
+- **CPU Update delivery logging**: Failed Update deliveries to dead workers are logged with the affected rank.
+- **Shutdown cleanup**: `drain_avg_state()` logs and joins any in-progress CPU averaging (Collecting or Computing) before the coordinator exits, preventing detached threads from holding GPU resources.
+
+#### DDP Builder — Observability
+- **Averaging success logging**: Both paths log on successful averaging. NCCL: `"NCCL averaging #N complete (vV)"`. CPU: `"CPU averaging #N complete (vV, X.Xms)"` with timing.
+- **Per-rank epoch metrics**: Worker epoch-end metrics (rank, epoch, loss, batches, wall time) forwarded to stderr from the coordinator loop.
+- **Coordinator accessors**: `avg_count()`, `abort_count()`, `last_batch_ms()`, `last_avg_ms()`, `is_cpu_averaging()`, `version()`, `avg_interval()`, `is_calibrated()`, `steps_since_avg()` for external monitoring.
+- **Divergence monitoring** (Async policy): Per-rank parameter L2 norms tracked. Relative norm difference triggers interval halving (diverging) or doubling (converging). Threshold configurable via `divergence_threshold` (default 0.05).
+- **Hardware summary**: Prints GPU count, heterogeneous/homogeneous detection, per-GPU name + VRAM, policy, and backend at launch.
+
+#### DDP Builder — Metrics Pipeline
+- **`record_scalar(name, value)`**: Thread-local function callable from inside the train function. Records named scalar metrics (accuracy, custom losses, etc.) per batch. Metrics are aggregated per rank per epoch and forwarded to the coordinator.
+- **`EpochMetrics`**: Aggregated metrics for one completed epoch. Fields: `epoch`, `avg_loss`, `batches_processed`, `epoch_ms`, `samples_processed`, `per_rank_loss`, `per_rank_time_ms`, `per_rank_scalars`, `scalars`.
+- **`DdpHandle::poll_metrics()`**: Non-blocking poll for completed epoch metrics. Returns a `Vec<EpochMetrics>` of all epochs aggregated since the last poll. Enables external monitoring loops.
+- **`DdpHandle::next_metrics()`**: Blocking call that returns the next available `EpochMetrics`. Useful for sequential metric processing.
+- **`DdpHandle::setup_monitor(&self, &mut Monitor)`**: Wire the DDP handle's graph identity, architecture SVG, and training config into a training monitor. Enables the live dashboard and HTML archive for DDP Builder training runs.
+- **`LossContext`**: Per-batch context passed to loss closures in distributed training. Provides batch metadata (shard sizes, device indices) for loss functions that need to weight contributions correctly.
+
+#### DDP Builder — Epoch Callback
+- **`EpochFn<M>`**: `Arc<dyn Fn(usize, &mut GpuWorker<M>) + Send + Sync>`. Called at the start of each epoch inside each worker thread, before `run_epoch_plan()`.
+- **`.epoch_fn()`** on `DdpBuilder`: Set the callback. Typical uses: LR schedules, noise curricula, dynamic loss weights.
+- **`GpuWorker::set_lr(f64)`**: Delegate to the worker's optimizer.
+- **`GpuWorker::current_epoch()`**: Public accessor for the current epoch number.
+
+#### DDP Builder — Checkpointing
+- **`CheckpointFn<M>`**: `Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>`. Called on rank 0 after averaging events (multi-GPU) or epoch boundaries (single-GPU). Errors are logged but do not stop training.
+- **`checkpoint_every(n)`**: Save every N averaging events. Coordinated through `ControlMsg::Checkpoint` to rank 0's worker thread (which owns the model).
+- **`TrainedState`** on partial failure: If some workers died, `collect_final_state()` averages surviving workers' snapshots. If averaging fails, falls back to the first snapshot's tensors. Returns `None` only if zero snapshots arrived.
+
+#### Adaptive Data Pipeline
+- **VRAM-aware prefetch depth**: `prefetch_depth_from_vram()` computes prefetch budget as the gap between current VRAM usage and a configurable cap. No manual tuning needed.
+- **Bootstrap prefetch**: Initial depth of 4 batches during DataLoader construction. Real depth computed at `epoch(0)` after model is loaded and VRAM usage is stable.
+- **Per-epoch VRAM probing**: `epoch(N)` re-probes VRAM usage and fills up to the cap. Adapts to VRAM fragmentation and activation memory changes across epochs.
+- **`DataLoaderBuilder::vram_max_usage(f64)`**: Default 0.90 (use up to 90% of total VRAM). Clamped to [0.50, 0.99]. Remaining headroom covers activations, gradients, and CUDA overhead.
+- **Manual override**: `.prefetch(n)` or `set_prefetch_depth()` disables automatic adaptation (`user_set_depth` flag).
+- **`auto_resize()`**: Manual trigger for VRAM-based resize between epochs.
+
+#### Module Builders
+- **`ConvTranspose1dBuilder`**, **`ConvTranspose2dBuilder`**, **`ConvTranspose3dBuilder`**: Fluent builder APIs for transposed convolution layers (`with_stride`, `with_padding`, `with_output_padding`, `with_dilation`, `with_groups`, `with_bias`, `on_device`, `done`). Consistent with existing Conv1d/Conv2d/Conv3d builder pattern.
+
+#### CLI Tool
+- **`fdl`** (shell script): Zero-dependency entry point. Auto-detects libtorch, Docker, Rust, GPUs. Dispatches to the compiled binary (native or Docker) with shell fallback for diagnostics. Interactive setup wizard guides users through libtorch installation and build environment selection.
+- **`flodl-cli`** (`cargo install flodl-cli`): Standalone Rust binary. Pure Rust, no libtorch dependency. Works inside floDl projects and standalone (system-wide libtorch management under `~/.flodl/`). Override global root with `$FLODL_HOME`. Commands:
+  - `fdl setup`: Guided wizard. Detects project vs standalone mode. In a project: system detection, libtorch download, Docker image build. Standalone: system detection, libtorch download to `~/.flodl/`, prints shell export instructions.
+  - `fdl libtorch download [--cpu | --cuda 12.6|12.8]`: Auto-detect GPUs and download matching libtorch variant. Project-local or global depending on context.
+  - `fdl libtorch build [--docker | --native] [--archs "6.1;12.0"]`: Compile libtorch from source for custom GPU architectures.
+  - `fdl libtorch list / info / activate / remove`: Manage installed variants.
+  - `fdl init <name> [--docker]`: Scaffold a new floDl project. Default mode uses mounted libtorch (like the main repo). `--docker` bakes libtorch into the Docker image for standalone deployment. Generates Cargo.toml, Dockerfiles, docker-compose.yml, Makefile, and annotated src/main.rs.
+  - `fdl diagnose [--json]`: System + GPU + libtorch + compatibility report. Shows context mode (project/global). Probes GPUs via nvidia-smi, verifies libtorch arch coverage, detects Docker containers.
+  - `fdl help / version`
+- Pre-compiled binaries published via GitHub Releases for Linux x86_64/aarch64, macOS arm64, Windows x86_64. Downloaded automatically by the `fdl` shell script on first use.
+
+#### Small Additions
+- **`Linear::no_bias_on_device()`**: Create a bias-free linear layer on a specific device. Previously `no_bias()` was CPU-only.
+- **`AdamBuilder::betas()` / `.eps()`**: Customize beta1, beta2, and epsilon in Adam per-group builder. Previously hardcoded to (0.9, 0.999) and 1e-8.
+- **`AdamWBuilder::betas()` / `.eps()`**: Same for AdamW per-group builder.
+- Improved doc comments on all loss functions (dtype requirements), conv builders, and optimizer constructors.
+
+### Changed
+
+#### Unified DDP API
+- **`Ddp` is now the single entry point** for all multi-GPU training modes: `setup()` (user owns the loop), `builder()` (framework owns the loop), `wrap()` (manual).
+- **Renamed**: `AsyncDdp` -> `DdpHandle`, `AsyncDdpBuilder` -> `DdpBuilder`, `AsyncDdpConfig` -> `DdpRunConfig`, `Ddp::auto()` -> `Ddp::setup()`, `Ddp::auto_with()` -> `Ddp::setup_with()`.
+- **Module renamed**: `nn::async_ddp` -> `nn::ddp_run`.
+- **Log prefix**: `async-ddp:` -> `ddp:` in all runtime output.
+- **Deprecated aliases** preserved for backward compatibility: `AsyncDdp`, `AsyncDdpBuilder`, `AsyncDdpConfig`, `Ddp::auto()`, `Ddp::auto_with()`.
+
+#### Unified libtorch Management
+- **`libtorch/` directory**: Single host-side directory for all libtorch variants.
+  - `libtorch/precompiled/cpu|cu128|cu126/` for downloaded pre-built variants
+  - `libtorch/builds/<arch>/` for source-compiled variants (e.g., `sm61-sm120`)
+  - `libtorch/.active` points to the variant in use
+  - `libtorch/<variant>/.arch` contains metadata (cuda version, torch version, architectures, source type)
+- **Docker images are libtorch-agnostic**: No libtorch baked into images. Mounted at runtime via volume.
+  - `Dockerfile` (new, replaces `Dockerfile.cpu`): Ubuntu + Rust, no libtorch
+  - `Dockerfile.cuda`: parameterized `CUDA_VERSION`, cudnn-devel base, no libtorch
+  - `Dockerfile.cuda.source`: builder-only (no Stage 2 runtime image), Makefile extracts via `docker cp`
+  - `Dockerfile.bench`: removed libtorch download, kept Python + PyTorch pip install
+- **docker-compose.yml simplified**: 5 services reduced to 3 (`dev`, `cuda`, `bench`). Removed `cuda-local` and `cuda-source`. All services mount `${LIBTORCH_HOST_PATH}:/usr/local/libtorch:ro`.
+- **Makefile auto-detection**: Reads `libtorch/.active` and `.arch` to derive `CUDA_VERSION` and libtorch mount path. Override: `CUDA_VERSION=12.6.0 make cuda-test`.
+- **`download-libtorch.sh --project`**: Downloads to `libtorch/precompiled/<variant>/`, writes `.arch` and `.active`. Existing `--path` mode for native installs unchanged.
+
+#### Test Infrastructure
+- **15 tests un-ignored**: `cuda_event` (3), `cuda_stream` (4), DDP cross-device autograd (2) tests now run in the normal `make cuda-test` flow. They have proper mutex serialization and early-return guards.
+- **NCCL/DDP/Graph tests remain `#[ignore]`**: NCCL communicator init corrupts concurrent CUBLAS operations. Must run single-threaded.
+- **Process-isolated test targets**: NCCL tests run in their own cargo process to prevent CUBLAS context poisoning. Fixes SIGABRT in `test_manual_seed_reproducible` when run after NCCL init.
+  - **`make cuda-test-all`**: Three-pass target -- parallel + NCCL (isolated) + remaining serial.
+  - **`make cuda-test-nccl`**: NCCL/DDP tests only (isolated processes).
+  - **`make cuda-test-serial`** (new): Remaining serial tests (CUDA Graphs, manual_seed, probes).
+
+#### Build Targets
+- **`make setup`**: Auto-detect hardware, download CPU libtorch + CUDA libtorch (or build from source), build Docker image. One command from zero to ready.
+- **`make build-libtorch`**: Compile libtorch from source, extract to `libtorch/builds/<arch>/`, write `.arch`/`.active`.
+- **`make cli`** / **`make cuda-cli`**: Build flodl-cli (CPU/CUDA). **`make run-cli`** / **`make cuda-run-cli`**: Run inside Docker.
+- **CI updated**: CUDA job downloads libtorch separately and mounts into container (no longer baked into image).
+
+### Removed
+- `Dockerfile.cpu` (replaced by `Dockerfile`)
+- `cuda-local` and `cuda-source` docker-compose services
+
 ## [0.2.2] - 2026-03-31
 
 ### Added

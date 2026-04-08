@@ -24,6 +24,8 @@ pub(crate) enum ServerMsg {
     SetHardware(String),
     /// JSON metadata (training config, parameters, etc.).
     SetMetadata(String),
+    /// GPU init data (JSON array of {dev, name, vram_total}).
+    SetGpuInit(String),
     /// Clean shutdown.
     Shutdown,
 }
@@ -51,6 +53,8 @@ struct SharedState {
     hardware: Mutex<Option<String>>,
     /// JSON metadata string.
     metadata: Mutex<Option<String>>,
+    /// GPU init data for immediate tab creation.
+    gpu_init: Mutex<Option<String>>,
 }
 
 impl DashboardServer {
@@ -67,6 +71,7 @@ impl DashboardServer {
             hash: Mutex::new(None),
             hardware: Mutex::new(None),
             metadata: Mutex::new(None),
+            gpu_init: Mutex::new(None),
         });
 
         // Message handler thread: receives from Monitor, broadcasts to SSE clients
@@ -119,6 +124,11 @@ impl DashboardServer {
         let _ = self.tx.send(ServerMsg::SetMetadata(json));
     }
 
+    /// Set GPU init data for immediate tab creation on dashboard load.
+    pub fn set_gpu_init(&self, json: String) {
+        let _ = self.tx.send(ServerMsg::SetGpuInit(json));
+    }
+
     /// Signal shutdown and wait for the message handler to finish.
     pub fn shutdown(&mut self) {
         let _ = self.tx.send(ServerMsg::Shutdown);
@@ -150,6 +160,9 @@ fn handle_messages(rx: Receiver<ServerMsg>, state: Arc<SharedState>) {
             }
             ServerMsg::SetMetadata(json) => {
                 *state.metadata.lock().unwrap() = Some(json);
+            }
+            ServerMsg::SetGpuInit(json) => {
+                *state.gpu_init.lock().unwrap() = Some(json);
             }
             ServerMsg::Shutdown => {
                 let event = "event: complete\ndata: {}\n\n".to_string();
@@ -200,8 +213,10 @@ fn serve_html(stream: &mut TcpStream, state: &SharedState) {
     let hash = state.hash.lock().unwrap();
     let hardware = state.hardware.lock().unwrap();
     let metadata = state.metadata.lock().unwrap();
+    let gpu_init = state.gpu_init.lock().unwrap();
 
-    let has_inject = label.is_some() || hash.is_some() || hardware.is_some() || metadata.is_some();
+    let has_inject = label.is_some() || hash.is_some() || hardware.is_some()
+        || metadata.is_some() || gpu_init.is_some();
     let body = if has_inject {
         let label_js = match &*label {
             Some(l) => format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")),
@@ -219,9 +234,13 @@ fn serve_html(stream: &mut TcpStream, state: &SharedState) {
             Some(m) => m.clone(),
             None => "null".to_string(),
         };
+        let gpu_init_js = match &*gpu_init {
+            Some(j) => j.clone(),
+            None => "null".to_string(),
+        };
         let inject = format!(
-            "<script>const LIVE_LABEL={};const LIVE_HASH={};const LIVE_HARDWARE={};const LIVE_META={};</script>\n",
-            label_js, hash_js, hw_js, meta_js,
+            "<script>const LIVE_LABEL={};const LIVE_HASH={};const LIVE_HARDWARE={};const LIVE_META={};const LIVE_GPU_INIT={};</script>\n",
+            label_js, hash_js, hw_js, meta_js, gpu_init_js,
         );
         DASHBOARD_HTML.replace("<script>", &format!("{}<script>", inject))
     } else {

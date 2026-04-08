@@ -1,0 +1,87 @@
+#!/bin/sh
+# fdl -- floDl CLI entry point.
+#
+# Downloads a pre-compiled binary on first use (no Rust needed).
+# Falls back to building from source if the download fails.
+#
+# Usage:
+#   curl -sL https://flodl.dev/fdl -o fdl && chmod +x fdl
+#   ./fdl setup              # interactive guided setup
+#   ./fdl init <name>        # scaffold a new project
+#   ./fdl libtorch download  # download pre-built libtorch
+#   ./fdl diagnose           # system and GPU diagnostics
+#   ./fdl help               # show usage
+
+set -e
+
+REPO="fab2s/floDl"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI="$DIR/target/release/fdl"
+
+# ---------------------------------------------------------------------------
+# Ensure the CLI binary exists
+# ---------------------------------------------------------------------------
+
+if [ ! -f "$CLI" ] || [ "${FDL_REBUILD:-}" = "1" ]; then
+    mkdir -p "$DIR/target/release"
+
+    # --- Try downloading pre-compiled binary from GitHub Releases ---
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        arm64) ARCH="arm64" ;;    # macOS reports arm64
+        *)     ;;                  # x86_64, aarch64 pass through
+    esac
+
+    ARTIFACT="flodl-cli-${OS}-${ARCH}"
+    case "$OS" in
+        *mingw*|*msys*|*cygwin*) ARTIFACT="flodl-cli-windows-x86_64.exe" ;;
+    esac
+
+    # Get latest release tag
+    LATEST_TAG=""
+    if command -v curl >/dev/null 2>&1; then
+        LATEST_TAG=$(curl -sI "https://github.com/$REPO/releases/latest" 2>/dev/null \
+            | grep -i '^location:' | sed 's|.*/||' | tr -d '\r\n')
+    fi
+
+    DOWNLOADED=false
+    if [ -n "$LATEST_TAG" ]; then
+        URL="https://github.com/$REPO/releases/download/${LATEST_TAG}/${ARTIFACT}"
+        echo "Downloading flodl-cli ${LATEST_TAG}..."
+        if curl -sfL "$URL" -o "$CLI" 2>/dev/null; then
+            chmod +x "$CLI"
+            # Verify the binary works
+            if "$CLI" version >/dev/null 2>&1; then
+                DOWNLOADED=true
+            else
+                rm -f "$CLI"
+            fi
+        else
+            rm -f "$CLI"
+        fi
+    fi
+
+    # --- Fall back to building from source ---
+    if ! $DOWNLOADED; then
+        if command -v cargo >/dev/null 2>&1; then
+            echo "Building fdl from source..."
+            (cd "$DIR" && cargo build --release -p flodl-cli)
+        elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            echo "Building fdl via Docker..."
+            (cd "$DIR" && docker compose run --rm dev cargo build --release -p flodl-cli)
+        else
+            echo "error: Cannot obtain fdl binary." >&2
+            echo "" >&2
+            echo "  No pre-compiled binary found for your platform ($OS/$ARCH)," >&2
+            echo "  and neither Rust nor Docker is available to build from source." >&2
+            echo "" >&2
+            echo "  Install one of:" >&2
+            echo "    Rust:   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+            echo "    Docker: https://docs.docker.com/engine/install/" >&2
+            exit 1
+        fi
+    fi
+fi
+
+exec "$CLI" "$@"

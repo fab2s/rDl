@@ -1,0 +1,16 @@
+[package]
+name = "flodl-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "libtorch manager and GPU diagnostic tool for Rust deep learning"
+readme = "README.md"
+keywords = ["libtorch", "pytorch", "cuda", "deep-learning", "gpu"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "fdl"
+path = "src/main.rs"

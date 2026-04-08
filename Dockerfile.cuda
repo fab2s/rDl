@@ -1,9 +1,13 @@
-# flodl CUDA image — for GPU builds, testing, and CI.
+# flodl CUDA image -- CUDA toolkit only, libtorch mounted at runtime.
 #
-# Uses NVIDIA's CUDA base image with libtorch CUDA variant.
-# For runtime GPU access, use: docker run --gpus all ...
+# No libtorch is baked into this image. Mount the appropriate variant
+# from libtorch/ via docker-compose volumes.
+#
+# The CUDA toolkit version is parameterized. Override at build time:
+#   docker build --build-arg CUDA_VERSION=12.6.0 -f Dockerfile.cuda .
 
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+ARG CUDA_VERSION=12.8.0
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -26,16 +30,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 
-# --- libtorch (CUDA 12.8) ---
-ARG LIBTORCH_VERSION=2.10.0
-RUN --mount=type=cache,target=/tmp/libtorch-cache \
-    ZIPFILE="libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu128.zip" && \
-    if [ ! -f "/tmp/libtorch-cache/${ZIPFILE}" ]; then \
-        wget -q "https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu128.zip" \
-            -O "/tmp/libtorch-cache/${ZIPFILE}"; \
-    fi && \
-    unzip -q "/tmp/libtorch-cache/${ZIPFILE}" -d /usr/local
-
+# libtorch is bind-mounted at runtime to /usr/local/libtorch
 ENV LIBTORCH_PATH="/usr/local/libtorch"
 ENV LD_LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"
 ENV LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"

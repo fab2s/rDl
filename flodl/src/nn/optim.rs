@@ -299,7 +299,7 @@ impl Adam {
 
     /// Create a builder for Adam with per-group learning rates.
     pub fn with_groups() -> AdamBuilder {
-        AdamBuilder { groups: vec![] }
+        AdamBuilder { beta1: 0.9, beta2: 0.999, eps: 1e-8, groups: vec![] }
     }
 
     /// Current learning rate (base LR, or first group's LR).
@@ -308,12 +308,25 @@ impl Adam {
     }
 }
 
-/// Builder for Adam with per-group learning rates.
+/// Builder for Adam with per-group learning rates and customizable hyperparameters.
 pub struct AdamBuilder {
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
     groups: Vec<(Vec<Variable>, f64)>,
 }
 
 impl AdamBuilder {
+    /// Set exponential decay rates for moment estimates (default: (0.9, 0.999)).
+    pub fn betas(mut self, beta1: f64, beta2: f64) -> Self {
+        self.beta1 = beta1;
+        self.beta2 = beta2;
+        self
+    }
+
+    /// Set epsilon for numerical stability (default: 1e-8).
+    pub fn eps(mut self, eps: f64) -> Self { self.eps = eps; self }
+
     /// Add a parameter group with its own learning rate.
     pub fn group(mut self, params: &[Parameter], lr: f64) -> Self {
         let vars: Vec<Variable> = params.iter().map(|p| p.variable.clone()).collect();
@@ -338,9 +351,9 @@ impl AdamBuilder {
         Adam {
             params: all_params,
             lr: base_lr,
-            beta1: 0.9,
-            beta2: 0.999,
-            eps: 1e-8,
+            beta1: self.beta1,
+            beta2: self.beta2,
+            eps: self.eps,
             m: vec![None; n],
             v: vec![None; n],
             t: 0,
@@ -495,7 +508,7 @@ impl AdamW {
 
     /// Create a builder for AdamW with per-group learning rates.
     pub fn with_groups(weight_decay: f64) -> AdamWBuilder {
-        AdamWBuilder { weight_decay, groups: vec![] }
+        AdamWBuilder { beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay, groups: vec![] }
     }
 
     /// Current learning rate.
@@ -504,13 +517,26 @@ impl AdamW {
     }
 }
 
-/// Builder for AdamW with per-group learning rates.
+/// Builder for AdamW with per-group learning rates and customizable hyperparameters.
 pub struct AdamWBuilder {
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
     weight_decay: f64,
     groups: Vec<(Vec<Variable>, f64)>,
 }
 
 impl AdamWBuilder {
+    /// Set exponential decay rates for moment estimates (default: (0.9, 0.999)).
+    pub fn betas(mut self, beta1: f64, beta2: f64) -> Self {
+        self.beta1 = beta1;
+        self.beta2 = beta2;
+        self
+    }
+
+    /// Set epsilon for numerical stability (default: 1e-8).
+    pub fn eps(mut self, eps: f64) -> Self { self.eps = eps; self }
+
     /// Add a parameter group with its own learning rate.
     pub fn group(mut self, params: &[Parameter], lr: f64) -> Self {
         let vars: Vec<Variable> = params.iter().map(|p| p.variable.clone()).collect();
@@ -536,9 +562,9 @@ impl AdamWBuilder {
             adam: Adam {
                 params: all_params,
                 lr: base_lr,
-                beta1: 0.9,
-                beta2: 0.999,
-                eps: 1e-8,
+                beta1: self.beta1,
+                beta2: self.beta2,
+                eps: self.eps,
                 m: vec![None; n],
                 v: vec![None; n],
                 t: 0,
@@ -853,10 +879,14 @@ pub struct AdagradBuilder {
 }
 
 impl AdagradBuilder {
+    /// Set epsilon for numerical stability (default: 1e-10).
     pub fn eps(mut self, eps: f64) -> Self { self.eps = eps; self }
+    /// Set L2 penalty / weight decay (default: 0.0).
     pub fn weight_decay(mut self, wd: f64) -> Self { self.weight_decay = wd; self }
+    /// Set learning rate decay applied each step: `clr = lr / (1 + (step-1) * lr_decay)` (default: 0.0).
     pub fn lr_decay(mut self, lr_decay: f64) -> Self { self.lr_decay = lr_decay; self }
 
+    /// Build the Adagrad optimizer.
     pub fn build(self) -> Adagrad {
         let n = self.params.len();
         Adagrad {
@@ -870,6 +900,8 @@ impl AdagradBuilder {
 }
 
 impl Adagrad {
+    /// Create a new Adagrad optimizer with default parameters:
+    /// eps=1e-10, weight_decay=0, lr_decay=0.
     pub fn new(params: &[Parameter], lr: f64) -> Self {
         let n = params.len();
         Adagrad {
@@ -880,12 +912,14 @@ impl Adagrad {
         }
     }
 
+    /// Create a builder for Adagrad with customizable options.
     pub fn builder(params: &[Parameter], lr: f64) -> AdagradBuilder {
         AdagradBuilder {
             params: params.to_vec(), lr, eps: 1e-10, weight_decay: 0.0, lr_decay: 0.0,
         }
     }
 
+    /// Current learning rate.
     pub fn lr(&self) -> f64 { self.lr }
 }
 
@@ -939,6 +973,8 @@ pub struct RAdam {
 }
 
 impl RAdam {
+    /// Create a new RAdam optimizer with default betas (0.9, 0.999), eps (1e-8),
+    /// and no weight decay.
     pub fn new(params: &[Parameter], lr: f64) -> Self {
         let n = params.len();
         RAdam {
@@ -948,6 +984,7 @@ impl RAdam {
         }
     }
 
+    /// Current learning rate.
     pub fn lr(&self) -> f64 { self.lr }
 }
 
@@ -1035,6 +1072,8 @@ pub struct NAdam {
 }
 
 impl NAdam {
+    /// Create a new NAdam optimizer with default betas (0.9, 0.999), eps (1e-8),
+    /// and no weight decay.
     pub fn new(params: &[Parameter], lr: f64) -> Self {
         let n = params.len();
         NAdam {
@@ -1044,6 +1083,7 @@ impl NAdam {
         }
     }
 
+    /// Current learning rate.
     pub fn lr(&self) -> f64 { self.lr }
 }
 
@@ -1578,5 +1618,358 @@ mod tests {
         opt.step().unwrap();
         let after = p.variable.data().item().unwrap();
         assert!((after - before).abs() > 1e-6, "NAdam step should change parameter");
+    }
+
+    // ---------------------------------------------------------------
+    // Edge-case tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_adam_zero_lr_no_param_change() {
+        let p = make_param("w", &[3, 2]);
+        let mut opt = Adam::new(std::slice::from_ref(&p), 0.0);
+
+        let x = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
+            false,
+        );
+        let before = p.variable.data().to_f32_vec().unwrap();
+        let y = x.matmul(&p.variable).unwrap();
+        y.sum().unwrap().backward().unwrap();
+        opt.step().unwrap();
+        let after = p.variable.data().to_f32_vec().unwrap();
+        assert_eq!(before, after, "lr=0 should leave parameters unchanged");
+    }
+
+    #[test]
+    fn test_adam_very_small_lr_no_nan() {
+        let p = make_param("w", &[4, 3]);
+        let mut opt = Adam::new(std::slice::from_ref(&p), 1e-30);
+
+        let x = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4], crate::tensor::test_device()).unwrap(),
+            false,
+        );
+        let y = x.matmul(&p.variable).unwrap();
+        y.sum().unwrap().backward().unwrap();
+        opt.step().unwrap();
+
+        let vals = p.variable.data().to_f32_vec().unwrap();
+        for (i, &v) in vals.iter().enumerate() {
+            assert!(v.is_finite(), "param[{}] is not finite: {}", i, v);
+        }
+    }
+
+    #[test]
+    fn test_empty_params_optimizers_no_panic() {
+        let empty: &[Parameter] = &[];
+
+        let mut adam = Adam::new(empty, 0.001);
+        adam.step().unwrap();
+        adam.zero_grad();
+
+        let mut sgd = SGD::new(empty, 0.01, 0.9);
+        sgd.step().unwrap();
+        sgd.zero_grad();
+
+        let mut adamw = AdamW::new(empty, 0.001, 0.01);
+        adamw.step().unwrap();
+        adamw.zero_grad();
+
+        let mut rmsprop = RMSprop::new(empty, 0.01);
+        rmsprop.step().unwrap();
+        rmsprop.zero_grad();
+
+        let mut adagrad = Adagrad::new(empty, 0.01);
+        adagrad.step().unwrap();
+        adagrad.zero_grad();
+
+        let mut radam = RAdam::new(empty, 0.01);
+        radam.step().unwrap();
+        radam.zero_grad();
+
+        let mut nadam = NAdam::new(empty, 0.01);
+        nadam.step().unwrap();
+        nadam.zero_grad();
+    }
+
+    #[test]
+    fn test_nadam_convergence_100_steps() {
+        use crate::nn::{Linear, Module, loss::mse_loss};
+
+        let dev = crate::tensor::test_device();
+        let model = Linear::on_device(4, 1, dev).unwrap();
+        let mut opt = NAdam::new(&model.parameters(), 0.01);
+
+        let x = Variable::new(
+            Tensor::from_f32(
+                &[1.0, 0.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0, 0.0,
+                  0.0, 0.0, 1.0, 0.0,
+                  0.0, 0.0, 0.0, 1.0],
+                &[4, 4], dev,
+            ).unwrap(),
+            false,
+        );
+        let target = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4, 1], dev).unwrap(),
+            false,
+        );
+
+        let first_loss;
+        {
+            let pred = model.forward(&x).unwrap();
+            first_loss = mse_loss(&pred, &target).unwrap().item().unwrap();
+        }
+
+        for _ in 0..100 {
+            opt.zero_grad();
+            let pred = model.forward(&x).unwrap();
+            let loss = mse_loss(&pred, &target).unwrap();
+            loss.backward().unwrap();
+            opt.step().unwrap();
+        }
+
+        let pred = model.forward(&x).unwrap();
+        let final_loss = mse_loss(&pred, &target).unwrap().item().unwrap();
+        assert!(final_loss < first_loss * 0.5,
+            "NAdam should converge: first={}, final={}", first_loss, final_loss);
+    }
+
+    #[test]
+    fn test_radam_convergence_100_steps() {
+        use crate::nn::{Linear, Module, loss::mse_loss};
+
+        let dev = crate::tensor::test_device();
+        let model = Linear::on_device(4, 1, dev).unwrap();
+        // RAdam uses SGD-like updates for early steps (rho_t <= 5), so needs
+        // more iterations and a slightly higher LR than vanilla Adam.
+        let mut opt = RAdam::new(&model.parameters(), 0.05);
+
+        let x = Variable::new(
+            Tensor::from_f32(
+                &[1.0, 0.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0, 0.0,
+                  0.0, 0.0, 1.0, 0.0,
+                  0.0, 0.0, 0.0, 1.0],
+                &[4, 4], dev,
+            ).unwrap(),
+            false,
+        );
+        let target = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4, 1], dev).unwrap(),
+            false,
+        );
+
+        let first_loss;
+        {
+            let pred = model.forward(&x).unwrap();
+            first_loss = mse_loss(&pred, &target).unwrap().item().unwrap();
+        }
+
+        for _ in 0..100 {
+            opt.zero_grad();
+            let pred = model.forward(&x).unwrap();
+            let loss = mse_loss(&pred, &target).unwrap();
+            loss.backward().unwrap();
+            opt.step().unwrap();
+        }
+
+        let pred = model.forward(&x).unwrap();
+        let final_loss = mse_loss(&pred, &target).unwrap().item().unwrap();
+        assert!(final_loss < first_loss * 0.5,
+            "RAdam should converge: first={}, final={}", first_loss, final_loss);
+    }
+
+    #[test]
+    fn test_adagrad_convergence_50_steps() {
+        use crate::nn::{Linear, Module, loss::mse_loss};
+
+        let dev = crate::tensor::test_device();
+        let model = Linear::on_device(4, 1, dev).unwrap();
+        let mut opt = Adagrad::new(&model.parameters(), 0.1);
+
+        let x = Variable::new(
+            Tensor::from_f32(
+                &[1.0, 0.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0, 0.0,
+                  0.0, 0.0, 1.0, 0.0,
+                  0.0, 0.0, 0.0, 1.0],
+                &[4, 4], dev,
+            ).unwrap(),
+            false,
+        );
+        let target = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4, 1], dev).unwrap(),
+            false,
+        );
+
+        let first_loss;
+        {
+            let pred = model.forward(&x).unwrap();
+            first_loss = mse_loss(&pred, &target).unwrap().item().unwrap();
+        }
+
+        for _ in 0..50 {
+            opt.zero_grad();
+            let pred = model.forward(&x).unwrap();
+            let loss = mse_loss(&pred, &target).unwrap();
+            loss.backward().unwrap();
+            opt.step().unwrap();
+        }
+
+        let pred = model.forward(&x).unwrap();
+        let final_loss = mse_loss(&pred, &target).unwrap().item().unwrap();
+        assert!(final_loss < first_loss * 0.5,
+            "Adagrad should converge: first={}, final={}", first_loss, final_loss);
+    }
+
+    #[test]
+    fn test_sgd_parameter_groups_different_lr() {
+        let dev = crate::tensor::test_device();
+        let p_fast = Parameter::new(
+            Tensor::from_f32(&[1.0, 2.0], &[1, 2], dev).unwrap(), "fast");
+        let p_slow = Parameter::new(
+            Tensor::from_f32(&[1.0, 2.0], &[1, 2], dev).unwrap(), "slow");
+
+        let mut opt = SGD::with_groups(0.0)
+            .group(std::slice::from_ref(&p_fast), 1.0)
+            .group(std::slice::from_ref(&p_slow), 0.001)
+            .build();
+
+        let x = Variable::new(
+            Tensor::from_f32(&[1.0], &[1, 1], dev).unwrap(), false,
+        );
+        let y_fast = x.matmul(&p_fast.variable).unwrap();
+        let y_slow = x.matmul(&p_slow.variable).unwrap();
+        let loss = y_fast.add(&y_slow).unwrap().sum().unwrap();
+        loss.backward().unwrap();
+
+        let fast_before = p_fast.variable.data().to_f32_vec().unwrap();
+        let slow_before = p_slow.variable.data().to_f32_vec().unwrap();
+        opt.step().unwrap();
+        let fast_after = p_fast.variable.data().to_f32_vec().unwrap();
+        let slow_after = p_slow.variable.data().to_f32_vec().unwrap();
+
+        let fast_delta: f64 = fast_before.iter().zip(&fast_after)
+            .map(|(a, b)| (a - b).abs() as f64).sum();
+        let slow_delta: f64 = slow_before.iter().zip(&slow_after)
+            .map(|(a, b)| (a - b).abs() as f64).sum();
+
+        assert!(fast_delta > slow_delta * 100.0,
+            "fast group (lr=1.0) should move much more than slow (lr=0.001): fast={}, slow={}",
+            fast_delta, slow_delta);
+    }
+
+    #[test]
+    fn test_step_after_zero_grad_on_fresh_optimizer() {
+        let p = make_param("w", &[3, 2]);
+        let mut adam = Adam::new(std::slice::from_ref(&p), 0.001);
+        let mut sgd = SGD::new(std::slice::from_ref(&p), 0.01, 0.9);
+
+        // zero_grad then step on a fresh optimizer (no backward ever called)
+        adam.zero_grad();
+        adam.step().unwrap();
+        sgd.zero_grad();
+        sgd.step().unwrap();
+
+        let vals = p.variable.data().to_f32_vec().unwrap();
+        for (i, &v) in vals.iter().enumerate() {
+            assert!(v.is_finite(), "param[{}] should be finite after step-without-backward: {}", i, v);
+        }
+    }
+
+    #[test]
+    fn test_double_step_without_backward_is_noop() {
+        let p = make_param("w", &[3, 2]);
+        let mut opt = Adam::new(std::slice::from_ref(&p), 0.01);
+
+        // Do one forward+backward+step
+        let x = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
+            false,
+        );
+        let y = x.matmul(&p.variable).unwrap();
+        y.sum().unwrap().backward().unwrap();
+        opt.step().unwrap();
+        opt.zero_grad();
+
+        // Now step again without backward: no gradients, should be a no-op
+        let after_first = p.variable.data().to_f32_vec().unwrap();
+        opt.step().unwrap();
+        let after_second = p.variable.data().to_f32_vec().unwrap();
+
+        assert_eq!(after_first, after_second,
+            "second step without backward should not change params");
+    }
+
+    #[test]
+    fn test_set_lr_all_optimizers() {
+        let p = make_param("w", &[2]);
+
+        let mut adam = Adam::new(std::slice::from_ref(&p), 0.001);
+        adam.set_lr(0.42);
+        assert!((adam.lr() - 0.42).abs() < 1e-12, "Adam set_lr failed");
+
+        let mut sgd = SGD::new(std::slice::from_ref(&p), 0.01, 0.0);
+        sgd.set_lr(0.42);
+        assert!((sgd.lr() - 0.42).abs() < 1e-12, "SGD set_lr failed");
+
+        let mut adamw = AdamW::new(std::slice::from_ref(&p), 0.001, 0.01);
+        adamw.set_lr(0.42);
+        assert!((adamw.lr() - 0.42).abs() < 1e-12, "AdamW set_lr failed");
+
+        let mut rmsprop = RMSprop::new(std::slice::from_ref(&p), 0.01);
+        rmsprop.set_lr(0.42);
+        assert!((rmsprop.lr() - 0.42).abs() < 1e-12, "RMSprop set_lr failed");
+
+        let mut nadam = NAdam::new(std::slice::from_ref(&p), 0.01);
+        nadam.set_lr(0.42);
+        assert!((nadam.lr() - 0.42).abs() < 1e-12, "NAdam set_lr failed");
+
+        let mut radam = RAdam::new(std::slice::from_ref(&p), 0.01);
+        radam.set_lr(0.42);
+        assert!((radam.lr() - 0.42).abs() < 1e-12, "RAdam set_lr failed");
+
+        let mut adagrad = Adagrad::new(std::slice::from_ref(&p), 0.01);
+        adagrad.set_lr(0.42);
+        assert!((adagrad.lr() - 0.42).abs() < 1e-12, "Adagrad set_lr failed");
+    }
+
+    #[test]
+    fn test_set_lr_affects_actual_update_magnitude() {
+        let dev = crate::tensor::test_device();
+
+        // Two identical params, same gradient, different LR via set_lr
+        let p_lo = Parameter::new(
+            Tensor::from_f32(&[5.0], &[1], dev).unwrap(), "lo");
+        let p_hi = Parameter::new(
+            Tensor::from_f32(&[5.0], &[1], dev).unwrap(), "hi");
+
+        let mut opt_lo = SGD::new(std::slice::from_ref(&p_lo), 0.001, 0.0);
+        let mut opt_hi = SGD::new(std::slice::from_ref(&p_hi), 0.001, 0.0);
+        opt_hi.set_lr(1.0);
+
+        // Compute gradients for both
+        let x = Variable::new(
+            Tensor::from_f32(&[1.0], &[1], dev).unwrap(), false,
+        );
+        let loss_lo = x.mul(&p_lo.variable).unwrap().sum().unwrap();
+        loss_lo.backward().unwrap();
+        let loss_hi = x.mul(&p_hi.variable).unwrap().sum().unwrap();
+        loss_hi.backward().unwrap();
+
+        opt_lo.step().unwrap();
+        opt_hi.step().unwrap();
+
+        let val_lo = p_lo.variable.data().to_f32_vec().unwrap()[0];
+        let val_hi = p_hi.variable.data().to_f32_vec().unwrap()[0];
+
+        let delta_lo = (5.0 - val_lo).abs();
+        let delta_hi = (5.0 - val_hi).abs();
+
+        assert!(delta_hi > delta_lo * 100.0,
+            "set_lr(1.0) should produce much larger update than 0.001: hi={}, lo={}",
+            delta_hi, delta_lo);
     }
 }

@@ -33,7 +33,20 @@ use std::time::{Duration, Instant};
 use crate::graph::Graph;
 
 pub use format::{format_eta, format_bytes, format_metric};
-pub use resources::{ResourceSample, ResourceSampler};
+pub use resources::{ResourceSample, ResourceSampler, GpuSnapshot};
+
+/// DDP metrics for a single GPU (throughput, batch split, shard size).
+#[derive(Debug, Clone, Default)]
+pub struct GpuMetrics {
+    /// CUDA device index.
+    pub device_index: u8,
+    /// EMA throughput in samples/ms.
+    pub throughput: f64,
+    /// Fraction of the batch assigned to this device (0.0-1.0).
+    pub chunk_ratio: f64,
+    /// Number of samples in this device's shard last batch.
+    pub shard_size: i64,
+}
 
 /// Recorded snapshot of a single training epoch: timing, metrics, and resource usage.
 #[derive(Clone)]
@@ -46,6 +59,8 @@ pub struct EpochRecord {
     pub metrics: Vec<(String, f64)>,
     /// System resource snapshot taken at the end of this epoch.
     pub resources: ResourceSample,
+    /// Per-GPU DDP metrics (empty for single-GPU training).
+    pub gpu_metrics: Vec<GpuMetrics>,
 }
 
 /// Trait for values accepted by [`Monitor::log()`] as the `metrics` argument.
@@ -56,6 +71,8 @@ pub struct EpochRecord {
 pub trait Metrics {
     /// Convert into owned `(name, value)` pairs for recording.
     fn into_metrics(self) -> Vec<(String, f64)>;
+    /// Per-GPU DDP metrics. Default: empty (single-GPU or non-graph sources).
+    fn gpu_metrics(&self) -> Vec<GpuMetrics> { Vec::new() }
 }
 
 /// Plain metric slice: `&[("loss", val)]`.
@@ -72,10 +89,36 @@ impl<const N: usize> Metrics for &[(&str, f64); N] {
     }
 }
 
-/// Graph only: `&model` — reads latest epoch history.
+/// Build per-GPU DDP metrics from a Graph's distributed state.
+fn graph_gpu_metrics(graph: &Graph) -> Vec<GpuMetrics> {
+    if !graph.is_distributed() {
+        return Vec::new();
+    }
+    let devices = graph.devices();
+    let ratios = graph.chunk_ratios();
+    let throughput = graph.throughput();
+    let shard_sizes = graph.shard_sizes();
+
+    devices.iter().enumerate().map(|(i, dev)| {
+        GpuMetrics {
+            device_index: match dev {
+                crate::tensor::Device::CUDA(idx) => *idx,
+                _ => i as u8,
+            },
+            throughput: throughput.get(i).copied().unwrap_or(0.0),
+            chunk_ratio: ratios.get(i).copied().unwrap_or(0.0),
+            shard_size: shard_sizes.get(i).copied().unwrap_or(0),
+        }
+    }).collect()
+}
+
+/// Graph only: `&model` -- reads latest epoch history.
 impl Metrics for &Graph {
     fn into_metrics(self) -> Vec<(String, f64)> {
         self.latest_metrics()
+    }
+    fn gpu_metrics(&self) -> Vec<GpuMetrics> {
+        graph_gpu_metrics(self)
     }
 }
 
@@ -87,6 +130,9 @@ impl<'a> Metrics for (&'a Graph, &'a [(&'a str, f64)]) {
         m.extend(extra.iter().map(|(k, v)| (k.to_string(), *v)));
         m
     }
+    fn gpu_metrics(&self) -> Vec<GpuMetrics> {
+        graph_gpu_metrics(self.0)
+    }
 }
 
 /// Graph + extras array literal: `(&model, &[("lr", lr)])`.
@@ -96,6 +142,42 @@ impl<'a, const N: usize> Metrics for (&'a Graph, &'a [(&'a str, f64); N]) {
         let mut m = graph.latest_metrics();
         m.extend(extra.iter().map(|(k, v)| (k.to_string(), *v)));
         m
+    }
+    fn gpu_metrics(&self) -> Vec<GpuMetrics> {
+        graph_gpu_metrics(self.0)
+    }
+}
+
+/// DDP builder epoch metrics: feeds `record_scalar` data and per-GPU
+/// throughput/batch share into the Monitor.
+///
+/// ```ignore
+/// while let Some(m) = handle.next_metrics() {
+///     monitor.log(m.epoch, Duration::from_millis(m.epoch_ms as u64), &m);
+/// }
+/// ```
+impl Metrics for &crate::distributed::EpochMetrics {
+    fn into_metrics(self) -> Vec<(String, f64)> {
+        let mut out = Vec::with_capacity(self.scalars.len() + 1);
+        out.push(("loss".to_string(), self.avg_loss));
+        // Deterministic order: sort by key
+        let mut keys: Vec<&String> = self.scalars.keys().collect();
+        keys.sort();
+        for k in keys {
+            out.push((k.clone(), self.scalars[k]));
+        }
+        out
+    }
+
+    fn gpu_metrics(&self) -> Vec<GpuMetrics> {
+        self.device_indices.iter().enumerate().map(|(i, &dev)| {
+            GpuMetrics {
+                device_index: dev,
+                throughput: self.per_rank_throughput.get(i).copied().unwrap_or(0.0),
+                chunk_ratio: self.per_rank_batch_share.get(i).copied().unwrap_or(0.0),
+                shard_size: 0, // not tracked per-epoch in builder mode
+            }
+        }).collect()
     }
 }
 
@@ -140,6 +222,13 @@ impl Monitor {
         let srv = server::DashboardServer::start(port)?;
         eprintln!("  dashboard: http://localhost:{}", port);
         srv.set_hardware(self.hardware.clone());
+
+        // Sample GPU hardware for immediate tab init (before epoch 1)
+        let init_sample = self.sampler.sample();
+        if init_sample.gpus.len() >= 2 {
+            srv.set_gpu_init(Self::gpu_init_json(&init_sample.gpus));
+        }
+
         self.server = Some(srv);
         Ok(())
     }
@@ -199,6 +288,22 @@ impl Monitor {
         self.svg_snapshot = Some(svg.to_string());
         if let Some(ref srv) = self.server {
             srv.set_svg(svg.to_string());
+        }
+    }
+
+    /// Set the graph label and structural hash for the dashboard header.
+    ///
+    /// This is the standalone equivalent of what [`watch()`](Self::watch) does
+    /// via `capture_graph_identity`. Use when you have the identity strings
+    /// but not a `&Graph` reference (e.g. from `DdpHandle::setup_monitor()`).
+    pub fn set_identity(&mut self, label: Option<&str>, hash: Option<&str>) {
+        self.graph_label = label.map(|s| s.to_string());
+        self.graph_hash = hash.map(|s| s.to_string());
+        if let Some(ref srv) = self.server {
+            srv.set_label_hash(
+                self.graph_label.clone(),
+                self.graph_hash.clone(),
+            );
         }
     }
 
@@ -279,6 +384,7 @@ impl Monitor {
     /// history is up to date. `log` does **not** flush — this keeps
     /// observation and monitoring decoupled.
     pub fn log(&mut self, epoch: usize, duration: Duration, metrics: impl Metrics) {
+        let gpu_metrics = metrics.gpu_metrics();
         let metrics = metrics.into_metrics();
         let duration_secs = duration.as_secs_f64();
         let resources = self.sampler.sample();
@@ -288,6 +394,7 @@ impl Monitor {
             duration_secs,
             metrics: metrics.clone(),
             resources: resources.clone(),
+            gpu_metrics: gpu_metrics.clone(),
         };
         self.epochs.push(record);
 
@@ -532,9 +639,15 @@ impl Monitor {
 
         let hw_js = format!("\"{}\"", self.hardware.replace('\\', "\\\\").replace('"', "\\\""));
 
+        // GPU init from first epoch's resource data
+        let gpu_init_js = self.epochs.first()
+            .filter(|e| e.resources.gpus.len() >= 2)
+            .map(|e| Self::gpu_init_json(&e.resources.gpus))
+            .unwrap_or_else(|| "null".to_string());
+
         // Inject archive constants before the main <script> tag
         let archive_block = format!(
-            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\n</script>",
+            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n</script>",
             data_json,
             svg_js,
             format_eta(total_time),
@@ -542,6 +655,7 @@ impl Monitor {
             hash_js,
             meta_js,
             hw_js,
+            gpu_init_js,
         );
 
         let template = include_str!("dashboard.html");
@@ -585,6 +699,70 @@ impl Monitor {
         b.push('}');
     }
 
+    /// Write per-GPU data (hardware + DDP metrics) to a JSON buffer.
+    fn write_gpus(b: &mut String, res: &ResourceSample, ddp: &[GpuMetrics]) {
+        if res.gpus.is_empty() && ddp.is_empty() {
+            return;
+        }
+        b.push_str(",\"gpus\":[");
+        let hw = &res.gpus;
+        let n = hw.len().max(ddp.len());
+        for i in 0..n {
+            if i > 0 { b.push(','); }
+            b.push('{');
+            let mut first = true;
+            // Hardware data from GpuSnapshot
+            if let Some(gpu) = hw.get(i) {
+                let _ = write!(b, "\"dev\":{}", gpu.device_index);
+                first = false;
+                if !gpu.name.is_empty() {
+                    let _ = write!(b, ",\"name\":\"{}\"", gpu.name);
+                }
+                if let Some(util) = gpu.util_percent {
+                    let _ = write!(b, ",\"util\":{:.1}", util);
+                }
+                if let Some(alloc) = gpu.vram_allocated_bytes {
+                    let _ = write!(b, ",\"vram_alloc\":{}", alloc);
+                }
+                if let Some(total) = gpu.vram_total_bytes {
+                    let _ = write!(b, ",\"vram_total\":{}", total);
+                }
+            }
+            // DDP metrics from GpuMetrics
+            if let Some(m) = ddp.get(i) {
+                if first {
+                    let _ = write!(b, "\"dev\":{}", m.device_index);
+                }
+                let _ = write!(b, ",\"throughput\":{:.4}", m.throughput);
+                let _ = write!(b, ",\"chunk\":{:.4}", m.chunk_ratio);
+                let _ = write!(b, ",\"shard\":{}", m.shard_size);
+            }
+            b.push('}');
+        }
+        b.push(']');
+    }
+
+    /// Serialize GPU hardware info as a JSON array for dashboard init.
+    /// Minimal format: `[{"dev":0,"name":"...","vram_total":...}, ...]`
+    fn gpu_init_json(gpus: &[resources::GpuSnapshot]) -> String {
+        use std::fmt::Write;
+        let mut b = String::from("[");
+        for (i, gpu) in gpus.iter().enumerate() {
+            if i > 0 { b.push(','); }
+            b.push('{');
+            let _ = write!(b, "\"dev\":{}", gpu.device_index);
+            if !gpu.name.is_empty() {
+                let _ = write!(b, ",\"name\":\"{}\"", gpu.name);
+            }
+            if let Some(total) = gpu.vram_total_bytes {
+                let _ = write!(b, ",\"vram_total\":{}", total);
+            }
+            b.push('}');
+        }
+        b.push(']');
+        b
+    }
+
     /// Write metric values to a JSON buffer, replacing NaN/Infinity with null.
     fn write_metrics(b: &mut String, metrics: &[(String, f64)]) {
         b.push_str(",\"metrics\":{");
@@ -615,6 +793,7 @@ impl Monitor {
 
         Self::write_metrics(&mut b, &record.metrics);
         Self::write_resources(&mut b, &record.resources);
+        Self::write_gpus(&mut b, &record.resources, &record.gpu_metrics);
 
         b.push('}');
         b
@@ -647,6 +826,7 @@ impl Monitor {
 
         Self::write_metrics(&mut b, &record.metrics);
         Self::write_resources(&mut b, &record.resources);
+        Self::write_gpus(&mut b, &record.resources, &record.gpu_metrics);
 
         b.push('}');
         b

@@ -1,23 +1,26 @@
 #!/bin/sh
-# Download and install libtorch for native (non-Docker) floDl development.
+# Download and install libtorch for floDl development.
 #
 # Usage:
-#   sh download-libtorch.sh                    # auto-detect CPU or CUDA
+#   sh download-libtorch.sh                    # auto-detect CPU or CUDA, install to ~/.local/lib/libtorch
+#   sh download-libtorch.sh --project          # auto-detect, install to project libtorch/ directory
 #   sh download-libtorch.sh --cpu              # force CPU-only
 #   sh download-libtorch.sh --cuda 12.8        # specific CUDA version
 #   sh download-libtorch.sh --path ~/libtorch  # custom install directory
 #
+# With --project, downloads to libtorch/precompiled/<variant>/ and writes
+# .arch metadata + .active pointer for Docker/Makefile auto-detection.
+#
 # Or via curl:
 #   curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/download-libtorch.sh | sh
 #   curl -sL https://raw.githubusercontent.com/fab2s/floDl/main/download-libtorch.sh | sh -s -- --cuda 12.8
-#
-# After install, add the printed exports to your shell profile (~/.bashrc, etc.).
 
 set -e
 
 LIBTORCH_VERSION="2.10.0"
 INSTALL_PATH=""
 VARIANT=""
+PROJECT_MODE=0
 
 # --- Parse arguments ---
 
@@ -35,13 +38,17 @@ while [ $# -gt 0 ]; do
             INSTALL_PATH="${2:?--path requires a directory}"
             shift 2
             ;;
+        --project)
+            PROJECT_MODE=1
+            shift
+            ;;
         --help|-h)
-            head -14 "$0" | tail -12
+            head -16 "$0" | tail -14
             exit 0
             ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: sh download-libtorch.sh [--cpu | --cuda 12.6|12.8] [--path DIR]" >&2
+            echo "Usage: sh download-libtorch.sh [--project] [--cpu | --cuda 12.6|12.8] [--path DIR]" >&2
             exit 1
             ;;
     esac
@@ -73,7 +80,7 @@ case "$OS" in
         fi
         ;;
     *)
-        echo "error: unsupported OS '$OS' — use Linux or macOS" >&2
+        echo "error: unsupported OS '$OS' -- use Linux or macOS" >&2
         echo "       Windows: download from https://pytorch.org/get-started/locally/" >&2
         exit 1
         ;;
@@ -110,7 +117,7 @@ if [ -z "$VARIANT" ]; then
     fi
 fi
 
-# --- Build download URL ---
+# --- Build download URL and metadata ---
 
 case "$VARIANT" in
     cpu)
@@ -122,16 +129,28 @@ case "$VARIANT" in
             URL="https://download.pytorch.org/libtorch/cpu/${FILENAME}"
         fi
         LABEL="CPU"
+        VARIANT_DIR="cpu"
+        ARCH_CUDA="none"
+        ARCH_ARCHS="cpu"
+        ARCH_VARIANT="cpu"
         ;;
     12.6)
         FILENAME="libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu126.zip"
         URL="https://download.pytorch.org/libtorch/cu126/${FILENAME}"
         LABEL="CUDA 12.6"
+        VARIANT_DIR="cu126"
+        ARCH_CUDA="12.6"
+        ARCH_ARCHS="5.0 5.2 6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0"
+        ARCH_VARIANT="cu126"
         ;;
     12.8)
         FILENAME="libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu128.zip"
         URL="https://download.pytorch.org/libtorch/cu128/${FILENAME}"
         LABEL="CUDA 12.8"
+        VARIANT_DIR="cu128"
+        ARCH_CUDA="12.8"
+        ARCH_ARCHS="7.0 7.5 8.0 8.6 8.9 9.0 12.0"
+        ARCH_VARIANT="cu128"
         ;;
     *)
         echo "error: unsupported CUDA version '$VARIANT'" >&2
@@ -143,7 +162,11 @@ esac
 # --- Install path ---
 
 if [ -z "$INSTALL_PATH" ]; then
-    INSTALL_PATH="$HOME/.local/lib/libtorch"
+    if [ "$PROJECT_MODE" = "1" ]; then
+        INSTALL_PATH="libtorch/precompiled/${VARIANT_DIR}"
+    else
+        INSTALL_PATH="$HOME/.local/lib/libtorch"
+    fi
 fi
 
 PARENT_DIR="$(dirname "$INSTALL_PATH")"
@@ -157,9 +180,11 @@ if [ -d "$INSTALL_PATH" ]; then
     fi
     if [ "$EXISTING_VER" = "$LIBTORCH_VERSION" ]; then
         echo "libtorch $LIBTORCH_VERSION already installed at $INSTALL_PATH"
-        echo ""
-        echo "To reinstall, remove it first:"
-        echo "  rm -rf $INSTALL_PATH"
+        if [ "$PROJECT_MODE" = "1" ]; then
+            # Still update .active in case it points elsewhere
+            echo "precompiled/${VARIANT_DIR}" > libtorch/.active
+            echo "Active variant set to: precompiled/${VARIANT_DIR}"
+        fi
         exit 0
     fi
     echo "Existing libtorch found at $INSTALL_PATH (version: ${EXISTING_VER:-unknown})"
@@ -204,16 +229,19 @@ $DOWNLOAD "$TMPFILE" "$URL"
 echo ""
 echo "Extracting to $INSTALL_PATH ..."
 
-# libtorch zips contain a top-level "libtorch/" directory
-unzip -q "$TMPFILE" -d "$PARENT_DIR"
+# libtorch zips contain a top-level "libtorch/" directory.
+# Extract to a temp dir to avoid conflicts with our libtorch/ project dir.
+TMPEXTRACT=$(mktemp -d "${TMPDIR:-/tmp}/libtorch-extract-XXXXXX")
+trap 'rm -f "$TMPFILE"; rm -rf "$TMPEXTRACT"' EXIT
 
-# Rename to target path if needed (zip extracts to $PARENT_DIR/libtorch)
-EXTRACTED="$PARENT_DIR/libtorch"
-if [ "$EXTRACTED" != "$INSTALL_PATH" ]; then
-    mv "$EXTRACTED" "$INSTALL_PATH"
-fi
+unzip -q "$TMPFILE" -d "$TMPEXTRACT"
+
+# Move extracted contents to target path
+mkdir -p "$INSTALL_PATH"
+mv "$TMPEXTRACT"/libtorch/* "$INSTALL_PATH/"
 
 rm -f "$TMPFILE"
+rm -rf "$TMPEXTRACT"
 trap - EXIT
 
 echo "  done."
@@ -228,24 +256,51 @@ if [ ! -f "$INSTALL_PATH/lib/libtorch.so" ] && [ ! -f "$INSTALL_PATH/lib/libtorc
     exit 1
 fi
 
-# --- Print setup instructions ---
+# --- Write .arch metadata ---
 
-echo ""
-echo "=================================================="
-echo "  libtorch $LIBTORCH_VERSION ($LABEL) installed"
-echo "  $INSTALL_PATH"
-echo "=================================================="
-echo ""
-echo "Add these to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-echo ""
-echo "  export LIBTORCH_PATH=\"$INSTALL_PATH\""
-echo "  export LD_LIBRARY_PATH=\"$INSTALL_PATH/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""
-echo ""
-echo "Then reload your shell:"
-echo ""
-echo "  source ~/.bashrc    # or: source ~/.zshrc"
-echo ""
-echo "Verify:"
-echo ""
-echo "  cargo build   # in your floDl project"
-echo ""
+if [ "$PROJECT_MODE" = "1" ]; then
+    cat > "$INSTALL_PATH/.arch" <<ARCH
+cuda=${ARCH_CUDA}
+torch=${LIBTORCH_VERSION}
+archs=${ARCH_ARCHS}
+source=precompiled
+variant=${ARCH_VARIANT}
+ARCH
+
+    # Set .active pointer
+    mkdir -p libtorch
+    echo "precompiled/${VARIANT_DIR}" > libtorch/.active
+
+    echo ""
+    echo "=================================================="
+    echo "  libtorch $LIBTORCH_VERSION ($LABEL) installed"
+    echo "  $INSTALL_PATH"
+    echo "=================================================="
+    echo ""
+    echo "  .arch:   $INSTALL_PATH/.arch"
+    echo "  .active: libtorch/.active -> precompiled/${VARIANT_DIR}"
+    echo ""
+    echo "Run 'make cuda-test' (or 'make test' for CPU) to verify."
+    echo ""
+else
+    # --- Print setup instructions for native install ---
+    echo ""
+    echo "=================================================="
+    echo "  libtorch $LIBTORCH_VERSION ($LABEL) installed"
+    echo "  $INSTALL_PATH"
+    echo "=================================================="
+    echo ""
+    echo "Add these to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
+    echo ""
+    echo "  export LIBTORCH_PATH=\"$INSTALL_PATH\""
+    echo "  export LD_LIBRARY_PATH=\"$INSTALL_PATH/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""
+    echo ""
+    echo "Then reload your shell:"
+    echo ""
+    echo "  source ~/.bashrc    # or: source ~/.zshrc"
+    echo ""
+    echo "Verify:"
+    echo ""
+    echo "  cargo build   # in your floDl project"
+    echo ""
+fi

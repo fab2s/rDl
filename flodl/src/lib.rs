@@ -28,16 +28,19 @@
 pub mod tensor;
 pub mod autograd;
 pub mod nn;
+pub mod distributed;
 pub mod graph;
 pub mod monitor;
 pub mod worker;
 #[cfg(feature = "rng")]
 pub mod rng;
+#[cfg(feature = "rng")]
+pub mod data;
 
 /// Shorthand for building `Vec<Box<dyn Module>>` from a list of modules.
 /// Use with `split`, `gate`, and `switch` to avoid manual `Box::new()` wrapping.
 ///
-/// ```ignore
+/// ```text
 /// .split(modules![read_head(H), read_head(H)])
 /// .gate(router, modules![Linear::new(H, H)?, Linear::new(H, H)?])
 /// ```
@@ -48,7 +51,7 @@ macro_rules! modules {
     };
 }
 
-pub use tensor::{cuda_available, cuda_device_count, cuda_memory_info, cuda_memory_info_idx, cuda_allocated_bytes, cuda_allocated_bytes_idx, cuda_active_bytes, cuda_active_bytes_idx, cuda_peak_active_bytes, cuda_peak_active_bytes_idx, cuda_peak_reserved_bytes, cuda_peak_reserved_bytes_idx, cuda_reset_peak_stats, cuda_reset_peak_stats_idx, cuda_empty_cache, cuda_utilization, cuda_utilization_idx, cuda_device_name, cuda_device_name_idx, cuda_devices, DeviceInfo, set_current_cuda_device, current_cuda_device, cuda_synchronize, hardware_summary, set_cudnn_benchmark, manual_seed, cuda_manual_seed_all, malloc_trim, live_tensor_count, rss_kb, Device, DType, Result, Tensor, TensorError, TensorOptions};
+pub use tensor::{cuda_available, cuda_device_count, cuda_memory_info, cuda_memory_info_idx, cuda_allocated_bytes, cuda_allocated_bytes_idx, cuda_active_bytes, cuda_active_bytes_idx, cuda_peak_active_bytes, cuda_peak_active_bytes_idx, cuda_peak_reserved_bytes, cuda_peak_reserved_bytes_idx, cuda_reset_peak_stats, cuda_reset_peak_stats_idx, cuda_empty_cache, cuda_utilization, cuda_utilization_idx, cuda_device_name, cuda_device_name_idx, cuda_devices, cuda_compute_capability, probe_device, usable_cuda_devices, DeviceInfo, set_current_cuda_device, current_cuda_device, cuda_synchronize, hardware_summary, set_cudnn_benchmark, manual_seed, cuda_manual_seed_all, malloc_trim, live_tensor_count, rss_kb, Device, DType, Result, Tensor, TensorError, TensorOptions};
 #[cfg(feature = "rng")]
 pub use rng::Rng;
 pub use autograd::{Variable, no_grad, is_grad_enabled, NoGradGuard, max_pool2d, adaptive_avg_pool2d, grid_sample, embedding_bag};
@@ -84,12 +87,20 @@ pub use nn::{
     CudaGraph, MemPoolId, CaptureMode, cuda_graph_capture, cuda_graph_pool_handle,
     GaussianBlur, gaussian_blur_2d,
 };
+pub use distributed::{
+    CudaEvent, CudaEventFlags, CudaStream, StreamGuard,
+    NcclComms, NcclRankComm, NcclUniqueId, ReduceOp, Ddp, DdpConfig, ElChe,
+    ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, record_scalar, GpuWorker,
+};
 pub use graph::{
-    FlowBuilder, MergeOp, Graph, MapBuilder, Trend, TrendGroup,
+    FlowBuilder, MergeOp, Graph, LossContext, MapBuilder, Trend, TrendGroup,
     Profile, NodeTiming, LevelTiming, format_duration,
     SoftmaxRouter, SigmoidRouter, FixedSelector, ArgmaxSelector,
     ThresholdHalt, LearnedHalt,
     Reshape, StateAdd, Reduce, ModelSnapshot,
     PathKind,
+    GraphEpochIterator, ActiveGraphEpochIterator,
 };
 pub use worker::CpuWorker;
+#[cfg(feature = "rng")]
+pub use data::{DataSet, BatchDataSet, Sampler, RandomSampler, SequentialSampler, DataLoader, DataLoaderBuilder, EpochIterator, DistributedEpochIterator, Batch};

@@ -21,3 +21,6 @@ site/guide/*.md
 site/_site/
 site/.jekyll-cache/
 site/Gemfile.lock
+
+# libtorch variants (downloaded or built from source)
+/libtorch/
