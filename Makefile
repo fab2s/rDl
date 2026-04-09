@@ -224,6 +224,11 @@ bench-publish: bench-image _require-libtorch-cuda
 
 bench-compare: bench
 
+# --- DDP validation benchmark ---
+
+ddp-bench: cuda-image _require-libtorch-cuda
+	$(RUN_GPU) bash -c "cd ddp-bench && cargo run --release --features cuda -- $(ARGS)"
+
 # --- docs.rs validation ---
 
 docs-rs:

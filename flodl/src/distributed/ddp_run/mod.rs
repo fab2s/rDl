@@ -332,6 +332,22 @@ pub struct DdpRunConfig {
     /// spikes on any GPU are bounded before they propagate through
     /// AllReduce averaging.
     pub max_grad_norm: Option<f64>,
+    /// Optional high-frequency system timeline for profiling DDP behavior.
+    ///
+    /// When set, the coordinator and workers inject training events (sync,
+    /// epoch boundaries, anchor changes, throttle) into the timeline.
+    pub timeline: Option<Arc<crate::monitor::Timeline>>,
+    /// Automatically scale the learning rate by `world_size` to compensate
+    /// for data partitioning across GPUs. Default: `true`.
+    ///
+    /// In DDP, the dataset is split across workers so each GPU sees
+    /// `total_samples / world_size` per epoch. With gradient averaging,
+    /// the effective batch size is `batch_size * world_size`. The linear
+    /// scaling rule (Goyal et al.) compensates by scaling LR proportionally.
+    ///
+    /// Set to `false` if you already account for multi-GPU LR scaling
+    /// in your optimizer factory or epoch callback.
+    pub auto_scale_lr: bool,
 }
 
 impl Default for DdpRunConfig {
@@ -354,6 +370,8 @@ impl DdpRunConfig {
             partition_ratios: None,
             progressive_dispatch: None,
             max_grad_norm: None,
+            timeline: None,
+            auto_scale_lr: true,
         }
     }
 
@@ -437,6 +455,25 @@ impl DdpRunConfig {
     /// propagating through AllReduce.
     pub fn with_max_grad_norm(mut self, max_norm: f64) -> Self {
         self.max_grad_norm = Some(max_norm);
+        self
+    }
+
+    /// Attach a high-frequency system timeline for profiling DDP behavior.
+    ///
+    /// When set, the coordinator and workers inject training events
+    /// (sync, epoch, anchor changes, throttle) into the timeline.
+    pub fn with_timeline(mut self, tl: Arc<crate::monitor::Timeline>) -> Self {
+        self.timeline = Some(tl);
+        self
+    }
+
+    /// Disable automatic LR scaling by `world_size`.
+    ///
+    /// By default, flodl scales the learning rate by `world_size` to compensate
+    /// for the reduced per-GPU dataset partition. Call this if you already handle
+    /// LR scaling in your optimizer factory or epoch callback.
+    pub fn without_auto_scale_lr(mut self) -> Self {
+        self.auto_scale_lr = false;
         self
     }
 }
@@ -596,6 +633,8 @@ pub struct WorkerConfig {
     pub seed: u64,
     /// Maximum gradient norm for clipping (None = no clipping).
     pub max_grad_norm: Option<f64>,
+    /// Optional system timeline for high-frequency profiling.
+    pub timeline: Option<Arc<crate::monitor::Timeline>>,
 }
 
 // ---------------------------------------------------------------------------

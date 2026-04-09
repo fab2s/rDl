@@ -210,6 +210,21 @@ impl DdpHandle {
         let world_size = devices.len();
         let total_samples = dataset.len();
 
+        // Linear LR scaling: compensate for data partitioning across GPUs.
+        // Each GPU sees total_samples/world_size, so the effective batch size
+        // is batch_size * world_size. Scale LR proportionally (Goyal et al., 2017).
+        let lr_scale_factor = if config.auto_scale_lr && world_size > 1 {
+            let scale = world_size as f64;
+            eprintln!(
+                "  ddp: LR scaled by {world_size}x (effective batch size = {}). \
+                 Disable with .no_lr_scaling()",
+                batch_size * world_size,
+            );
+            scale
+        } else {
+            1.0
+        };
+
         // Build training config snapshot for monitor metadata
         let progressive = config.progressive_dispatch
             .unwrap_or(!matches!(policy, ApplyPolicy::Sync));
@@ -280,6 +295,8 @@ impl DdpHandle {
         let snap_timeout = config.snapshot_timeout_secs;
         let partition_ratios = config.partition_ratios.clone();
         let max_grad_norm = config.max_grad_norm;
+        let timeline = config.timeline.clone();
+        let coord_timeline = timeline.clone();
         let coord_batch_size = batch_size;
         let seed: u64 = 42;
 
@@ -299,7 +316,8 @@ impl DdpHandle {
                 .num_epochs(num_epochs)
                 .partition_ratios(partition_ratios)
                 .progressive(progressive)
-                .batch_size(coord_batch_size);
+                .batch_size(coord_batch_size)
+                .timeline(coord_timeline.clone());
                 if let Some(dt) = div_threshold {
                     builder = builder.divergence_threshold(dt);
                 }
@@ -406,6 +424,8 @@ impl DdpHandle {
             let shutdown_w = shutdown.clone();
 
             let worker_nccl = rank_comms[rank].take();
+            let worker_tl = timeline.clone();
+            let lr_scale = lr_scale_factor;
             let config = WorkerConfig {
                 rank,
                 world_size,
@@ -416,6 +436,7 @@ impl DdpHandle {
                 batch_size,
                 seed,
                 max_grad_norm,
+                timeline: worker_tl,
             };
 
             let handle = std::thread::Builder::new()
@@ -445,6 +466,11 @@ impl DdpHandle {
                             fp_tx,
                             control_rx,
                         )?;
+
+                        // Apply linear LR scaling for DDP.
+                        if lr_scale > 1.0 {
+                            worker.scale_lr(lr_scale);
+                        }
 
                         // Training loop: coordinator-driven epochs.
                         // Workers are mode-agnostic: they wait for a plan,
@@ -595,6 +621,7 @@ impl DdpHandle {
             batch_size,
             seed: 42,
             max_grad_norm,
+            timeline: None,
         };
 
         // Channels (unused in single-GPU mode, but needed by GpuWorker)
@@ -1074,6 +1101,29 @@ where
     /// for the setup/El Che path.
     pub fn max_grad_norm(mut self, max_norm: f64) -> Self {
         self.config = self.config.with_max_grad_norm(max_norm);
+        self
+    }
+
+    /// Attach a high-frequency system timeline for profiling DDP behavior.
+    ///
+    /// The coordinator and workers inject training events (sync, epoch,
+    /// anchor changes, throttle) into the timeline for post-run analysis.
+    pub fn timeline(mut self, tl: std::sync::Arc<crate::monitor::Timeline>) -> Self {
+        self.config = self.config.with_timeline(tl);
+        self
+    }
+
+    /// Disable automatic LR scaling by `world_size`.
+    ///
+    /// By default, flodl scales the learning rate by `world_size` to compensate
+    /// for data partitioning. Each GPU sees `total_samples / world_size` per
+    /// epoch, so the effective batch size is `batch_size * world_size`. The
+    /// linear scaling rule (Goyal et al., 2017) compensates by increasing LR.
+    ///
+    /// Call this if you already handle LR scaling in your optimizer factory
+    /// or epoch callback.
+    pub fn no_lr_scaling(mut self) -> Self {
+        self.config = self.config.without_auto_scale_lr();
         self
     }
 

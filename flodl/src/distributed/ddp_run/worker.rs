@@ -96,6 +96,8 @@ pub struct GpuWorker<M: Module> {
     activation_peak_bytes: usize,
     /// Maximum gradient norm for clipping (None = no clipping).
     max_grad_norm: Option<f64>,
+    /// Optional system timeline for event injection.
+    timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
 }
 
 /// Channels bundle returned by [`GpuWorker::channels`] for wiring into the coordinator.
@@ -276,6 +278,7 @@ impl<M: Module> GpuWorker<M> {
             per_sample_bytes,
             activation_peak_bytes: 0,
             max_grad_norm: config.max_grad_norm,
+            timeline: config.timeline.clone(),
         })
     }
 
@@ -307,6 +310,11 @@ impl<M: Module> GpuWorker<M> {
     /// Set the learning rate on this worker's optimizer.
     pub fn set_lr(&mut self, lr: f64) {
         self.optimizer.set_lr(lr);
+    }
+
+    /// Scale the learning rate by a factor (for DDP linear scaling rule).
+    pub fn scale_lr(&mut self, factor: f64) {
+        self.optimizer.scale_lr(factor);
     }
 
     /// A reference to the concrete model.
@@ -399,8 +407,16 @@ impl<M: Module> GpuWorker<M> {
         let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
 
         if let Some(stream) = &self.comm_stream {
-            // AllReduce on comm_stream (non-blocking on host)
+            // AllReduce on comm_stream
             comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream)?;
+            // HOST-synchronize: block until AllReduce completes. Without
+            // this, the host thread races ahead and reports timing from
+            // batches whose GPU ops are queued behind the AllReduce. The
+            // coordinator sees those phantom batches as real progress and
+            // floods SyncNow, deadlocking the GPU comm streams.
+            // No throughput loss: compute_stream already waits on
+            // copy_done, so AllReduce and compute can't overlap.
+            stream.synchronize()?;
             // Record event so compute_stream waits before next forward
             if let Some(ev) = &self.copy_done {
                 ev.record_on(stream)?;
@@ -718,6 +734,9 @@ impl<M: Module> GpuWorker<M> {
             false
         };
 
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::EpochStart { epoch: plan.epoch });
+        }
         let epoch_start = Instant::now();
         let mut total_loss = 0.0;
 
@@ -805,11 +824,14 @@ impl<M: Module> GpuWorker<M> {
         }
 
         let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
-        let _ = self.report_epoch(
-            total_loss / num_batches as f64,
-            num_batches,
-            epoch_ms,
-        );
+        let avg_loss = total_loss / num_batches as f64;
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::EpochEnd {
+                epoch: plan.epoch,
+                loss: avg_loss,
+            });
+        }
+        let _ = self.report_epoch(avg_loss, num_batches, epoch_ms);
 
         Ok(false)
     }

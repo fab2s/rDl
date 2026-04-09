@@ -86,6 +86,7 @@ fn test_worker_config_clone() {
         batch_size: 32,
         seed: 42,
         max_grad_norm: None,
+        timeline: None,
     };
     let cfg2 = cfg.clone();
     assert_eq!(cfg2.rank, 0);
@@ -168,6 +169,7 @@ fn make_test_worker_with(
         batch_size: 4,
         seed: 42,
         max_grad_norm: None,
+        timeline: None,
     };
 
     let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), channels) =
@@ -604,9 +606,10 @@ fn test_coordinator_should_average_wall_time() {
 
     // Phase 1: calibrate ElChe (uncalibrated uses batch-count fallback).
     // Send 10 batches per rank to trigger initial averaging.
-    for _ in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0 }).unwrap();
+    // step_count must increment to satisfy NCCL ack tracking.
+    for i in 0..10 {
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i + 1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: i + 1 }).unwrap();
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average()); // batch-count fallback: 10 >= 10
@@ -624,17 +627,17 @@ fn test_coordinator_should_average_wall_time() {
     // After calibration with 2:1 ratio, batch_counts ≈ [20, 10].
     // If we feed 10 batches to each: wall_ms_accum = [50, 100].
     // min(50, 100) = 50 < 100 → no trigger (fast rank hasn't accumulated enough).
-    for _ in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0 }).unwrap();
+    for i in 0..10 {
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 11 + i }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 11 + i }).unwrap();
     }
     h.coord.drain_timing();
     assert!(!h.coord.should_average(), "fast rank wall time < target");
 
     // Feed 10 more to rank 0 only (simulating fast GPU running ahead).
     // wall_ms_accum = [100, 100]. min = 100 >= target → trigger!
-    for _ in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
+    for i in 0..10 {
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 21 + i }).unwrap();
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average(), "both ranks at target wall time");
@@ -647,9 +650,10 @@ fn test_async_uses_batch_count_not_wall_time() {
     let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Nccl);
 
     // Calibrate: 10 batches each at 2:1 speed ratio.
-    for _ in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0 }).unwrap();
+    // step_count must increment to satisfy NCCL ack tracking.
+    for i in 0..10 {
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i + 1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: i + 1 }).unwrap();
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average());
@@ -657,16 +661,20 @@ fn test_async_uses_batch_count_not_wall_time() {
     for rx in &h.control_rxs { while rx.try_recv().is_ok() {} }
     assert!(h.coord.is_calibrated());
 
-    // After calibration, batch_counts ≈ [20, 10].
+    // After calibration, batch_counts ~ [20, 10].
     // Feed exactly those counts. With wall-time trigger this would NOT
     // fire (fast rank wall = 100ms, slow = 100ms, but batch counts would
     // differ). With batch-count trigger it fires immediately.
     let counts = h.coord.el_che.batch_counts();
+    let mut step0 = 11usize;
+    let mut step1 = 11usize;
     for _ in 0..counts[0] {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: step0 }).unwrap();
+        step0 += 1;
     }
     for _ in 0..counts[1] {
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: step1 }).unwrap();
+        step1 += 1;
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average(), "async triggers on batch counts, not wall time");
@@ -709,11 +717,16 @@ fn test_coordinator_trigger_cpu_averaging() {
     // trigger_averaging now returns immediately (enters Collecting state)
     h.coord.trigger_averaging().unwrap();
 
-    // Workers should receive RequestParams
+    // Workers should receive RequestParams + Throttle (Sync policy blocks
+    // workers during CPU averaging to prevent training with stale params).
     for rx in &h.control_rxs {
         match rx.recv().unwrap() {
             ControlMsg::RequestParams => {}
             other => panic!("expected RequestParams, got {:?}", std::mem::discriminant(&other)),
+        }
+        match rx.recv().unwrap() {
+            ControlMsg::Throttle => {}
+            other => panic!("expected Throttle, got {:?}", std::mem::discriminant(&other)),
         }
     }
 
@@ -742,7 +755,7 @@ fn test_coordinator_trigger_cpu_averaging() {
 
     assert_eq!(h.coord.version(), 1);
 
-    // Workers should receive Update
+    // Workers should receive Update (Throttle handler dispatches it)
     for rx in &h.control_rxs {
         match rx.recv().unwrap() {
             ControlMsg::Update(avg) => {
@@ -1701,9 +1714,10 @@ fn test_cpu_averaging_divergence_correction() {
 #[test]
 fn test_throttle_during_cpu_averaging() {
     // The key invariant: check_throttle fires even while CPU averaging
-    // is in Collecting state.
-    let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Cpu);
-    let el_che = ElChe::new(2, 10).with_max_batch_diff(2);
+    // is in Collecting state. Uses Cadence policy because Sync sends
+    // a sync Throttle with RequestParams (workers block immediately).
+    let mut h = make_coord_harness(2, ApplyPolicy::Cadence, AverageBackend::Cpu);
+    let el_che = ElChe::new(2, 1).with_max_batch_diff(2);
     h.coord.el_che = el_che;
 
     // Feed enough timing to trigger averaging

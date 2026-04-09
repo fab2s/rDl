@@ -15,12 +15,18 @@ pub trait Optimizer {
     fn step(&mut self) -> Result<()>;
     /// Reset all parameter gradients to zero.
     fn zero_grad(&self);
+    /// Current learning rate (group 0 for grouped optimizers).
+    fn lr(&self) -> f64;
     /// Update the learning rate (all groups if grouped).
     fn set_lr(&mut self, lr: f64);
     /// Set learning rate for a specific parameter group (0-indexed).
     /// Falls back to `set_lr` for single-group optimizers.
     fn set_group_lr(&mut self, _group: usize, lr: f64) {
         self.set_lr(lr);
+    }
+    /// Multiply the learning rate by a factor (all groups).
+    fn scale_lr(&mut self, factor: f64) {
+        self.set_lr(self.lr() * factor);
     }
 }
 
@@ -166,6 +172,7 @@ impl SGDBuilder {
 }
 
 impl Optimizer for SGD {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
@@ -363,6 +370,7 @@ impl AdamBuilder {
 }
 
 impl Optimizer for Adam {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         self.adam_update(0.0)
     }
@@ -576,6 +584,7 @@ impl AdamWBuilder {
 }
 
 impl Optimizer for AdamW {
+    fn lr(&self) -> f64 { self.adam.lr }
     fn step(&mut self) -> Result<()> {
         self.adam.adam_update(self.weight_decay)
     }
@@ -725,6 +734,7 @@ impl RMSpropBuilder {
 }
 
 impl Optimizer for RMSprop {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
@@ -924,6 +934,7 @@ impl Adagrad {
 }
 
 impl Optimizer for Adagrad {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         self.step_count += 1;
         let clr = self.lr / (1.0 + (self.step_count - 1) as f64 * self.lr_decay);
@@ -989,6 +1000,7 @@ impl RAdam {
 }
 
 impl Optimizer for RAdam {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         self.step_count += 1;
         let t = self.step_count as f64;
@@ -1088,6 +1100,7 @@ impl NAdam {
 }
 
 impl Optimizer for NAdam {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         self.step_count += 1;
         let t = self.step_count as f64;

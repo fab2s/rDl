@@ -25,6 +25,7 @@
 
 pub mod format;
 pub mod resources;
+pub mod timeline;
 mod server;
 
 use std::fmt::Write;
@@ -34,6 +35,7 @@ use crate::graph::Graph;
 
 pub use format::{format_eta, format_bytes, format_metric};
 pub use resources::{ResourceSample, ResourceSampler, GpuSnapshot};
+pub use timeline::{Timeline, TimelineBroadcast, TimelineEvent, EventKind, TimelineSample, GpuTimelineSample, TimelineSummary};
 
 /// DDP metrics for a single GPU (throughput, batch split, shard size).
 #[derive(Debug, Clone, Default)]

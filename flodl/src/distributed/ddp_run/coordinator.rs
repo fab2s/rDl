@@ -253,6 +253,24 @@ pub struct Coordinator {
     min_chunk_batches: usize,
     /// Batch size (samples per batch), needed for chunk sizing.
     batch_size: usize,
+
+    // Timeline profiling
+    /// Optional high-frequency system timeline for event injection.
+    timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
+    /// Instant when the last NCCL sync started (for duration measurement).
+    nccl_sync_start: Option<std::time::Instant>,
+
+    // NCCL sync acknowledgment
+    /// Per-rank: last worker `step_count` seen in a TimingMsg.
+    /// Monotonically increasing (workers never reset `local_step`).
+    last_step_count: Vec<usize>,
+    /// Per-rank: `last_step_count` snapshot at the time SyncNow was sent.
+    /// A rank is acknowledged when its `step_count` exceeds this threshold.
+    nccl_sync_step: Vec<usize>,
+    /// Per-rank: true once a post-sync timing message has arrived.
+    /// Without this gate, stale timing from pre-sync batches refills
+    /// `steps_since_avg` and floods AllReduce calls, deadlocking GPU streams.
+    nccl_ack: Vec<bool>,
 }
 
 /// Builder for configuring a [`Coordinator`].
@@ -276,6 +294,7 @@ pub struct CoordinatorBuilder {
     partition_ratios: Option<Vec<f64>>,
     progressive: bool,
     batch_size: usize,
+    timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
 }
 
 impl CoordinatorBuilder {
@@ -289,6 +308,12 @@ impl CoordinatorBuilder {
     /// Set the batch size (needed for chunk sizing in progressive mode).
     pub fn batch_size(mut self, bs: usize) -> Self {
         self.batch_size = bs;
+        self
+    }
+
+    /// Attach a system timeline for event injection.
+    pub fn timeline(mut self, tl: Option<std::sync::Arc<crate::monitor::Timeline>>) -> Self {
+        self.timeline = tl;
         self
     }
 
@@ -389,6 +414,11 @@ impl CoordinatorBuilder {
             chunk_pool: None,
             min_chunk_batches: 4,
             batch_size: self.batch_size.max(1),
+            timeline: self.timeline,
+            nccl_sync_start: None,
+            last_step_count: vec![0; self.world_size],
+            nccl_sync_step: vec![0; self.world_size],
+            nccl_ack: vec![true; self.world_size],
         }
     }
 }
@@ -428,6 +458,7 @@ impl Coordinator {
             partition_ratios: None,
             progressive: !matches!(policy, ApplyPolicy::Sync),
             batch_size: 1,
+            timeline: None,
         }
     }
 
@@ -751,10 +782,20 @@ impl Coordinator {
     /// [`Self::drain_timing_blocking`].
     fn process_timing_msg(&mut self, msg: TimingMsg) {
         match msg {
-            TimingMsg::Batch { rank, batch_ms, .. } => {
+            TimingMsg::Batch { rank, batch_ms, step_count } => {
                 self.steps_since_avg[rank] = self.steps_since_avg[rank].saturating_add(1);
                 self.wall_ms_accum[rank] += batch_ms;
+                self.last_step_count[rank] = self.last_step_count[rank].max(step_count);
                 self.last_batch_ms[rank] = batch_ms;
+                // Ack NCCL sync when the worker's step_count exceeds the
+                // snapshot at trigger time (proves the worker processed the
+                // SyncNow and completed the AllReduce before this batch).
+                if rank < self.nccl_ack.len()
+                    && !self.nccl_ack[rank]
+                    && step_count > self.nccl_sync_step[rank]
+                {
+                    self.nccl_ack[rank] = true;
+                }
             }
             TimingMsg::Exiting { .. } => {
                 self.active_count = self.active_count.saturating_sub(1);
@@ -882,6 +923,13 @@ impl Coordinator {
         if !matches!(self.avg_state, CpuAvgState::Idle) {
             return false;
         }
+        // Don't re-trigger NCCL averaging until all ranks have acknowledged
+        // the previous SyncNow (sent at least one timing message since).
+        if matches!(self.backend, AverageBackend::Nccl)
+            && !self.nccl_ack.iter().all(|&a| a)
+        {
+            return false;
+        }
         // Training complete: workers received Shutdown, skip stale averaging.
         if self.all_epochs_done() {
             return false;
@@ -936,13 +984,23 @@ impl Coordinator {
     /// and averaging happen over subsequent [`Self::poll_cpu_averaging`] ticks,
     /// keeping [`Self::check_throttle`] active throughout.
     pub fn trigger_averaging(&mut self) -> Result<()> {
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::SyncStart);
+        }
         match self.backend {
             AverageBackend::Nccl => {
+                self.nccl_sync_start = Some(Instant::now());
                 for tx in &self.control_txs {
                     let _ = tx.send(ControlMsg::SyncNow);
                 }
-                // NCCL: workers block in AllReduce, no new batches happen,
-                // so zeroing counters is correct.
+                // Snapshot each rank's last seen worker step_count and
+                // mark unacknowledged. should_average() won't fire again
+                // until every rank sends a timing message with step_count
+                // above this snapshot, proving it processed the SyncNow.
+                for rank in 0..self.world_size {
+                    self.nccl_sync_step[rank] = self.last_step_count[rank];
+                    self.nccl_ack[rank] = false;
+                }
                 self.finish_averaging_nccl();
             }
             AverageBackend::Cpu => {
@@ -951,9 +1009,20 @@ impl Coordinator {
                 let steps_snapshot = self.steps_since_avg.clone();
                 let wall_ms_snapshot = self.wall_ms_accum.clone();
 
-                // Send RequestParams to all workers
-                for tx in &self.control_txs {
+                // Send RequestParams to all workers. In Sync mode, also
+                // send Throttle so workers block after snapshotting (same
+                // semantics as NCCL AllReduce blocking). Without this,
+                // workers keep training with diverging params while the
+                // CPU averaging state machine runs, then the Update
+                // overwrites those steps, wasting compute and corrupting
+                // the optimizer's momentum/variance state.
+                let sync_throttle = matches!(self.policy, ApplyPolicy::Sync);
+                for (rank, tx) in self.control_txs.iter().enumerate() {
                     let _ = tx.send(ControlMsg::RequestParams);
+                    if sync_throttle {
+                        let _ = tx.send(ControlMsg::Throttle);
+                        self.throttled[rank] = true;
+                    }
                 }
 
                 let timeout_secs = self.snapshot_timeout_secs;
@@ -977,6 +1046,7 @@ impl Coordinator {
     /// NCCL workers block in AllReduce so no new batches arrive during the
     /// collective; zeroing is correct.
     fn finish_averaging_nccl(&mut self) {
+        let old_anchor = self.el_che.anchor();
         if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
             self.el_che.report_timing(&self.wall_ms_accum, &self.steps_since_avg, self.last_avg_ms);
             self.last_avg_ms = 0.0;
@@ -987,6 +1057,21 @@ impl Coordinator {
 
         self.version += 1;
         self.avg_count += 1;
+
+        // Timeline: sync duration and anchor changes
+        if let Some(ref tl) = self.timeline {
+            let dur = self.nccl_sync_start.take()
+                .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            tl.event(crate::monitor::EventKind::SyncEnd { duration_ms: dur });
+            let new_anchor = self.el_che.anchor();
+            if new_anchor != old_anchor {
+                tl.event(crate::monitor::EventKind::AnchorChanged {
+                    from: old_anchor,
+                    to: new_anchor,
+                });
+            }
+        }
 
         eprintln!(
             "  ddp: NCCL averaging #{} complete (v{})",
@@ -1015,6 +1100,7 @@ impl Coordinator {
         divergence: Option<f64>,
     ) {
         self.last_avg_ms = avg_ms;
+        let old_anchor = self.el_che.anchor();
 
         // Report the snapshot values to ElChe (accurate for the period
         // that triggered averaging, not inflated by during-averaging batches).
@@ -1031,7 +1117,6 @@ impl Coordinator {
         // overhead auto-tune handles loosening.
         if let Some(div) = divergence {
             if div > self.divergence_threshold {
-                let old_anchor = self.el_che.anchor();
                 self.el_che.nudge_anchor_down(0.5);
                 eprintln!(
                     "  ddp: divergence {div:.4} > {:.4}, anchor {} -> {}",
@@ -1042,6 +1127,19 @@ impl Coordinator {
 
         self.version += 1;
         self.avg_count += 1;
+
+        // Timeline: CPU averaging completion and anchor changes
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::CpuAvgEnd { duration_ms: avg_ms });
+            tl.event(crate::monitor::EventKind::SyncEnd { duration_ms: avg_ms });
+            let new_anchor = self.el_che.anchor();
+            if new_anchor != old_anchor {
+                tl.event(crate::monitor::EventKind::AnchorChanged {
+                    from: old_anchor,
+                    to: new_anchor,
+                });
+            }
+        }
 
         eprintln!(
             "  ddp: CPU averaging #{} complete (v{}, {:.1}ms)",
@@ -1147,6 +1245,9 @@ impl Coordinator {
 
                 if snapshots.len() >= self.world_size {
                     // All snapshots collected. Spawn compute thread.
+                    if let Some(ref tl) = self.timeline {
+                        tl.event(crate::monitor::EventKind::CpuAvgStart);
+                    }
                     let version = self.version + 1;
 
                     let handle = std::thread::Builder::new()
@@ -1361,6 +1462,9 @@ impl Coordinator {
             if should_throttle && !self.throttled[rank] {
                 let _ = self.control_txs[rank].send(ControlMsg::Throttle);
                 self.throttled[rank] = true;
+                if let Some(ref tl) = self.timeline {
+                    tl.event(crate::monitor::EventKind::Throttle { rank });
+                }
             }
         }
     }

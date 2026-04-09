@@ -1,4 +1,4 @@
-/target
+target/
 benchmarks/target
 Cargo.lock
 .cargo-cache/
