@@ -29,7 +29,7 @@ pub fn def() -> ModelDef {
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 1000,
-            batch_size: 256,
+            batch_size: 64,
             lr: 0.001,
         },
     }
@@ -42,8 +42,8 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
     Ok(Box::new(model))
 }
 
-fn make_dataset(seed: u64, total_samples: usize) -> Result<Arc<dyn BatchDataSet>> {
-    SyntheticDataSet::sequence(seed, total_samples, SEQ_LEN, INPUT_DIM, OUTPUT_DIM)
+fn make_dataset(seed: u64, virtual_len: usize, pool_size: usize) -> Result<Arc<dyn BatchDataSet>> {
+    SyntheticDataSet::sequence(seed, virtual_len, pool_size, SEQ_LEN, INPUT_DIM, OUTPUT_DIM)
 }
 
 fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {

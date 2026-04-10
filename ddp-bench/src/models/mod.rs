@@ -30,8 +30,8 @@ pub struct ModelDef {
     pub description: &'static str,
     /// Build the model on a specific device.
     pub build: fn(Device) -> Result<Box<dyn Module>>,
-    /// Create a synthetic dataset with the given seed and total samples.
-    pub dataset: fn(u64, usize) -> Result<Arc<dyn BatchDataSet>>,
+    /// Create a synthetic dataset.  Args: (seed, virtual_len, pool_size).
+    pub dataset: fn(u64, usize, usize) -> Result<Arc<dyn BatchDataSet>>,
     /// Training step: forward + loss. Returns the loss Variable.
     pub train_fn: fn(&dyn Module, &[Tensor]) -> Result<Variable>,
     /// Default configuration.

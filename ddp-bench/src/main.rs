@@ -3,6 +3,7 @@
 //! Tests every common training pattern across all ElChe modes to validate
 //! correctness and measure convergence, throughput, and GPU utilization.
 
+mod analyze;
 mod config;
 mod data;
 mod harness;
@@ -35,6 +36,8 @@ fn run() -> flodl::tensor::Result<()> {
     let mut tolerance: f64 = 0.15; // 15% relative tolerance
     let mut seed: u64 = 42;
     let mut list = false;
+    let mut do_report = false;
+    let mut report_file: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -88,6 +91,14 @@ fn run() -> flodl::tensor::Result<()> {
             "--list" => {
                 list = true;
             }
+            "--report" => {
+                do_report = true;
+                // Optional: next arg can be a file path (if it doesn't start with --)
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    i += 1;
+                    report_file = Some(args[i].clone());
+                }
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -111,6 +122,59 @@ fn run() -> flodl::tensor::Result<()> {
         eprintln!("\nModes:");
         for name in DdpMode::all_names() {
             eprintln!("  {name}");
+        }
+        return Ok(());
+    }
+
+    // Report mode: analyze saved timeline data from runs/
+    if do_report {
+        let runs = analyze::discover_runs(&output);
+
+        // Apply filters
+        let filtered: Vec<(String, String)> = runs
+            .into_iter()
+            .filter(|(m, _)| model_filter.as_ref().map_or(true, |f| f == "all" || f == m))
+            .filter(|(_, mode)| mode_filter.as_ref().map_or(true, |f| f == "all" || f == mode))
+            .collect();
+
+        if filtered.is_empty() {
+            eprintln!("no runs found in {output}/");
+            return Ok(());
+        }
+
+        eprintln!("analyzing {} runs from {output}/", filtered.len());
+
+        // Load and analyze
+        let mut analyses: Vec<analyze::RunAnalysis> = Vec::new();
+        for (model, mode) in &filtered {
+            let path = std::path::Path::new(&output)
+                .join(model)
+                .join(mode)
+                .join("timeline.json");
+            match analyze::load_timeline(&path) {
+                Ok(tl) => analyses.push(analyze::analyze(model, mode, &tl)),
+                Err(e) => eprintln!("  skip {model}/{mode}: {e}"),
+            }
+        }
+
+        // Group by model
+        let mut groups: Vec<(String, Vec<analyze::RunAnalysis>)> = Vec::new();
+        for a in analyses {
+            if let Some(g) = groups.iter_mut().find(|(m, _)| *m == a.model) {
+                g.1.push(a);
+            } else {
+                let model = a.model.clone();
+                groups.push((model, vec![a]));
+            }
+        }
+
+        let md = report::generate_report(&groups);
+        if let Some(ref path) = report_file {
+            std::fs::write(path, &md)
+                .map_err(|e| flodl::tensor::TensorError::new(&format!("cannot write {path}: {e}")))?;
+            eprintln!("report saved to {path}");
+        } else {
+            print!("{md}");
         }
         return Ok(());
     }
@@ -267,6 +331,7 @@ fn print_help() {
     eprintln!("  --baseline <PATH>    Baseline file (default: baselines/baseline.json)");
     eprintln!("  --tolerance <F>      Validation tolerance, 0.0-1.0 (default: 0.15)");
     eprintln!("  --seed <N>           RNG seed (default: 42)");
+    eprintln!("  --report [FILE]      Analyze runs/ and print report (or save to FILE)");
     eprintln!("  --list               Show available models and modes");
     eprintln!("  --help               Show this help");
     eprintln!("\nModels:");
@@ -281,4 +346,7 @@ fn print_help() {
     eprintln!("  ddp-bench --model linear --mode solo-0 --epochs 2");
     eprintln!("  ddp-bench --model convnet --mode nccl-cadence --monitor 3000");
     eprintln!("  ddp-bench --model all --mode all --validate");
+    eprintln!("  ddp-bench --report                                 # all runs");
+    eprintln!("  ddp-bench --report --model linear                  # one model");
+    eprintln!("  ddp-bench --report --model linear --mode nccl-cadence  # one case");
 }

@@ -1,7 +1,9 @@
-//! Comparison report generation and baseline validation.
+//! Comparison tables, baseline validation, and post-hoc report generation.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 
+use crate::analyze::RunAnalysis;
 use crate::harness::RunResult;
 
 // ---------------------------------------------------------------------------
@@ -25,7 +27,6 @@ pub struct Baseline {
 pub fn load_baselines(path: &str) -> Result<Vec<Baseline>, String> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {path}: {e}"))?;
-    // Minimal JSON parsing (no serde on Baseline to keep deps light)
     parse_baselines(&data)
 }
 
@@ -121,7 +122,6 @@ pub fn validate_results(
 }
 
 fn parse_baselines(json: &str) -> Result<Vec<Baseline>, String> {
-    // Use serde_json since we already depend on it
     let val: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("invalid JSON: {e}"))?;
     let arr = val.as_array().ok_or("expected JSON array")?;
@@ -195,4 +195,248 @@ pub fn print_matrix(all_results: &[Vec<RunResult>]) {
         }
         print_comparison(group);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Post-hoc report from timeline analysis
+// ---------------------------------------------------------------------------
+
+/// Generate a markdown report from analyzed runs.
+/// `analyses` is grouped by model: Vec<(model, Vec<RunAnalysis>)>.
+pub fn generate_report(groups: &[(String, Vec<RunAnalysis>)]) -> String {
+    let mut md = String::with_capacity(16_000);
+
+    md.push_str("# DDP Benchmark Report\n\n");
+
+    // Setup
+    let n_models = groups.len();
+    let n_modes: usize = groups.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
+    let _ = writeln!(md, "- **Models**: {n_models}");
+    let _ = writeln!(md, "- **Modes**: {n_modes}");
+
+    // Speed ratio from solo runs
+    if let Some(ratio) = speed_ratio(groups) {
+        let _ = writeln!(md, "- **GPU speed ratio**: {ratio:.2}x (solo-0 / solo-1)");
+    }
+    md.push('\n');
+
+    // Per-model comparison
+    md.push_str("## Per-Model Results\n\n");
+    for (model, runs) in groups {
+        write_model_table(&mut md, model, runs);
+    }
+
+    // Speedup vs sync
+    if groups.iter().any(|(_, runs)| runs.len() > 1) {
+        md.push_str("## Speedup vs Sync\n\n");
+        write_speedup_table(&mut md, groups);
+    }
+
+    // Idle analysis (the main event)
+    md.push_str("## GPU Idle Analysis\n\n");
+    md.push_str("Idle gaps >= 500ms, classified by nearest event.\n\n");
+    for (model, runs) in groups {
+        write_idle_analysis(&mut md, model, runs);
+    }
+
+    // Idle summary by cause
+    md.push_str("## Idle Breakdown by Cause\n\n");
+    write_idle_breakdown(&mut md, groups);
+
+    // ElChe details (anchor + throttle)
+    if groups.iter().any(|(_, runs)| runs.iter().any(|r| r.anchor_changes > 0)) {
+        md.push_str("## ElChe Calibration\n\n");
+        write_elche_details(&mut md, groups);
+    }
+
+    md
+}
+
+fn speed_ratio(groups: &[(String, Vec<RunAnalysis>)]) -> Option<f64> {
+    let mut ratios = Vec::new();
+    for (_, runs) in groups {
+        let s0 = runs.iter().find(|r| r.mode == "solo-0");
+        let s1 = runs.iter().find(|r| r.mode == "solo-1");
+        if let (Some(a), Some(b)) = (s0, s1) {
+            if a.total_ms > 0 {
+                ratios.push(b.total_ms as f64 / a.total_ms as f64);
+            }
+        }
+    }
+    if ratios.is_empty() {
+        return None;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(ratios[ratios.len() / 2])
+}
+
+fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysis]) {
+    if runs.is_empty() {
+        return;
+    }
+    let _ = writeln!(md, "### {model}\n");
+    md.push_str("| Mode | Loss | Total (s) | Syncs | Avg Sync (ms) | GPU0 | GPU1 | Idle (s) |\n");
+    md.push_str("|------|------|-----------|-------|--------------|------|------|----------|\n");
+
+    for r in runs {
+        let a0 = r.gpu_active_pct.first().copied().unwrap_or(0.0);
+        let a1 = r.gpu_active_pct.get(1).copied().unwrap_or(0.0);
+        let total_idle_s: f64 = r.idle_by_cause.iter()
+            .map(|c| c.total_ms)
+            .sum::<f64>() / 1000.0;
+
+        let _ = writeln!(
+            md,
+            "| {} | {:.6} | {:.1} | {} | {:.1} | {:.0}% | {:.0}% | {:.1} |",
+            r.mode,
+            r.final_loss,
+            r.total_ms as f64 / 1000.0,
+            r.sync_count,
+            r.avg_sync_ms,
+            a0,
+            a1,
+            total_idle_s,
+        );
+    }
+    md.push('\n');
+}
+
+fn write_speedup_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
+    // Collect mode names from first group
+    let modes: Vec<&str> = if let Some((_, runs)) = groups.first() {
+        runs.iter().map(|r| r.mode.as_str()).collect()
+    } else {
+        return;
+    };
+
+    md.push_str("| Model |");
+    for m in &modes {
+        if *m == "sync" { continue; }
+        let _ = write!(md, " {m} |");
+    }
+    md.push('\n');
+
+    md.push_str("|-------|");
+    for m in &modes {
+        if *m == "sync" { continue; }
+        let _ = write!(md, "{}|", "-".repeat(m.len() + 2));
+    }
+    md.push('\n');
+
+    for (model, runs) in groups {
+        let sync_ms = runs.iter()
+            .find(|r| r.mode == "sync")
+            .map(|r| r.total_ms as f64)
+            .unwrap_or(0.0);
+
+        let _ = write!(md, "| {model} |");
+        for m in &modes {
+            if *m == "sync" { continue; }
+            if let Some(r) = runs.iter().find(|r| r.mode == *m) {
+                if sync_ms > 0.0 && r.total_ms > 0 {
+                    let _ = write!(md, " {:.1}x |", sync_ms / r.total_ms as f64);
+                } else {
+                    md.push_str(" - |");
+                }
+            } else {
+                md.push_str(" - |");
+            }
+        }
+        md.push('\n');
+    }
+    md.push('\n');
+}
+
+fn write_idle_analysis(md: &mut String, model: &str, runs: &[RunAnalysis]) {
+    // Only show runs with idle gaps
+    let runs_with_gaps: Vec<&RunAnalysis> = runs.iter()
+        .filter(|r| !r.idle_gaps.is_empty())
+        .collect();
+
+    if runs_with_gaps.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(md, "### {model}\n");
+    md.push_str("| Mode | GPU | Start (s) | Duration (s) | Cause |\n");
+    md.push_str("|------|-----|-----------|-------------|-------|\n");
+
+    for r in &runs_with_gaps {
+        // Skip startup gaps, sort by duration descending
+        let mut gaps: Vec<&crate::analyze::IdleGap> = r.idle_gaps.iter()
+            .filter(|g| !matches!(g.cause, crate::analyze::IdleCause::Startup))
+            .collect();
+        gaps.sort_by(|a, b| b.duration_ms.cmp(&a.duration_ms));
+
+        // Show top 10 longest gaps per run
+        for g in gaps.iter().take(10) {
+            let _ = writeln!(
+                md,
+                "| {} | gpu{} | {:.1} | {:.1} | {} |",
+                r.mode,
+                g.device,
+                g.start_ms as f64 / 1000.0,
+                g.duration_ms as f64 / 1000.0,
+                g.cause,
+            );
+        }
+    }
+    md.push('\n');
+}
+
+fn write_idle_breakdown(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
+    md.push_str("| Model | Mode | GPU | Epoch Boundary | Sync | CPU Avg | Unexplained | Total Idle |\n");
+    md.push_str("|-------|------|-----|---------------|------|---------|-------------|------------|\n");
+
+    for (model, runs) in groups {
+        for r in runs {
+            // Skip solo modes and runs with no idle
+            if r.mode.starts_with("solo") {
+                continue;
+            }
+            for c in &r.idle_by_cause {
+                if c.total_ms < 500.0 {
+                    continue; // skip negligible
+                }
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | gpu{} | {:.1}s | {:.1}s | {:.1}s | {:.1}s | {:.1}s |",
+                    model,
+                    r.mode,
+                    c.device,
+                    c.epoch_boundary_ms / 1000.0,
+                    c.sync_ms / 1000.0,
+                    c.cpu_avg_ms / 1000.0,
+                    c.unexplained_ms / 1000.0,
+                    c.total_ms / 1000.0,
+                );
+            }
+        }
+    }
+    md.push('\n');
+}
+
+fn write_elche_details(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
+    md.push_str("| Model | Mode | Anchor Changes | Throttles | Syncs | CPU Avgs | Avg CPU Avg (ms) |\n");
+    md.push_str("|-------|------|---------------|-----------|-------|---------|----------------|\n");
+
+    for (model, runs) in groups {
+        for r in runs {
+            if r.anchor_changes == 0 && r.throttle_count == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} | {} | {} | {:.1} |",
+                model,
+                r.mode,
+                r.anchor_changes,
+                r.throttle_count,
+                r.sync_count,
+                r.cpu_avg_count,
+                r.avg_cpu_avg_ms,
+            );
+        }
+    }
+    md.push('\n');
 }
