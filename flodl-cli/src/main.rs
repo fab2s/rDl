@@ -25,7 +25,16 @@ use std::process::ExitCode;
 use context::Context;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+
+    // Extract global verbosity flags before command dispatch.
+    // Sets FLODL_VERBOSITY so child processes (including Docker) inherit it.
+    let (args, verbosity) = extract_verbosity(&raw_args);
+    if let Some(v) = verbosity {
+        // SAFETY: called before any threads are spawned.
+        unsafe { env::set_var("FLODL_VERBOSITY", v.to_string()); }
+    }
+
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
 
     match cmd {
@@ -793,12 +802,12 @@ fn dispatch_config(cmd: &str, args: &[String]) -> ExitCode {
         };
 
         // Recursive help: fdl ddp-bench <job> --help
-        if job_name.is_some() {
+        if let Some(jn) = &job_name {
             let has_help = args[extra_start..]
                 .iter()
                 .any(|a| a == "--help" || a == "-h");
             if has_help {
-                run::print_job_help(&cmd_config, short, job_name.unwrap());
+                run::print_job_help(&cmd_config, short, jn);
                 return ExitCode::SUCCESS;
             }
         }
@@ -825,7 +834,13 @@ fn print_usage() {
     println!("Works anywhere. Uses project root when available, ~/.flodl/ otherwise.");
     println!();
     println!("USAGE:");
-    println!("    fdl <command> [options]");
+    println!("    fdl [options] <command> [command-options]");
+    println!();
+    println!("GLOBAL OPTIONS:");
+    println!("    -v                 Verbose output (DDP sync, data loading detail)");
+    println!("    -vv                Debug output (per-batch timing, loop internals)");
+    println!("    -vvv               Trace output (maximum detail)");
+    println!("    -q, --quiet        Suppress all non-error output");
     println!();
     println!("COMMANDS:");
     println!("    setup              Interactive guided setup");
@@ -859,6 +874,32 @@ fn print_usage() {
     println!("    fdl diagnose --json        # machine-readable output");
     println!("    fdl api-ref                # generate API reference");
     println!("    fdl api-ref --json         # structured JSON for tooling");
+}
+
+// ---------------------------------------------------------------------------
+// Global verbosity flags
+// ---------------------------------------------------------------------------
+
+/// Extract verbosity flags from args, returning filtered args and the
+/// `FLODL_VERBOSITY` value: Quiet=0, Normal=1, Verbose=2, Debug=3, Trace=4.
+///
+/// Supports `-v` (Verbose), `-vv` (Debug), `-vvv` (Trace), `--quiet`/`-q` (Quiet).
+/// Flags can appear anywhere in the arg list and are stripped before dispatch.
+fn extract_verbosity(args: &[String]) -> (Vec<String>, Option<u8>) {
+    let mut level: Option<u8> = None;
+    let mut filtered = Vec::with_capacity(args.len());
+
+    for arg in args {
+        match arg.as_str() {
+            "-vvv" => level = Some(4),  // Trace
+            "-vv" => level = Some(3),   // Debug
+            "-v" => level = Some(2),    // Verbose
+            "--quiet" | "-q" => level = Some(0), // Quiet
+            _ => filtered.push(arg.clone()),
+        }
+    }
+
+    (filtered, level)
 }
 
 fn print_libtorch_usage() {

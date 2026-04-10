@@ -205,7 +205,7 @@ fn build_bash_script(
 ) -> String {
     let top_level = words.join(" ");
     let mut s = String::new();
-    s.push_str(&format!("eval \"$(fdl completions bash)\"\n"));
+    s.push_str("eval \"$(fdl completions bash)\"\n");
     // The actual completion function is emitted by gen_bash via stdout.
     // For the rc file, we use eval to stay dynamic.
     let _ = (top_level, command_jobs);

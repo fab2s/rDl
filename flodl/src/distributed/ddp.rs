@@ -729,7 +729,7 @@ impl Ddp {
         use crate::monitor::format_bytes;
 
         if !cuda_available() || cuda_device_count() == 0 {
-            eprintln!("  ddp: no CUDA available | CPU mode");
+            crate::verbose!("  ddp: no CUDA available | CPU mode");
             return;
         }
 
@@ -754,15 +754,15 @@ impl Ddp {
         let heterogeneous = names.windows(2).any(|w| w[0] != w[1]);
 
         if n == 1 {
-            eprintln!("  ddp: 1 GPU | {} | single-device mode", parts[0]);
+            crate::verbose!("  ddp: 1 GPU | {} | single-device mode", parts[0]);
         } else if heterogeneous {
-            eprintln!(
+            crate::verbose!(
                 "  ddp: {} GPUs (heterogeneous) | {}",
                 n,
                 parts.join(" | "),
             );
         } else {
-            eprintln!("  ddp: {} GPUs | {}", n, parts.join(" | "));
+            crate::verbose!("  ddp: {} GPUs | {}", n, parts.join(" | "));
         }
     }
 }

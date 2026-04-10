@@ -566,6 +566,22 @@ pub fn print_project_help(
         "    {}  Show version",
         style::green(&format!("{:<18}", "-V, --version"))
     );
+    eprintln!(
+        "    {}  Verbose output",
+        style::green(&format!("{:<18}", "-v"))
+    );
+    eprintln!(
+        "    {}  Debug output",
+        style::green(&format!("{:<18}", "-vv"))
+    );
+    eprintln!(
+        "    {}  Trace output (maximum detail)",
+        style::green(&format!("{:<18}", "-vvv"))
+    );
+    eprintln!(
+        "    {}  Suppress non-error output",
+        style::green(&format!("{:<18}", "-q, --quiet"))
+    );
 
     // Built-in commands.
     eprintln!();

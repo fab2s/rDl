@@ -197,7 +197,7 @@ impl Graph {
             // the caller is using manual forward + backward. Disable El Che and
             // fall through to standard AllReduce.
             if state.el_che.is_some() && state.last_el_che_counts.iter().sum::<usize>() == 0 {
-                eprintln!(
+                crate::verbose!(
                     "  ddp: El Che disabled (external forward/backward detected). \
                      Using standard AllReduce. To silence: DdpConfig::new().max_anchor(Some(0))"
                 );

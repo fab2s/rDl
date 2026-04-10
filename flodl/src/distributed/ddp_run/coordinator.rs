@@ -545,7 +545,7 @@ impl Coordinator {
             plans.push(EpochPlan { epoch, partition_offset: offset, partition_size: size });
             offset += size;
         }
-        eprintln!("  ddp: epoch {epoch} | partitions {sizes:?}");
+        crate::verbose!("  ddp: epoch {epoch} | partitions {sizes:?}");
         self.epoch_plan_cache.insert(epoch, plans.clone());
         plans
     }
@@ -583,7 +583,7 @@ impl Coordinator {
         let sizes: Vec<usize> = (0..self.world_size)
             .map(|r| self.compute_chunk_batches(r))
             .collect();
-        eprintln!(
+        crate::verbose!(
             "  ddp: epoch {epoch} progressive | initial chunks (batches) {sizes:?}"
         );
         for (rank, &batch_count) in sizes.iter().enumerate() {
@@ -602,7 +602,7 @@ impl Coordinator {
         };
         let batches = self.compute_chunk_batches(rank);
         let remaining = self.chunk_pool.as_ref().map_or(0, |p| p.remaining());
-        eprintln!(
+        crate::verbose!(
             "  ddp: chunk -> rank {rank} | {batches} batches | {remaining} samples left"
         );
         self.dispatch_next_chunk_with_batches(rank, epoch, batches);
@@ -909,7 +909,7 @@ impl Coordinator {
                 metrics.epoch_ms = epoch_ms;
                 let _ = tx.send(metrics);
             }
-            eprintln!(
+            crate::verbose!(
                 "  ddp: epoch {epoch} progressive complete | {:.0}ms",
                 epoch_ms,
             );
@@ -1073,7 +1073,7 @@ impl Coordinator {
             }
         }
 
-        eprintln!(
+        crate::verbose!(
             "  ddp: NCCL averaging #{} complete (v{})",
             self.avg_count, self.version
         );
@@ -1118,7 +1118,7 @@ impl Coordinator {
         if let Some(div) = divergence {
             if div > self.divergence_threshold {
                 self.el_che.nudge_anchor_down(0.5);
-                eprintln!(
+                crate::verbose!(
                     "  ddp: divergence {div:.4} > {:.4}, anchor {} -> {}",
                     self.divergence_threshold, old_anchor, self.el_che.anchor()
                 );
@@ -1141,7 +1141,7 @@ impl Coordinator {
             }
         }
 
-        eprintln!(
+        crate::verbose!(
             "  ddp: CPU averaging #{} complete (v{}, {:.1}ms)",
             self.avg_count, self.version, avg_ms
         );
@@ -1178,7 +1178,7 @@ impl Coordinator {
         match state {
             CpuAvgState::Idle => {}
             CpuAvgState::Collecting { snapshots, .. } => {
-                eprintln!(
+                crate::verbose!(
                     "  ddp: discarding in-progress CPU averaging \
                      (Collecting, {}/{} snapshots received)",
                     snapshots.len(), self.world_size
@@ -1196,7 +1196,7 @@ impl Coordinator {
                     }
                     Err(_) => "panicked",
                 };
-                eprintln!(
+                crate::verbose!(
                     "  ddp: discarding in-progress CPU averaging (Computing, {status})"
                 );
                 // Drain any snapshots it might have sent before we discard the result.
@@ -1274,7 +1274,7 @@ impl Coordinator {
                         .map(|(r, _)| r)
                         .collect();
                     self.abort_count += 1;
-                    eprintln!(
+                    crate::verbose!(
                         "  ddp: CPU averaging timeout, missing ranks: {missing:?} \
                          (abort #{}, will retry)", self.abort_count
                     );
@@ -1504,10 +1504,10 @@ impl Coordinator {
             match rx.recv_timeout(timeout) {
                 Ok(snap) => snapshots.push(snap),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    eprintln!("  ddp: timeout waiting for final snapshot from rank {rank}");
+                    crate::verbose!("  ddp: timeout waiting for final snapshot from rank {rank}");
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    eprintln!("  ddp: rank {rank} channel disconnected (worker errored)");
+                    crate::verbose!("  ddp: rank {rank} channel disconnected (worker errored)");
                 }
             }
         }

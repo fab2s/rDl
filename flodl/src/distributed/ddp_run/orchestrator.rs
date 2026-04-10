@@ -215,7 +215,7 @@ impl DdpHandle {
         // is batch_size * world_size. Scale LR proportionally (Goyal et al., 2017).
         let lr_scale_factor = if config.auto_scale_lr && world_size > 1 {
             let scale = world_size as f64;
-            eprintln!(
+            crate::verbose!(
                 "  ddp: LR scaled by {world_size}x (effective batch size = {}). \
                  Disable with .no_lr_scaling()",
                 batch_size * world_size,
@@ -333,15 +333,15 @@ impl DdpHandle {
                 let poll_timeout = std::time::Duration::from_micros(100);
                 let loop_err = loop {
                     if shutdown_coord.load(Ordering::Relaxed) {
-                        eprintln!("  ddp: coordinator exit: shutdown flag set (worker error?)");
+                        crate::verbose!("  ddp: coordinator exit: shutdown flag set (worker error?)");
                         break None;
                     }
                     if !coord.drain_timing_blocking(poll_timeout) {
-                        eprintln!("  ddp: coordinator exit: all timing channels disconnected");
+                        crate::verbose!("  ddp: coordinator exit: all timing channels disconnected");
                         break None;
                     }
                     if coord.active_count == 0 {
-                        eprintln!("  ddp: coordinator exit: all workers exited");
+                        crate::verbose!("  ddp: coordinator exit: all workers exited");
                         break None;
                     }
                     // on_epoch_aggregated sends Shutdown when last epoch completes.
@@ -358,7 +358,7 @@ impl DdpHandle {
                     //               -> try_aggregate_epochs -> on_epoch_aggregated
                     //                  (Sync/Cadence broadcast or Auto unblock)
                     for m in coord.drain_metrics() {
-                        eprintln!(
+                        crate::verbose!(
                             "  ddp: rank {} epoch {} | loss={:.4} batches={} time={:.0}ms",
                             m.rank, m.epoch, m.avg_loss, m.batches_processed, m.epoch_ms
                         );
@@ -584,7 +584,7 @@ impl DdpHandle {
     {
         use std::sync::atomic::AtomicBool;
 
-        eprintln!("  ddp: single device ({device:?}) | no coordination");
+        crate::verbose!("  ddp: single device ({device:?}) | no coordination");
 
         let total_samples = dataset.len();
         let tmp_model = model_factory(device)?;
@@ -889,7 +889,7 @@ impl DdpHandle {
             AverageBackend::Cpu => "cpu",
         };
 
-        eprintln!(
+        crate::verbose!(
             "  ddp: {} GPUs ({}) | {} | policy={} backend={}",
             devices.len(), mode, parts.join(" | "), policy_str, backend_str,
         );
