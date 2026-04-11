@@ -695,7 +695,13 @@ impl Coordinator {
         }
 
         // Current pool exhausted for this rank. Try cross-epoch streaming.
-        let next_epoch = epoch + 1;
+        // Skip past already-aggregated epochs: their pools were removed
+        // during try_aggregate_epochs_progressive. Re-creating them here
+        // would produce an orphan pool that blocks all future aggregation
+        // (BTreeMap iteration breaks at the first incomplete pool).
+        let first_live = self.last_aggregated_epoch
+            .map_or(0, |agg| agg + 1);
+        let next_epoch = (epoch + 1).max(first_live);
         if next_epoch >= self.num_epochs {
             return;
         }
@@ -1128,10 +1134,6 @@ impl Coordinator {
                     let min_wall = self.wall_ms_accum.iter()
                         .copied()
                         .fold(f64::MAX, f64::min);
-                    crate::debug!(
-                        "  ddp: should_average cadence | min_wall={min_wall:.0} target={target:.0} steps={:?}",
-                        self.steps_since_avg,
-                    );
                     return min_wall >= target;
                 }
                 // Fallback (uncalibrated): batch-count trigger with equal
@@ -1291,6 +1293,17 @@ impl Coordinator {
         }
         for t in &mut self.throttled {
             *t = false;
+        }
+        // Reset divergence signals: loss and param norm are trailing
+        // indicators from MetricsMsg/TimingMsg. Without resetting,
+        // stale values from the previous averaging interval keep
+        // triggering false divergence (anchor pinned at 1, AllReduce
+        // on every batch, fast GPU starved of compute).
+        for r in &mut self.loss_reported {
+            *r = false;
+        }
+        for n in &mut self.last_param_norm {
+            *n = 0.0;
         }
 
         // Re-dispatch to ranks that are idle (no in-flight chunks in any pool)

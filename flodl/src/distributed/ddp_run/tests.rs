@@ -3177,3 +3177,67 @@ fn test_epoch_event_fires_with_mixed_epoch_ranks() {
     // epoch_ms is overridden by pool wall-clock (near-instant in test).
     assert!(em.epoch_ms > 0.0, "epoch_ms should be positive");
 }
+
+#[test]
+fn test_dispatch_skips_aggregated_epochs() {
+    // Reproduce the pool-recreation deadlock:
+    // Fast GPU takes ALL chunks from epoch 1 while slow GPU is still on epoch 0.
+    // Both epoch 0 and 1 get aggregated in one sweep. dispatch_next_chunk for
+    // the slow GPU must skip past the removed pools, not recreate them.
+    //
+    // 2 ranks, 5 epochs, 100 samples, batch_size=10 (10 batches/epoch).
+    let mut h = make_streaming_harness(2, 5, 100, 10, None);
+
+    // Manually create epoch 0 pool with all samples dispatched.
+    // Fast GPU (rank 0) got 70 samples, slow GPU (rank 1) got 30.
+    let mut pool0 = super::coordinator::ChunkPool::new(0, 100, 2);
+    pool0.take_chunk(70, 0);
+    pool0.take_chunk(30, 1);
+    h.coord.chunk_pools.insert(0, pool0);
+
+    // Epoch 1 pool: fast GPU took ALL 100 samples; slow GPU got nothing.
+    let mut pool1 = super::coordinator::ChunkPool::new(1, 100, 2);
+    pool1.take_chunk(100, 0);
+    h.coord.chunk_pools.insert(1, pool1);
+
+    // Track rank positions: slow GPU last dispatched from epoch 0.
+    h.coord.rank_epoch[0] = 1;
+    h.coord.rank_epoch[1] = 0;
+
+    // Complete all chunks: both ranks for epoch 0, rank 0 for epoch 1.
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 7,
+        epoch_ms: 50.0, samples_processed: 70,
+        scalars: Default::default(),
+    }).unwrap();
+    h.metrics_tx.send(MetricsMsg {
+        rank: 1, epoch: 0, avg_loss: 0.2, batches_processed: 3,
+        epoch_ms: 80.0, samples_processed: 30,
+        scalars: Default::default(),
+    }).unwrap();
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 1, avg_loss: 0.1, batches_processed: 10,
+        epoch_ms: 100.0, samples_processed: 100,
+        scalars: Default::default(),
+    }).unwrap();
+
+    // drain_metrics -> try_aggregate_epochs_progressive aggregates both.
+    // on_epoch_aggregated(0) calls dispatch_next_chunk(1) for the idle slow GPU.
+    h.coord.drain_metrics();
+
+    // Both epochs should be aggregated.
+    assert_eq!(h.coord.last_aggregated_epoch, Some(1),
+        "both epoch 0 and 1 should be aggregated");
+
+    // The critical check: no orphan pool for epoch 0 or 1 should exist.
+    // Only pools for epoch 2+ should be present.
+    for &epoch in h.coord.chunk_pools.keys() {
+        assert!(epoch >= 2,
+            "found orphan pool for already-aggregated epoch {epoch}");
+    }
+
+    // Slow GPU should have been dispatched to epoch 2 (not epoch 1).
+    assert!(h.coord.rank_epoch[1] >= 2,
+        "slow GPU should be on epoch 2+, got epoch {}",
+        h.coord.rank_epoch[1]);
+}
