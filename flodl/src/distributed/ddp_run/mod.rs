@@ -337,6 +337,18 @@ pub struct DdpRunConfig {
     /// When set, the coordinator and workers inject training events (sync,
     /// epoch boundaries, anchor changes, throttle) into the timeline.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
+    /// Maximum batches past the planned sync point any GPU may execute.
+    ///
+    /// Controls how aggressively fast GPUs stream into the next epoch's
+    /// data when the current epoch's pool is exhausted. This is NOT the
+    /// same as `max_batch_diff` (which limits divergence between GPUs).
+    ///
+    /// `None` = auto-tuned from convergence feedback: starts conservative
+    /// (`max(2, total_batches / 100)` capped at 5), grows by +1 after
+    /// each successful sync with good convergence, resets on divergence.
+    ///
+    /// Default: `None` (auto).
+    pub max_overshoot: Option<usize>,
     /// Automatically scale the learning rate by `world_size` to compensate
     /// for data partitioning across GPUs. Default: `true`.
     ///
@@ -371,6 +383,7 @@ impl DdpRunConfig {
             progressive_dispatch: None,
             max_grad_norm: None,
             timeline: None,
+            max_overshoot: None,
             auto_scale_lr: true,
         }
     }
@@ -405,6 +418,18 @@ impl DdpRunConfig {
     /// this lead are paused until the slowest catches up.
     pub fn with_max_batch_diff(mut self, max: usize) -> Self {
         self.max_batch_diff = Some(max);
+        self
+    }
+
+    /// Set the maximum overshoot past the planned sync point.
+    ///
+    /// Controls cross-epoch streaming aggressiveness. When a GPU finishes
+    /// its epoch partition, it may stream into the next epoch's data up to
+    /// this many batches past ElChe's planned sync count.
+    ///
+    /// `0` disables cross-epoch streaming. Default: auto-tuned.
+    pub fn with_max_overshoot(mut self, max: usize) -> Self {
+        self.max_overshoot = Some(max);
         self
     }
 

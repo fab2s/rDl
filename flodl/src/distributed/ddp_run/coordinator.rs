@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::{
     ApplyPolicy, AverageBackend, TimingMsg, MetricsMsg,
@@ -70,23 +70,26 @@ struct CpuAvgResult {
 /// Instead of sending the full partition at epoch start, the coordinator hands
 /// out small chunks from this pool. Each `take_chunk` advances a monotonic
 /// cursor, guaranteeing non-overlapping slices into the global permutation.
-struct ChunkPool {
-    epoch: usize,
-    total_samples: usize,
+pub(super) struct ChunkPool {
+    /// Epoch this pool belongs to. Stored for diagnostics and test access;
+    /// the canonical key is the BTreeMap entry in `Coordinator::chunk_pools`.
+    #[allow(dead_code)]
+    pub(super) epoch: usize,
+    pub(super) total_samples: usize,
     /// Next unassigned offset into the global permutation.
-    cursor: usize,
+    pub(super) cursor: usize,
     /// Per-rank: samples dispatched (sum of all chunk sizes sent).
-    dispatched: Vec<usize>,
+    pub(super) dispatched: Vec<usize>,
     /// Per-rank: samples completed (from MetricsMsg.samples_processed).
-    completed: Vec<usize>,
+    pub(super) completed: Vec<usize>,
     /// Per-rank: number of chunks sent.
-    chunks_sent: Vec<usize>,
+    pub(super) chunks_sent: Vec<usize>,
     /// Wall-clock start of this epoch (for EpochMetrics).
-    epoch_start: Instant,
+    pub(super) epoch_start: Instant,
 }
 
 impl ChunkPool {
-    fn new(epoch: usize, total_samples: usize, world_size: usize) -> Self {
+    pub(super) fn new(epoch: usize, total_samples: usize, world_size: usize) -> Self {
         ChunkPool {
             epoch,
             total_samples,
@@ -102,7 +105,7 @@ impl ChunkPool {
     ///
     /// Returns `(offset, actual_size)` or `None` if the pool is exhausted.
     /// Actual size may be smaller than requested if near the end.
-    fn take_chunk(&mut self, size: usize, rank: usize) -> Option<(usize, usize)> {
+    pub(super) fn take_chunk(&mut self, size: usize, rank: usize) -> Option<(usize, usize)> {
         if self.cursor >= self.total_samples {
             return None;
         }
@@ -182,7 +185,7 @@ pub struct Coordinator {
     pub(super) el_che: crate::distributed::ddp::ElChe,
     version: u64,
     /// Per-rank steps since last averaging.
-    steps_since_avg: Vec<usize>,
+    pub(super) steps_since_avg: Vec<usize>,
 
     // Divergence monitoring (correction mechanism)
     divergence_threshold: f64,
@@ -233,12 +236,12 @@ pub struct Coordinator {
     /// Total number of epochs to train.
     num_epochs: usize,
     /// What epoch each rank is currently working on (last dispatched).
-    rank_epoch: Vec<usize>,
+    pub(super) rank_epoch: Vec<usize>,
     /// True if rank finished its epoch but is blocked by lookahead (Auto mode).
     rank_waiting: Vec<bool>,
     /// Last globally-aggregated epoch (all ranks reported).
     /// None = no epoch aggregated yet.
-    last_aggregated_epoch: Option<usize>,
+    pub(super) last_aggregated_epoch: Option<usize>,
     /// User-specified partition ratios (disables auto-rebalancing).
     partition_ratios: Option<Vec<f64>>,
     /// Cached epoch plans: computed once per epoch, consistent across ranks.
@@ -247,12 +250,22 @@ pub struct Coordinator {
     // Progressive chunk dispatch
     /// Whether progressive dispatch is enabled.
     progressive: bool,
-    /// Active chunk pool (None between epochs or when progressive is off).
-    chunk_pool: Option<ChunkPool>,
+    /// Active chunk pools keyed by epoch. Multiple pools may be active when
+    /// fast GPUs stream ahead into the next epoch's data.
+    pub(super) chunk_pools: BTreeMap<usize, ChunkPool>,
     /// Floor for chunk size (in batches). Default: 4.
     min_chunk_batches: usize,
     /// Batch size (samples per batch), needed for chunk sizing.
     batch_size: usize,
+
+    // Streaming epoch overshoot
+    /// Maximum batches past ElChe's planned sync count any GPU may execute.
+    /// Gates cross-epoch dispatch in progressive mode.
+    pub(super) max_overshoot: usize,
+    /// True when max_overshoot is auto-tuned (not user-set).
+    pub(super) overshoot_auto: bool,
+    /// Initial value for reset on convergence degradation.
+    pub(super) overshoot_initial: usize,
 
     // Timeline profiling
     /// Optional high-frequency system timeline for event injection.
@@ -295,6 +308,8 @@ pub struct CoordinatorBuilder {
     progressive: bool,
     batch_size: usize,
     timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
+    /// User-set max overshoot, or None for auto.
+    max_overshoot: Option<usize>,
 }
 
 impl CoordinatorBuilder {
@@ -374,8 +389,22 @@ impl CoordinatorBuilder {
         self
     }
 
+    /// Set the maximum overshoot past the planned sync point.
+    /// `None` = auto-tuned. `Some(0)` = disable cross-epoch streaming.
+    pub fn max_overshoot(mut self, max: Option<usize>) -> Self {
+        self.max_overshoot = max;
+        self
+    }
+
     /// Build the coordinator.
     pub fn build(self) -> Coordinator {
+        let total_batches = self.total_samples / self.batch_size.max(1);
+        let overshoot_auto = self.max_overshoot.is_none();
+        let overshoot_initial = match self.max_overshoot {
+            Some(n) => n,
+            None => (total_batches / 100).clamp(2, 5),
+        };
+
         Coordinator {
             timing_rx: self.timing_rx,
             metrics_rx: self.metrics_rx,
@@ -411,9 +440,12 @@ impl CoordinatorBuilder {
             partition_ratios: self.partition_ratios,
             epoch_plan_cache: HashMap::new(),
             progressive: self.progressive,
-            chunk_pool: None,
+            chunk_pools: BTreeMap::new(),
             min_chunk_batches: 4,
             batch_size: self.batch_size.max(1),
+            max_overshoot: overshoot_initial,
+            overshoot_auto,
+            overshoot_initial,
             timeline: self.timeline,
             nccl_sync_start: None,
             last_step_count: vec![0; self.world_size],
@@ -459,6 +491,7 @@ impl Coordinator {
             progressive: !matches!(policy, ApplyPolicy::Sync),
             batch_size: 1,
             timeline: None,
+            max_overshoot: None,
         }
     }
 
@@ -578,10 +611,10 @@ impl Coordinator {
         // Without this, is_epoch_done never fires when total % batch_size != 0.
         let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
         let pool = ChunkPool::new(epoch, batch_total, self.world_size);
-        self.chunk_pool = Some(pool);
+        self.chunk_pools.insert(epoch, pool);
 
         let sizes: Vec<usize> = (0..self.world_size)
-            .map(|r| self.compute_chunk_batches(r))
+            .map(|r| self.compute_chunk_batches(r, epoch))
             .collect();
         crate::verbose!(
             "  ddp: epoch {epoch} progressive | initial chunks (batches) {sizes:?}"
@@ -596,16 +629,54 @@ impl Coordinator {
     /// Computes chunk size based on calibration state, takes from the pool,
     /// and sends a `StartEpoch` plan. Does nothing if the pool is exhausted.
     fn dispatch_next_chunk(&mut self, rank: usize) {
-        let epoch = match &self.chunk_pool {
-            Some(pool) => pool.epoch,
-            None => return,
-        };
-        let batches = self.compute_chunk_batches(rank);
-        let remaining = self.chunk_pool.as_ref().map_or(0, |p| p.remaining());
+        let epoch = self.rank_epoch[rank];
+        // Try current epoch's pool first
+        if self.chunk_pools.get(&epoch).is_some_and(|p| p.remaining() > 0) {
+            let batches = self.compute_chunk_batches(rank, epoch);
+            let remaining = self.chunk_pools.get(&epoch).map_or(0, |p| p.remaining());
+            crate::verbose!(
+                "  ddp: chunk -> rank {rank} | {batches} batches | {remaining} samples left"
+            );
+            self.dispatch_next_chunk_with_batches(rank, epoch, batches);
+            return;
+        }
+
+        // Current pool exhausted for this rank. Try cross-epoch streaming.
+        let next_epoch = epoch + 1;
+        if next_epoch >= self.num_epochs {
+            return;
+        }
+
+        // Overshoot gate: don't dispatch if rank has exceeded its planned
+        // batch count by more than max_overshoot since the last sync.
+        // Only applies when streaming AHEAD of a not-yet-aggregated epoch.
+        // If the rank's current epoch is already aggregated, this is a normal
+        // transition (all ranks completed), not overshoot.
+        let current_aggregated = self.last_aggregated_epoch
+            .is_some_and(|agg| epoch <= agg);
+        if !current_aggregated {
+            let planned = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
+            if planned > 0 && self.steps_since_avg[rank] >= planned + self.max_overshoot {
+                return; // At overshoot limit, wait for next AllReduce
+            }
+        }
+
+        // Create next epoch's pool on-demand
+        if !self.chunk_pools.contains_key(&next_epoch) {
+            let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+            self.chunk_pools.insert(
+                next_epoch,
+                ChunkPool::new(next_epoch, batch_total, self.world_size),
+            );
+            crate::verbose!("  ddp: streaming -> epoch {next_epoch} pool created");
+        }
+
+        let batches = self.compute_chunk_batches(rank, next_epoch);
+        let remaining = self.chunk_pools.get(&next_epoch).map_or(0, |p| p.remaining());
         crate::verbose!(
-            "  ddp: chunk -> rank {rank} | {batches} batches | {remaining} samples left"
+            "  ddp: chunk -> rank {rank} | {batches} batches | {remaining} samples left (epoch {next_epoch})"
         );
-        self.dispatch_next_chunk_with_batches(rank, epoch, batches);
+        self.dispatch_next_chunk_with_batches(rank, next_epoch, batches);
     }
 
     fn dispatch_next_chunk_with_batches(&mut self, rank: usize, epoch: usize, batches: usize) {
@@ -613,7 +684,7 @@ impl Coordinator {
         if samples == 0 {
             return;
         }
-        let (offset, actual_size) = match self.chunk_pool.as_mut() {
+        let (offset, actual_size) = match self.chunk_pools.get_mut(&epoch) {
             Some(pool) => match pool.take_chunk(samples, rank) {
                 Some(v) => v,
                 None => return,
@@ -630,8 +701,8 @@ impl Coordinator {
     }
 
     /// Compute how many batches the next chunk for `rank` should contain.
-    fn compute_chunk_batches(&self, rank: usize) -> usize {
-        let pool = match &self.chunk_pool {
+    fn compute_chunk_batches(&self, rank: usize, epoch: usize) -> usize {
+        let pool = match self.chunk_pools.get(&epoch) {
             Some(pool) => pool,
             None => return 0,
         };
@@ -753,24 +824,32 @@ impl Coordinator {
             return;
         }
 
+        if self.progressive {
+            // Streaming epochs: pools are created on-demand by dispatch_next_chunk.
+            // Re-dispatch to idle ranks (no in-flight chunks) that may be waiting
+            // for work after exhausting their previous pool.
+            for rank in 0..self.world_size {
+                let has_inflight = self.chunk_pools.values()
+                    .any(|p| p.in_flight(rank) > 0);
+                if !has_inflight {
+                    self.dispatch_next_chunk(rank);
+                }
+            }
+            return;
+        }
+
         match self.policy {
             ApplyPolicy::Sync | ApplyPolicy::Cadence => {
                 self.send_all_plans(next_global);
             }
             ApplyPolicy::Async => {
-                if self.progressive {
-                    // Progressive handles chunk dispatch; start the next
-                    // epoch's pool the same way Sync/Cadence does.
-                    self.send_all_plans(next_global);
-                } else {
-                    // Legacy per-rank dispatch already happened in on_rank_done.
-                    // Unblock ranks that were waiting due to lookahead.
-                    for rank in 0..self.world_size {
-                        if self.rank_waiting[rank] {
-                            let next = self.rank_epoch[rank] + 1;
-                            if next < self.num_epochs {
-                                self.send_rank_plan(rank, next);
-                            }
+                // Legacy per-rank dispatch already happened in on_rank_done.
+                // Unblock ranks that were waiting due to lookahead.
+                for rank in 0..self.world_size {
+                    if self.rank_waiting[rank] {
+                        let next = self.rank_epoch[rank] + 1;
+                        if next < self.num_epochs {
+                            self.send_rank_plan(rank, next);
                         }
                     }
                 }
@@ -841,8 +920,8 @@ impl Coordinator {
         let mut msgs = Vec::new();
         while let Ok(msg) = self.metrics_rx.try_recv() {
             if self.progressive {
-                // Progressive: accumulate into pool, dispatch next chunk
-                if let Some(ref mut pool) = self.chunk_pool {
+                // Progressive: route completion to the correct pool by epoch
+                if let Some(pool) = self.chunk_pools.get_mut(&msg.epoch) {
                     pool.mark_completed(msg.rank, msg.samples_processed);
                 }
                 self.epoch_buffer.entry(msg.epoch).or_default().push(msg.clone());
@@ -889,31 +968,32 @@ impl Coordinator {
         }
     }
 
-    /// Progressive aggregation: epoch is done when the chunk pool says so.
+    /// Progressive aggregation: check all pools, fire global event for completed ones.
+    ///
+    /// BTreeMap iteration order guarantees epochs are processed in order,
+    /// so epoch 0 always aggregates before epoch 1.
     fn try_aggregate_epochs_progressive(&mut self) {
-        let pool_done = self.chunk_pool.as_ref().is_some_and(|p| p.is_epoch_done());
-        if !pool_done {
-            return;
-        }
+        // Collect completed epochs (can't mutate chunk_pools while iterating)
+        let completed: Vec<(usize, f64)> = self.chunk_pools.iter()
+            .filter(|(_, pool)| pool.is_epoch_done())
+            .map(|(&epoch, pool)| (epoch, pool.epoch_elapsed_ms()))
+            .collect();
 
-        let epoch = self.chunk_pool.as_ref().unwrap().epoch;
-        let epoch_ms = self.chunk_pool.as_ref().unwrap().epoch_elapsed_ms();
+        for (epoch, epoch_ms) in completed {
+            self.chunk_pools.remove(&epoch);
 
-        // Remove pool before processing (allows on_epoch_aggregated to create the next one)
-        self.chunk_pool = None;
-
-        if let Some(msgs) = self.epoch_buffer.remove(&epoch) {
-            if let Some(tx) = &self.epoch_metrics_tx {
-                let mut metrics = aggregate_epoch_metrics(epoch, &msgs, &self.device_indices);
-                // Override epoch_ms with the pool's wall-clock (not per-chunk times)
-                metrics.epoch_ms = epoch_ms;
-                let _ = tx.send(metrics);
+            if let Some(msgs) = self.epoch_buffer.remove(&epoch) {
+                if let Some(tx) = &self.epoch_metrics_tx {
+                    let mut metrics = aggregate_epoch_metrics(epoch, &msgs, &self.device_indices);
+                    metrics.epoch_ms = epoch_ms;
+                    let _ = tx.send(metrics);
+                }
+                crate::verbose!(
+                    "  ddp: epoch {epoch} progressive complete | {:.0}ms",
+                    epoch_ms,
+                );
+                self.on_epoch_aggregated(epoch);
             }
-            crate::verbose!(
-                "  ddp: epoch {epoch} progressive complete | {:.0}ms",
-                epoch_ms,
-            );
-            self.on_epoch_aggregated(epoch);
         }
     }
 
@@ -1045,7 +1125,7 @@ impl Coordinator {
     ///
     /// NCCL workers block in AllReduce so no new batches arrive during the
     /// collective; zeroing is correct.
-    fn finish_averaging_nccl(&mut self) {
+    pub(super) fn finish_averaging_nccl(&mut self) {
         let old_anchor = self.el_che.anchor();
         if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
             self.el_che.report_timing(&self.wall_ms_accum, &self.steps_since_avg, self.last_avg_ms);
@@ -1057,6 +1137,13 @@ impl Coordinator {
 
         self.version += 1;
         self.avg_count += 1;
+
+        // Auto-tune max_overshoot: NCCL path has no divergence signal,
+        // so only grow (max_batch_diff throttle catches divergence at batch level).
+        if self.overshoot_auto {
+            let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
+            self.max_overshoot = (self.max_overshoot + 1).min(cap);
+        }
 
         // Timeline: sync duration and anchor changes
         if let Some(ref tl) = self.timeline {
@@ -1087,6 +1174,19 @@ impl Coordinator {
         for t in &mut self.throttled {
             *t = false;
         }
+
+        // Re-dispatch to ranks that are idle (no in-flight chunks in any pool)
+        // and may have been waiting at the overshoot gate. Now that
+        // steps_since_avg is reset, the gate is open.
+        if self.progressive {
+            for rank in 0..self.world_size {
+                let has_inflight = self.chunk_pools.values()
+                    .any(|p| p.in_flight(rank) > 0);
+                if !has_inflight {
+                    self.dispatch_next_chunk(rank);
+                }
+            }
+        }
     }
 
     /// Common tail for CPU averaging: report snapshot counters to ElChe,
@@ -1115,13 +1215,28 @@ impl Coordinator {
         // Divergence correction: if replicas drifted apart, nudge ElChe's
         // anchor down (tighter sync). One-directional pressure only; ElChe's
         // overhead auto-tune handles loosening.
-        if let Some(div) = divergence {
+        let diverged = if let Some(div) = divergence {
             if div > self.divergence_threshold {
                 self.el_che.nudge_anchor_down(0.5);
                 crate::verbose!(
                     "  ddp: divergence {div:.4} > {:.4}, anchor {} -> {}",
                     self.divergence_threshold, old_anchor, self.el_che.anchor()
                 );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Auto-tune max_overshoot: shrink on divergence, grow on stability.
+        if self.overshoot_auto {
+            if diverged {
+                self.max_overshoot = self.overshoot_initial;
+            } else {
+                let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
+                self.max_overshoot = (self.max_overshoot + 1).min(cap);
             }
         }
 
@@ -1156,6 +1271,17 @@ impl Coordinator {
         }
         for t in &mut self.throttled {
             *t = false;
+        }
+
+        // Re-dispatch to idle ranks that may have been waiting at the overshoot gate.
+        if self.progressive {
+            for rank in 0..self.world_size {
+                let has_inflight = self.chunk_pools.values()
+                    .any(|p| p.in_flight(rank) > 0);
+                if !has_inflight {
+                    self.dispatch_next_chunk(rank);
+                }
+            }
         }
     }
 

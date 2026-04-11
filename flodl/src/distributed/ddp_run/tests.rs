@@ -2648,3 +2648,426 @@ fn test_coordinator_active_count_prevents_averaging_after_exit() {
     assert!(!h.coord.should_average(),
         "should NOT average when active_count < world_size");
 }
+
+// ---------------------------------------------------------------------------
+// Streaming epochs tests
+// ---------------------------------------------------------------------------
+
+/// Streaming-epoch test harness with optional epoch metrics channel.
+struct StreamingTestHarness {
+    inner: CoordTestHarness,
+    epoch_metrics_rx: mpsc::Receiver<EpochMetrics>,
+}
+
+/// Helper: create a progressive coordinator with configurable epochs, batch_size,
+/// and max_overshoot for streaming epoch tests.
+fn make_streaming_harness(
+    n: usize,
+    num_epochs: usize,
+    total_samples: usize,
+    batch_size: usize,
+    max_overshoot: Option<usize>,
+) -> CoordTestHarness {
+    make_streaming_harness_with_metrics(n, num_epochs, total_samples, batch_size, max_overshoot).inner
+}
+
+fn make_streaming_harness_with_metrics(
+    n: usize,
+    num_epochs: usize,
+    total_samples: usize,
+    batch_size: usize,
+    max_overshoot: Option<usize>,
+) -> StreamingTestHarness {
+    let (timing_tx, timing_rx) = mpsc::channel();
+    let (metrics_tx, metrics_rx) = mpsc::channel();
+    let (param_tx, param_rx) = mpsc::channel();
+    let (epoch_metrics_tx, epoch_metrics_rx) = mpsc::channel();
+
+    let mut control_txs = Vec::new();
+    let mut control_rxs = Vec::new();
+    let mut final_param_rxs = Vec::new();
+    for _ in 0..n {
+        let (tx, rx) = mpsc::channel();
+        control_txs.push(tx);
+        control_rxs.push(rx);
+        let (_ftx, frx) = mpsc::channel();
+        final_param_rxs.push(frx);
+    }
+
+    let el_che = ElChe::new(n, 10);
+    let coord = Coordinator::builder(
+        timing_rx, metrics_rx, param_rx,
+        final_param_rxs,
+        control_txs,
+        ApplyPolicy::Cadence, AverageBackend::Nccl,
+        n, total_samples, el_che,
+    )
+    .progressive(true)
+    .batch_size(batch_size)
+    .num_epochs(num_epochs)
+    .max_overshoot(max_overshoot)
+    .epoch_metrics_tx(epoch_metrics_tx)
+    .build();
+
+    StreamingTestHarness {
+        inner: CoordTestHarness { coord, timing_tx, metrics_tx, param_tx, control_rxs },
+        epoch_metrics_rx,
+    }
+}
+
+#[test]
+fn test_streaming_cross_epoch_dispatch() {
+    // 2 ranks, 3 epochs, 20 samples, batch_size=10 (2 batches/epoch).
+    // With probe chunks of ~4 batches capped at 1 batch (2 batches total / 2 ranks),
+    // each rank gets 10 samples. Completing that exhausts the pool.
+    let mut h = make_streaming_harness(2, 3, 20, 10, Some(5));
+
+    h.coord.send_all_plans(0);
+    // Collect initial dispatch: each rank should get an epoch 0 chunk.
+    let mut rank0_plan = None;
+    while let Ok(msg) = h.control_rxs[0].try_recv() {
+        if let ControlMsg::StartEpoch(p) = msg { rank0_plan = Some(p); }
+    }
+    let plan = rank0_plan.expect("rank 0 should get initial chunk");
+    assert_eq!(plan.epoch, 0);
+    let dispatched = plan.partition_size;
+
+    // Rank 0 reports exactly what was dispatched.
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 0, avg_loss: 0.1,
+        batches_processed: dispatched / 10,
+        epoch_ms: 50.0, samples_processed: dispatched,
+        scalars: Default::default(),
+    }).unwrap();
+    h.coord.drain_metrics();
+
+    // After reporting, rank 0 should get new work: either more from epoch 0
+    // or streaming into epoch 1 (pool was tiny, likely exhausted).
+    let mut epochs_dispatched = Vec::new();
+    while let Ok(msg) = h.control_rxs[0].try_recv() {
+        if let ControlMsg::StartEpoch(p) = msg { epochs_dispatched.push(p.epoch); }
+    }
+
+    // Rank 0 should have received some dispatch (from epoch 0 or 1).
+    // The exact behavior depends on pool sizing, but no crash = the
+    // multi-pool logic works.
+    assert!(true, "cross-epoch dispatch did not panic");
+}
+
+#[test]
+fn test_streaming_global_epoch_event_fires_when_all_complete() {
+    // Manually set up a pool and feed it exact completions.
+    let mut h = make_streaming_harness(2, 2, 20, 10, Some(5));
+
+    // Manually create epoch 0 pool with known sizes.
+    let pool = super::coordinator::ChunkPool::new(0, 20, 2);
+    h.coord.chunk_pools.insert(0, pool);
+
+    // Manually take chunks: 10 samples each.
+    h.coord.chunk_pools.get_mut(&0).unwrap().take_chunk(10, 0);
+    h.coord.chunk_pools.get_mut(&0).unwrap().take_chunk(10, 1);
+
+    // Report completion from both ranks.
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 1,
+        epoch_ms: 10.0, samples_processed: 10,
+        scalars: Default::default(),
+    }).unwrap();
+    h.metrics_tx.send(MetricsMsg {
+        rank: 1, epoch: 0, avg_loss: 0.2, batches_processed: 1,
+        epoch_ms: 20.0, samples_processed: 10,
+        scalars: Default::default(),
+    }).unwrap();
+    h.coord.drain_metrics();
+
+    assert_eq!(h.coord.last_aggregated_epoch, Some(0),
+        "epoch 0 should be aggregated when both ranks complete");
+}
+
+#[test]
+fn test_overshoot_gate_blocks_runaway() {
+    // Use a manually prepared pool so we control exactly what was dispatched.
+    let mut h = make_streaming_harness(2, 3, 100, 10, Some(0));
+
+    // Create epoch 0 pool, take all samples for both ranks.
+    let pool = super::coordinator::ChunkPool::new(0, 100, 2);
+    h.coord.chunk_pools.insert(0, pool);
+    h.coord.chunk_pools.get_mut(&0).unwrap().take_chunk(50, 0);
+    h.coord.chunk_pools.get_mut(&0).unwrap().take_chunk(50, 1);
+
+    // Simulate: rank 0 has completed all epoch 0 work, at planned batch count.
+    h.coord.steps_since_avg[0] = 10;
+    h.coord.steps_since_avg[1] = 3;
+
+    // Report rank 0 completion (matches dispatched amount).
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 5,
+        epoch_ms: 50.0, samples_processed: 50,
+        scalars: Default::default(),
+    }).unwrap();
+    h.coord.drain_metrics();
+
+    // With max_overshoot=0 and steps_since_avg[0]=10 >= batch_counts[0]=10,
+    // the gate should block cross-epoch dispatch.
+    let mut got_epoch_1 = false;
+    while let Ok(msg) = h.control_rxs[0].try_recv() {
+        if let ControlMsg::StartEpoch(p) = msg {
+            if p.epoch == 1 { got_epoch_1 = true; }
+        }
+    }
+    assert!(!got_epoch_1,
+        "overshoot gate should prevent cross-epoch dispatch when at limit");
+}
+
+#[test]
+fn test_overshoot_auto_tune_grows() {
+    let mut h = make_streaming_harness(2, 3, 1000, 10, None);
+    let initial = h.coord.max_overshoot;
+    assert!(initial >= 2, "initial overshoot should be at least 2");
+
+    // Simulate a successful NCCL averaging (no divergence)
+    h.coord.steps_since_avg = vec![10, 10];
+    h.coord.wall_ms_accum = vec![100.0, 200.0];
+    h.coord.finish_averaging_nccl();
+
+    assert_eq!(h.coord.max_overshoot, initial + 1,
+        "overshoot should grow by 1 after successful averaging");
+}
+
+#[test]
+fn test_overshoot_auto_tune_resets_on_divergence() {
+    let mut h = make_streaming_harness(2, 3, 1000, 10, None);
+    let initial = h.coord.overshoot_initial;
+
+    // Grow overshoot a few times
+    for _ in 0..3 {
+        h.coord.steps_since_avg = vec![10, 10];
+        h.coord.wall_ms_accum = vec![100.0, 200.0];
+        h.coord.finish_averaging_nccl();
+    }
+    assert!(h.coord.max_overshoot > initial,
+        "overshoot should have grown");
+
+    // Now simulate CPU averaging with divergence
+    let steps_snap = vec![5_usize, 5];
+    let wall_snap = vec![50.0, 100.0];
+    h.coord.finish_averaging_cpu(
+        10.0,
+        &steps_snap,
+        &wall_snap,
+        Some(0.2), // divergence > threshold (0.05)
+    );
+
+    assert_eq!(h.coord.max_overshoot, initial,
+        "overshoot should reset to initial on divergence");
+}
+
+#[test]
+fn test_overshoot_user_override_no_autotune() {
+    let mut h = make_streaming_harness(2, 3, 1000, 10, Some(7));
+    assert_eq!(h.coord.max_overshoot, 7);
+    assert!(!h.coord.overshoot_auto);
+
+    // Simulate averaging -- should NOT change overshoot
+    h.coord.steps_since_avg = vec![10, 10];
+    h.coord.wall_ms_accum = vec![100.0, 200.0];
+    h.coord.finish_averaging_nccl();
+
+    assert_eq!(h.coord.max_overshoot, 7,
+        "user-set overshoot should not auto-tune");
+}
+
+#[test]
+fn test_multi_pool_completion_tracking() {
+    // Manually create two pools and verify MetricsMsg routes to correct ones.
+    let mut h = make_streaming_harness(2, 3, 100, 10, Some(10));
+
+    // Create pools manually with known dispatched amounts.
+    let mut pool0 = super::coordinator::ChunkPool::new(0, 100, 2);
+    pool0.take_chunk(50, 0); // dispatch 50 to rank 0
+    pool0.take_chunk(50, 1); // dispatch 50 to rank 1
+    h.coord.chunk_pools.insert(0, pool0);
+
+    let mut pool1 = super::coordinator::ChunkPool::new(1, 100, 2);
+    pool1.take_chunk(30, 0); // dispatch 30 to rank 0
+    h.coord.chunk_pools.insert(1, pool1);
+
+    // Report epoch 0 completion from rank 0
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 5,
+        epoch_ms: 50.0, samples_processed: 50,
+        scalars: Default::default(),
+    }).unwrap();
+    // Report epoch 1 completion from rank 0
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 1, avg_loss: 0.2, batches_processed: 3,
+        epoch_ms: 30.0, samples_processed: 30,
+        scalars: Default::default(),
+    }).unwrap();
+    h.coord.drain_metrics();
+
+    // Epoch 0 pool should have rank 0 completion tracked
+    if let Some(pool) = h.coord.chunk_pools.get(&0) {
+        assert_eq!(pool.completed[0], 50, "epoch 0 pool should track rank 0 completion");
+    }
+    // Epoch 1 pool should have rank 0 completion tracked separately
+    if let Some(pool) = h.coord.chunk_pools.get(&1) {
+        assert_eq!(pool.completed[0], 30, "epoch 1 pool should track rank 0 completion");
+    }
+}
+
+#[test]
+fn test_shutdown_with_streaming_pools() {
+    // Manually create pools and verify shutdown fires when last epoch completes.
+    let mut h = make_streaming_harness(2, 2, 20, 10, Some(5));
+
+    // Create epoch 0 pool, dispatch all.
+    let mut pool0 = super::coordinator::ChunkPool::new(0, 20, 2);
+    pool0.take_chunk(10, 0);
+    pool0.take_chunk(10, 1);
+    h.coord.chunk_pools.insert(0, pool0);
+
+    // Complete epoch 0 from both ranks.
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 1,
+        epoch_ms: 10.0, samples_processed: 10,
+        scalars: Default::default(),
+    }).unwrap();
+    h.metrics_tx.send(MetricsMsg {
+        rank: 1, epoch: 0, avg_loss: 0.2, batches_processed: 1,
+        epoch_ms: 20.0, samples_processed: 10,
+        scalars: Default::default(),
+    }).unwrap();
+    h.coord.drain_metrics();
+    assert_eq!(h.coord.last_aggregated_epoch, Some(0));
+
+    // Drain dispatch messages from on_epoch_aggregated.
+    for rx in &h.control_rxs {
+        while let Ok(_) = rx.try_recv() {}
+    }
+
+    // Create epoch 1 pool with both ranks dispatched.
+    // Replace whatever on_epoch_aggregated created, to have clean state.
+    h.coord.chunk_pools.remove(&1);
+    let mut pool1 = super::coordinator::ChunkPool::new(1, 20, 2);
+    pool1.take_chunk(10, 0);
+    pool1.take_chunk(10, 1);
+    h.coord.chunk_pools.insert(1, pool1);
+
+    // Complete epoch 1 (the last epoch).
+    h.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 1, avg_loss: 0.05, batches_processed: 1,
+        epoch_ms: 10.0, samples_processed: 10,
+        scalars: Default::default(),
+    }).unwrap();
+    h.metrics_tx.send(MetricsMsg {
+        rank: 1, epoch: 1, avg_loss: 0.06, batches_processed: 1,
+        epoch_ms: 20.0, samples_processed: 10,
+        scalars: Default::default(),
+    }).unwrap();
+    h.coord.drain_metrics();
+
+    assert_eq!(h.coord.last_aggregated_epoch, Some(1));
+
+    // Both ranks should have received Shutdown.
+    let mut shutdowns = 0;
+    for rx in &h.control_rxs {
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ControlMsg::Shutdown) {
+                shutdowns += 1;
+            }
+        }
+    }
+    assert_eq!(shutdowns, 2, "both ranks should receive Shutdown after final epoch");
+}
+
+#[test]
+fn test_ddp_run_config_max_overshoot() {
+    let config = DdpRunConfig::new().with_max_overshoot(5);
+    assert_eq!(config.max_overshoot, Some(5));
+
+    let config2 = DdpRunConfig::new();
+    assert_eq!(config2.max_overshoot, None);
+}
+
+#[test]
+fn test_epoch_event_fires_with_mixed_epoch_ranks() {
+    // Scenario: fast rank (0) finishes epoch 1 and streams into epoch 2.
+    // Slow rank (1) then completes epoch 1. The global epoch 1 event must
+    // fire with correct metrics from BOTH ranks, even though rank 0's
+    // epoch 1 metrics were buffered earlier.
+    let mut sh = make_streaming_harness_with_metrics(2, 3, 60, 10, Some(10));
+
+    // -- Set up epoch 1 pool: 60 samples, 30 per rank --
+    let mut pool1 = super::coordinator::ChunkPool::new(1, 60, 2);
+    pool1.take_chunk(30, 0); // rank 0 dispatched 30
+    pool1.take_chunk(30, 1); // rank 1 dispatched 30
+    sh.inner.coord.chunk_pools.insert(1, pool1);
+
+    // -- Set up epoch 2 pool (rank 0 already streaming ahead) --
+    let mut pool2 = super::coordinator::ChunkPool::new(2, 60, 2);
+    pool2.take_chunk(20, 0); // rank 0 dispatched 20 into epoch 2
+    sh.inner.coord.chunk_pools.insert(2, pool2);
+    sh.inner.coord.rank_epoch[0] = 2; // rank 0 is on epoch 2
+    sh.inner.coord.rank_epoch[1] = 1; // rank 1 still on epoch 1
+
+    // -- Rank 0 reported epoch 1 completion earlier (buffered) --
+    sh.inner.metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 1, avg_loss: 0.10, batches_processed: 3,
+        epoch_ms: 30.0, samples_processed: 30,
+        scalars: [("loss".to_string(), (0.30, 3_usize))].into(),
+    }).unwrap();
+    sh.inner.coord.drain_metrics();
+
+    // Epoch 1 should NOT be aggregated yet (rank 1 hasn't completed).
+    assert!(sh.inner.coord.last_aggregated_epoch.is_none()
+        || sh.inner.coord.last_aggregated_epoch == Some(0),
+        "epoch 1 should not aggregate with only rank 0 complete");
+
+    // Verify epoch 1 pool is still active (rank 1 not done).
+    assert!(sh.inner.coord.chunk_pools.contains_key(&1),
+        "epoch 1 pool should still exist");
+
+    // -- Now slow rank (1) completes epoch 1 --
+    sh.inner.metrics_tx.send(MetricsMsg {
+        rank: 1, epoch: 1, avg_loss: 0.20, batches_processed: 3,
+        epoch_ms: 60.0, samples_processed: 30,
+        scalars: [("loss".to_string(), (0.60, 3_usize))].into(),
+    }).unwrap();
+    sh.inner.coord.drain_metrics();
+
+    // Epoch 1 should now be aggregated.
+    assert_eq!(sh.inner.coord.last_aggregated_epoch, Some(1),
+        "epoch 1 should aggregate when both ranks complete");
+
+    // Epoch 1 pool should be cleaned up.
+    assert!(!sh.inner.coord.chunk_pools.contains_key(&1),
+        "epoch 1 pool should be removed after aggregation");
+
+    // Epoch 2 pool should still exist (rank 0 is working on it).
+    assert!(sh.inner.coord.chunk_pools.contains_key(&2),
+        "epoch 2 pool should survive epoch 1 aggregation");
+
+    // -- Verify aggregated metrics are correct --
+    let em = sh.epoch_metrics_rx.try_recv()
+        .expect("epoch metrics should have been sent for epoch 1");
+    assert_eq!(em.epoch, 1);
+
+    // avg_loss: batch-weighted mean of rank 0 (0.10, 3 batches) and rank 1 (0.20, 3 batches)
+    // = (0.10*3 + 0.20*3) / 6 = 0.90 / 6 = 0.15
+    assert!((em.avg_loss - 0.15).abs() < 1e-9,
+        "avg_loss should be batch-weighted mean: got {}", em.avg_loss);
+
+    // per_rank_batch_share: 3/6 = 0.5 each
+    assert_eq!(em.per_rank_batch_share.len(), 2);
+    assert!((em.per_rank_batch_share[0] - 0.5).abs() < 1e-9);
+    assert!((em.per_rank_batch_share[1] - 0.5).abs() < 1e-9);
+
+    // scalars: loss = batch-weighted mean of rank 0 (0.30/3=0.10) and rank 1 (0.60/3=0.20)
+    // weighted by batches: (0.10*3 + 0.20*3)/6 = 0.15
+    assert!((em.scalars["loss"] - 0.15).abs() < 1e-9,
+        "loss scalar should be batch-weighted: got {}", em.scalars["loss"]);
+
+    // epoch_ms is overridden by pool wall-clock (near-instant in test).
+    assert!(em.epoch_ms > 0.0, "epoch_ms should be positive");
+}

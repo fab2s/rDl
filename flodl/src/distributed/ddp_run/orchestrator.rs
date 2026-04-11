@@ -317,7 +317,8 @@ impl DdpHandle {
                 .partition_ratios(partition_ratios)
                 .progressive(progressive)
                 .batch_size(coord_batch_size)
-                .timeline(coord_timeline.clone());
+                .timeline(coord_timeline.clone())
+                .max_overshoot(config.max_overshoot);
                 if let Some(dt) = div_threshold {
                     builder = builder.divergence_threshold(dt);
                 }
@@ -951,6 +952,9 @@ impl DdpHandle {
         if let Some(diff) = config.max_batch_diff {
             meta["max_batch_diff"] = serde_json::json!(diff);
         }
+        if let Some(overshoot) = config.max_overshoot {
+            meta["max_overshoot"] = serde_json::json!(overshoot);
+        }
         if let Some(dt) = config.divergence_threshold {
             meta["divergence_threshold"] = serde_json::json!(dt);
         }
@@ -1075,6 +1079,15 @@ where
     /// `0` = strict lockstep.
     pub fn max_batch_diff(mut self, max: usize) -> Self {
         self.config = self.config.with_max_batch_diff(max);
+        self
+    }
+
+    /// Set the maximum overshoot past the planned sync point.
+    ///
+    /// Controls how far a fast GPU can stream past its planned batch count
+    /// into the next epoch's data. Default: auto-tuned from convergence.
+    pub fn max_overshoot(mut self, max: usize) -> Self {
+        self.config = self.config.with_max_overshoot(max);
         self
     }
 
