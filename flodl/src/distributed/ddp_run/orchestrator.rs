@@ -291,6 +291,7 @@ impl DdpHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_coord = shutdown.clone();
         let div_threshold = config.divergence_threshold;
+        let no_div_guard = config.no_divergence_guard;
         let ckpt_every = config.checkpoint_every;
         let snap_timeout = config.snapshot_timeout_secs;
         let partition_ratios = config.partition_ratios.clone();
@@ -321,6 +322,9 @@ impl DdpHandle {
                 .max_overshoot(config.max_overshoot);
                 if let Some(dt) = div_threshold {
                     builder = builder.divergence_threshold(dt);
+                }
+                if no_div_guard {
+                    builder = builder.no_divergence_guard();
                 }
                 if let Some(n) = ckpt_every {
                     builder = builder.checkpoint_every(n);
@@ -1079,9 +1083,16 @@ where
         self
     }
 
-    /// Set the divergence threshold for Async mode.
+    /// Set the divergence threshold for the trend guardrail.
     pub fn divergence_threshold(mut self, threshold: f64) -> Self {
         self.config = self.config.with_divergence_threshold(threshold);
+        self
+    }
+
+    /// Disable the divergence guardrail. ElChe's overhead auto-tune
+    /// handles cadence alone. Use when you know your workload is stable.
+    pub fn no_divergence_guard(mut self) -> Self {
+        self.config = self.config.with_no_divergence_guard();
         self
     }
 

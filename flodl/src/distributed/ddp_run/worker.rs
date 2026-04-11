@@ -544,7 +544,7 @@ impl<M: Module> GpuWorker<M> {
                 // train afterward) leaves nccl_ack permanently false, blocking
                 // all future should_average() calls.
                 self.local_step += 1;
-                let _ = self.report_timing(0.0, None);
+                let _ = self.report_timing(0.0, None, 0.0);
             }
             ControlMsg::StartEpoch(plan) => {
                 self.pending_plan = Some(plan);
@@ -586,12 +586,13 @@ impl<M: Module> GpuWorker<M> {
     }
 
     /// Send a timing report to the coordinator.
-    pub fn report_timing(&self, batch_ms: f64, param_norm: Option<f64>) -> Result<()> {
+    pub fn report_timing(&self, batch_ms: f64, param_norm: Option<f64>, batch_loss: f64) -> Result<()> {
         self.timing_tx.send(TimingMsg::Batch {
             rank: self.rank,
             batch_ms,
             step_count: self.local_step,
             param_norm,
+            batch_loss,
         }).map_err(|_| TensorError::new("timing channel disconnected"))
     }
 
@@ -829,7 +830,7 @@ impl<M: Module> GpuWorker<M> {
                 } else {
                     None
                 };
-                let _ = self.report_timing(ms, norm);
+                let _ = self.report_timing(ms, norm, loss);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }
@@ -881,7 +882,7 @@ impl<M: Module> GpuWorker<M> {
                 } else {
                     None
                 };
-                let _ = self.report_timing(ms, norm);
+                let _ = self.report_timing(ms, norm, loss);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }

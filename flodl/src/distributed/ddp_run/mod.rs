@@ -300,8 +300,11 @@ pub struct DdpRunConfig {
     pub max_anchor: Option<usize>,
     /// Initial ElChe anchor (batches before first sync). Default: 10.
     pub anchor: Option<usize>,
-    /// Divergence threshold for Async mode. Default: 0.05.
+    /// Divergence threshold for the trend guardrail. Default: 0.05.
     pub divergence_threshold: Option<f64>,
+    /// Disable the divergence guardrail entirely. Default: false (enabled).
+    /// When true, ElChe's overhead auto-tune handles cadence alone.
+    pub no_divergence_guard: bool,
     /// Maximum batch lead of fastest over slowest worker.
     /// `Some(0)` = strict lockstep. `None` = unlimited. Default: `None`.
     pub max_batch_diff: Option<usize>,
@@ -376,6 +379,7 @@ impl DdpRunConfig {
             max_anchor: None,
             anchor: None,
             divergence_threshold: None,
+            no_divergence_guard: false,
             max_batch_diff: None,
             checkpoint_every: None,
             snapshot_timeout_secs: 5,
@@ -406,9 +410,16 @@ impl DdpRunConfig {
         self
     }
 
-    /// Set the divergence threshold for Async mode.
+    /// Set the divergence threshold for the trend guardrail.
     pub fn with_divergence_threshold(mut self, threshold: f64) -> Self {
         self.divergence_threshold = Some(threshold);
+        self
+    }
+
+    /// Disable the divergence guardrail. ElChe's overhead auto-tune
+    /// handles cadence alone. Use when you know your workload is stable.
+    pub fn with_no_divergence_guard(mut self) -> Self {
+        self.no_divergence_guard = true;
         self
     }
 
@@ -525,6 +536,9 @@ pub enum TimingMsg {
         /// L2 norm of all parameters (computed periodically, not every batch).
         /// Used by the coordinator for NCCL divergence detection.
         param_norm: Option<f64>,
+        /// Training loss for this batch. Accumulated by the coordinator
+        /// for weighted divergence detection across sync intervals.
+        batch_loss: f64,
     },
     /// Worker is about to exit. Coordinator must stop including this rank
     /// in collectives before processing any further messages.

@@ -307,7 +307,7 @@ fn test_worker_train_step() {
 fn test_worker_report_timing() {
     let (worker, ch) = make_test_worker();
 
-    worker.report_timing(12.5, None).unwrap();
+    worker.report_timing(12.5, None, 0.5).unwrap();
 
     let msg = ch.timing_rx.recv().unwrap();
     match msg {
@@ -458,7 +458,7 @@ fn test_worker_channels_create() {
         GpuWorker::<Linear>::channels();
 
     // Verify channel pairs work
-    timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 1.0, step_count: 0, param_norm: None }).unwrap();
+    timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 1.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
     let msg = ch.timing_rx.recv().unwrap();
     assert!(matches!(msg, TimingMsg::Batch { rank: 0, .. }));
 
@@ -550,8 +550,8 @@ fn test_coordinator_initial_state() {
 fn test_coordinator_drain_timing() {
     let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Nccl);
 
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
 
     h.coord.drain_timing();
 
@@ -566,12 +566,12 @@ fn test_coordinator_should_average_sync() {
     assert!(!h.coord.should_average());
 
     // One rank reports
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
     assert!(!h.coord.should_average()); // rank 1 still at 0
 
     // Both ranks report
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
     assert!(h.coord.should_average());
 }
@@ -583,15 +583,15 @@ fn test_coordinator_should_average_async() {
     // Async now uses batch_counts() same as Cadence (anchor=10 from harness).
     // Feed 9 steps per rank: not enough yet.
     for _ in 0..9 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     assert!(!h.coord.should_average());
 
     // 10th step: both ranks reach batch_counts (anchor=10, uncalibrated so equal).
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
     assert!(h.coord.should_average());
 }
@@ -608,8 +608,8 @@ fn test_coordinator_should_average_wall_time() {
     // Send 10 batches per rank to trigger initial averaging.
     // step_count must increment to satisfy NCCL ack tracking.
     for i in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i + 1, param_norm: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: i + 1, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i + 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: i + 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average()); // batch-count fallback: 10 >= 10
@@ -628,8 +628,8 @@ fn test_coordinator_should_average_wall_time() {
     // If we feed 10 batches to each: wall_ms_accum = [50, 100].
     // min(50, 100) = 50 < 100 → no trigger (fast rank hasn't accumulated enough).
     for i in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 11 + i, param_norm: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 11 + i, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 11 + i, param_norm: None, batch_loss: 0.1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 11 + i, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     assert!(!h.coord.should_average(), "fast rank wall time < target");
@@ -637,7 +637,7 @@ fn test_coordinator_should_average_wall_time() {
     // Feed 10 more to rank 0 only (simulating fast GPU running ahead).
     // wall_ms_accum = [100, 100]. min = 100 >= target → trigger!
     for i in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 21 + i, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 21 + i, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average(), "both ranks at target wall time");
@@ -652,8 +652,8 @@ fn test_async_uses_batch_count_not_wall_time() {
     // Calibrate: 10 batches each at 2:1 speed ratio.
     // step_count must increment to satisfy NCCL ack tracking.
     for i in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i + 1, param_norm: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: i + 1, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i + 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: i + 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average());
@@ -669,11 +669,11 @@ fn test_async_uses_batch_count_not_wall_time() {
     let mut step0 = 11usize;
     let mut step1 = 11usize;
     for _ in 0..counts[0] {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: step0, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: step0, param_norm: None, batch_loss: 0.1 }).unwrap();
         step0 += 1;
     }
     for _ in 0..counts[1] {
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: step1, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: step1, param_norm: None, batch_loss: 0.1 }).unwrap();
         step1 += 1;
     }
     h.coord.drain_timing();
@@ -685,8 +685,8 @@ fn test_coordinator_trigger_nccl() {
     let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Nccl);
 
     // Feed timing and trigger
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
     h.coord.trigger_averaging().unwrap();
 
@@ -710,8 +710,8 @@ fn test_coordinator_trigger_cpu_averaging() {
     let opts = TensorOptions { dtype: DType::Float32, device: dev };
 
     // Feed timing
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
 
     // trigger_averaging now returns immediately (enters Collecting state)
@@ -814,8 +814,8 @@ fn test_coordinator_tick_sync_flow() {
     assert_eq!(h.coord.version(), 0);
 
     // Feed steps from both ranks
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
 
     // Tick: should trigger averaging
     let metrics = h.coord.tick().unwrap();
@@ -939,7 +939,7 @@ fn test_throttle_sends_when_diff_exceeded() {
 
     // Rank 0 is 5 steps ahead, rank 1 at 0 -> diff = 5 > 3
     for i in 0..5 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     h.coord.check_throttle();
@@ -960,7 +960,7 @@ fn test_throttle_no_send_within_limit() {
 
     // Rank 0 is 3 steps ahead, rank 1 at 0 -> diff = 3 <= 5
     for i in 0..3 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     h.coord.check_throttle();
@@ -975,7 +975,7 @@ fn test_throttle_zero_is_strict_lockstep() {
     let mut h = make_throttle_harness(2, 0);
 
     // Rank 0 does 1 batch, rank 1 does 0 -> diff = 1 > 0
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
     h.coord.check_throttle();
 
@@ -1019,7 +1019,7 @@ fn test_throttle_skipped_for_nccl() {
 
     // Rank 0 is 10 steps ahead (would trigger throttle with CPU backend).
     for i in 0..10 {
-        timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i, param_norm: None }).unwrap();
+        timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     coord.drain_timing();
     coord.check_throttle();
@@ -1036,7 +1036,7 @@ fn test_throttle_disabled_when_none() {
 
     // Rank 0 far ahead
     for i in 0..50 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     h.coord.check_throttle();
@@ -1669,8 +1669,8 @@ fn test_cadence_heterogeneous_timing() {
     // Feed enough timing to calibrate ElChe.
     // First, trigger with equal steps so ElChe sees the timing.
     for _ in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
         h.coord.drain_timing();
         if h.coord.should_average() {
             h.coord.trigger_averaging().unwrap();
@@ -1702,8 +1702,8 @@ fn test_cpu_averaging_divergence_correction() {
 
     // Feed enough timing to reach batch_counts (anchor=10, uncalibrated).
     for _ in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 0, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average());
@@ -1764,8 +1764,8 @@ fn test_throttle_during_cpu_averaging() {
     h.coord.el_che = el_che;
 
     // Feed enough timing to trigger averaging
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
 
     // Trigger averaging (enters Collecting state, returns immediately)
@@ -1784,7 +1784,7 @@ fn test_throttle_during_cpu_averaging() {
 
     // Simulate rank 0 running ahead by 5 batches during the averaging window
     for i in 0..5 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 1.0, step_count: 2 + i, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 1.0, step_count: 2 + i, param_norm: None, batch_loss: 0.1 }).unwrap();
     }
     h.coord.drain_timing();
 
@@ -1808,8 +1808,8 @@ fn test_cpu_avg_state_machine_full_cycle() {
     let opts = TensorOptions { dtype: DType::Float32, device: dev };
 
     // Feed timing
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
 
     assert_eq!(h.coord.version(), 0);
@@ -1880,8 +1880,8 @@ fn test_cpu_avg_collection_timeout() {
     );
 
     // Feed timing to trigger averaging
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
 
     // Trigger: enters Collecting
@@ -1911,8 +1911,8 @@ fn test_stale_snapshot_after_timeout() {
     let opts = TensorOptions { dtype: DType::Float32, device: dev };
 
     // Feed timing
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
 
     // Round 1: trigger, send only rank 0's snapshot, let it timeout
@@ -1932,8 +1932,8 @@ fn test_stale_snapshot_after_timeout() {
 
     // Round 2: trigger fresh. The stale rank-0 snapshot from round 1
     // should have been drained by abort_cpu_averaging.
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 2, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 2, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 2, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 5.0, step_count: 2, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
 
     h.coord.trigger_averaging().unwrap();
@@ -1987,8 +1987,8 @@ fn test_elche_calibration_produces_proportional_sizes() {
 
     // Feed heterogeneous timing to trigger ElChe calibration
     for _ in 0..5 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
         h.coord.drain_timing();
         if h.coord.should_average() {
             h.coord.trigger_averaging().unwrap();
@@ -2011,10 +2011,10 @@ fn test_wall_ms_accumulation() {
     let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Nccl);
 
     // Send multiple timing messages per rank
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 7.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 12.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 7.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 12.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
 
     // wall_ms_accum should have accumulated totals
@@ -2204,8 +2204,8 @@ fn test_proportional_sharding() {
 
     // Calibrate ElChe with 2:1 timing
     for _ in 0..3 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None, batch_loss: 0.1 }).unwrap();
         h.coord.drain_timing();
         if h.coord.should_average() {
             h.coord.trigger_averaging().unwrap();
@@ -2668,8 +2668,8 @@ fn test_coordinator_active_count_prevents_averaging_after_exit() {
     let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Nccl);
 
     // Both ranks report a batch
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 1, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
     assert!(h.coord.should_average(), "both ranks reported, should average");
 
@@ -2677,8 +2677,8 @@ fn test_coordinator_active_count_prevents_averaging_after_exit() {
     h.coord.trigger_averaging().unwrap();
 
     // Both report again
-    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 2, param_norm: None }).unwrap();
-    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 2, param_norm: None }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 2, param_norm: None, batch_loss: 0.1 }).unwrap();
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 20.0, step_count: 2, param_norm: None, batch_loss: 0.1 }).unwrap();
     h.coord.drain_timing();
     assert!(h.coord.should_average());
 
