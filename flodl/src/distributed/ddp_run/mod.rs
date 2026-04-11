@@ -522,6 +522,9 @@ pub enum TimingMsg {
         batch_ms: f64,
         /// Worker's local step counter (monotonically increasing).
         step_count: usize,
+        /// L2 norm of all parameters (computed periodically, not every batch).
+        /// Used by the coordinator for NCCL divergence detection.
+        param_norm: Option<f64>,
     },
     /// Worker is about to exit. Coordinator must stop including this rank
     /// in collectives before processing any further messages.

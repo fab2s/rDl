@@ -266,6 +266,17 @@ pub struct Coordinator {
     pub(super) overshoot_auto: bool,
     /// Initial value for reset on convergence degradation.
     pub(super) overshoot_initial: usize,
+    /// Absolute ceiling on max_overshoot (safety valve, applied after auto-tune).
+    overshoot_ceiling: usize,
+
+    // NCCL divergence detection (trailing indicators, never cleared)
+    /// Per-rank latest loss from MetricsMsg. Updated in drain_metrics().
+    last_loss: Vec<f64>,
+    /// Per-rank: true once at least one MetricsMsg has arrived.
+    /// Loss divergence check is skipped until all ranks have reported.
+    loss_reported: Vec<bool>,
+    /// Per-rank latest parameter L2 norm from TimingMsg. Updated in process_timing_msg().
+    last_param_norm: Vec<f64>,
 
     // Timeline profiling
     /// Optional high-frequency system timeline for event injection.
@@ -310,6 +321,8 @@ pub struct CoordinatorBuilder {
     timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
     /// User-set max overshoot, or None for auto.
     max_overshoot: Option<usize>,
+    /// Absolute ceiling on max_overshoot (safety valve). Default: 15.
+    overshoot_ceiling: usize,
 }
 
 impl CoordinatorBuilder {
@@ -396,6 +409,13 @@ impl CoordinatorBuilder {
         self
     }
 
+    /// Set the absolute ceiling on max_overshoot (safety valve).
+    /// Default: 15. Applied after all auto-tune logic.
+    pub fn overshoot_ceiling(mut self, ceiling: usize) -> Self {
+        self.overshoot_ceiling = ceiling;
+        self
+    }
+
     /// Build the coordinator.
     pub fn build(self) -> Coordinator {
         let total_batches = self.total_samples / self.batch_size.max(1);
@@ -446,6 +466,10 @@ impl CoordinatorBuilder {
             max_overshoot: overshoot_initial,
             overshoot_auto,
             overshoot_initial,
+            overshoot_ceiling: self.overshoot_ceiling,
+            last_loss: vec![0.0; self.world_size],
+            loss_reported: vec![false; self.world_size],
+            last_param_norm: vec![0.0; self.world_size],
             timeline: self.timeline,
             nccl_sync_start: None,
             last_step_count: vec![0; self.world_size],
@@ -492,6 +516,7 @@ impl Coordinator {
             batch_size: 1,
             timeline: None,
             max_overshoot: None,
+            overshoot_ceiling: 15,
         }
     }
 
@@ -865,11 +890,15 @@ impl Coordinator {
     /// [`Self::drain_timing_blocking`].
     fn process_timing_msg(&mut self, msg: TimingMsg) {
         match msg {
-            TimingMsg::Batch { rank, batch_ms, step_count } => {
+            TimingMsg::Batch { rank, batch_ms, step_count, param_norm } => {
                 self.steps_since_avg[rank] = self.steps_since_avg[rank].saturating_add(1);
                 self.wall_ms_accum[rank] += batch_ms;
                 self.last_step_count[rank] = self.last_step_count[rank].max(step_count);
                 self.last_batch_ms[rank] = batch_ms;
+                // Track parameter norm for NCCL divergence detection.
+                if let Some(norm) = param_norm {
+                    self.last_param_norm[rank] = norm;
+                }
                 // Ack NCCL sync when the worker's step_count exceeds the
                 // snapshot at trigger time (proves the worker processed the
                 // SyncNow and completed the AllReduce before this batch).
@@ -923,6 +952,10 @@ impl Coordinator {
     pub fn drain_metrics(&mut self) -> Vec<MetricsMsg> {
         let mut msgs = Vec::new();
         while let Ok(msg) = self.metrics_rx.try_recv() {
+            // Track per-rank loss for NCCL divergence detection.
+            self.last_loss[msg.rank] = msg.avg_loss;
+            self.loss_reported[msg.rank] = true;
+
             if self.progressive {
                 // Progressive: route completion to the correct pool by epoch
                 if let Some(pool) = self.chunk_pools.get_mut(&msg.epoch) {
@@ -1141,10 +1174,18 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Common tail for NCCL averaging: report to ElChe, bump version, zero counters.
+    /// Common tail for NCCL averaging: report to ElChe, check divergence,
+    /// bump version, zero counters.
     ///
     /// NCCL workers block in AllReduce so no new batches arrive during the
     /// collective; zeroing is correct.
+    ///
+    /// Divergence detection uses two trailing signals (gated on policy != Sync):
+    /// - **Param norm** (primary): L2 norm reported every 10 batches via TimingMsg.
+    ///   Sum-deviation formula, matching the CPU path. Stricter signal.
+    /// - **Loss** (backup): avg_loss from MetricsMsg at chunk/epoch boundaries.
+    ///   Max-deviation formula, effectively 2x less sensitive. Catches routing
+    ///   divergence (e.g. MoE gates) where norms track close but behavior diverges.
     pub(super) fn finish_averaging_nccl(&mut self) {
         let old_anchor = self.el_che.anchor();
         if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
@@ -1155,15 +1196,27 @@ impl Coordinator {
             }
         }
 
+        // NCCL divergence detection (skip in Sync mode -- near-zero by construction).
+        let diverged = if self.policy != ApplyPolicy::Sync {
+            self.check_nccl_divergence()
+        } else {
+            false
+        };
+
         self.version += 1;
         self.avg_count += 1;
 
-        // Auto-tune max_overshoot: NCCL path has no divergence signal,
-        // so only grow (max_batch_diff throttle catches divergence at batch level).
+        // Auto-tune max_overshoot: shrink on divergence, grow on stability.
         if self.overshoot_auto {
-            let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
-            self.max_overshoot = (self.max_overshoot + 1).min(cap);
+            if diverged {
+                self.max_overshoot = self.overshoot_initial;
+            } else {
+                let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
+                self.max_overshoot = (self.max_overshoot + 1).min(cap);
+            }
         }
+        // Absolute ceiling (safety valve, applied after all auto-tune logic).
+        self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
 
         // Timeline: sync duration and anchor changes
         if let Some(ref tl) = self.timeline {
@@ -1206,6 +1259,79 @@ impl Coordinator {
                     self.dispatch_next_chunk(rank);
                 }
             }
+        }
+    }
+
+    /// Check NCCL divergence from trailing loss and param norm signals.
+    ///
+    /// Returns true if divergence was detected and anchor was nudged down.
+    /// Called from `finish_averaging_nccl()` (gated on policy != Sync).
+    ///
+    /// Two independent checks, either triggers correction:
+    /// - **Param norm** (primary, ~every 10 batches): sum-deviation matching CPU path.
+    /// - **Loss** (backup, epoch/chunk boundaries): max-deviation, 2x less sensitive.
+    ///
+    /// Trailing indicators are never cleared -- they remain valid across averaging
+    /// events. Checks are skipped when a rank hasn't reported yet (init at 0.0).
+    fn check_nccl_divergence(&mut self) -> bool {
+        let old_anchor = self.el_che.anchor();
+
+        // Param norm divergence (primary signal).
+        // Skip if any rank hasn't reported yet (still at init 0.0).
+        let norm_diverged = if self.last_param_norm.iter().all(|&n| n > 0.0) {
+            let mean_norm: f64 = self.last_param_norm.iter().sum::<f64>()
+                / self.world_size as f64;
+            if mean_norm > 1e-10 {
+                let div = self.last_param_norm.iter()
+                    .map(|n| (n - mean_norm).abs())
+                    .sum::<f64>() / mean_norm;
+                if div > self.divergence_threshold {
+                    crate::verbose!(
+                        "  ddp: NCCL param norm divergence {div:.4} > {:.4}, anchor {} -> ?",
+                        self.divergence_threshold, old_anchor,
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Loss divergence (backup signal).
+        // Skip if any rank hasn't reported a MetricsMsg yet.
+        let loss_diverged = if self.loss_reported.iter().all(|&r| r) {
+            let mean_loss: f64 = self.last_loss.iter().sum::<f64>()
+                / self.world_size as f64;
+            let denom = mean_loss.abs().max(1e-7);
+            let div = self.last_loss.iter()
+                .map(|l| (l - mean_loss).abs())
+                .fold(0.0_f64, f64::max) / denom;
+            if div > self.divergence_threshold {
+                crate::verbose!(
+                    "  ddp: NCCL loss divergence {div:.4} > {:.4}, anchor {} -> ?",
+                    self.divergence_threshold, old_anchor,
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if norm_diverged || loss_diverged {
+            self.el_che.nudge_anchor_down(0.5);
+            crate::verbose!(
+                "  ddp: NCCL divergence corrected anchor {} -> {}",
+                old_anchor, self.el_che.anchor(),
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -2303,13 +2429,13 @@ mod tests {
         assert_eq!(coord.steps_since_avg[0], 0);
         assert_eq!(coord.wall_ms_accum[0], 0.0);
 
-        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1 });
+        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None });
         assert_eq!(coord.steps_since_avg[0], 1);
         assert!((coord.wall_ms_accum[0] - 10.0).abs() < 1e-9);
         assert!((coord.last_batch_ms[0] - 10.0).abs() < 1e-9);
 
         // Second message accumulates.
-        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 15.0, step_count: 2 });
+        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 15.0, step_count: 2, param_norm: None });
         assert_eq!(coord.steps_since_avg[0], 2);
         assert!((coord.wall_ms_accum[0] - 25.0).abs() < 1e-9);
         assert!((coord.last_batch_ms[0] - 15.0).abs() < 1e-9);
@@ -2500,5 +2626,145 @@ mod tests {
         assert!((coord.wall_ms_accum[1] - 10.0).abs() < 1e-9);
         assert_eq!(coord.version, 1);
         assert_eq!(coord.avg_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // NCCL divergence detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn finish_averaging_nccl_param_norm_divergence_nudges_anchor() {
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        // Calibrate ElChe so anchor is meaningful.
+        coord.el_che.report_timing(&[100.0, 200.0], &[10, 10], 5.0);
+        let anchor_before = coord.el_che.anchor();
+
+        // Inject diverging param norms (large relative difference).
+        coord.last_param_norm = vec![10.0, 20.0];
+        // Need wall_ms for report_timing inside finish_averaging_nccl.
+        coord.wall_ms_accum = vec![100.0, 200.0];
+        coord.steps_since_avg = vec![10, 10];
+
+        coord.finish_averaging_nccl();
+
+        // Anchor should have been nudged down.
+        assert!(coord.el_che.anchor() < anchor_before,
+            "expected anchor to decrease: was {anchor_before}, now {}",
+            coord.el_che.anchor());
+        // Overshoot should have been reset.
+        assert_eq!(coord.max_overshoot, coord.overshoot_initial);
+    }
+
+    #[test]
+    fn finish_averaging_nccl_loss_divergence_nudges_anchor() {
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        coord.el_che.report_timing(&[100.0, 200.0], &[10, 10], 5.0);
+        let anchor_before = coord.el_che.anchor();
+
+        // Param norms are close (no norm divergence).
+        coord.last_param_norm = vec![10.0, 10.1];
+        // Losses diverge significantly.
+        coord.last_loss = vec![0.1, 0.5];
+        coord.loss_reported = vec![true, true];
+
+        coord.wall_ms_accum = vec![100.0, 200.0];
+        coord.steps_since_avg = vec![10, 10];
+
+        coord.finish_averaging_nccl();
+
+        assert!(coord.el_che.anchor() < anchor_before,
+            "expected anchor to decrease from loss divergence: was {anchor_before}, now {}",
+            coord.el_che.anchor());
+        assert_eq!(coord.max_overshoot, coord.overshoot_initial);
+    }
+
+    #[test]
+    fn finish_averaging_nccl_no_divergence_grows_overshoot() {
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        coord.el_che.report_timing(&[100.0, 200.0], &[10, 10], 5.0);
+        let anchor_before = coord.el_che.anchor();
+        let overshoot_before = coord.max_overshoot;
+
+        // Close param norms and losses: no divergence.
+        coord.last_param_norm = vec![10.0, 10.01];
+        coord.last_loss = vec![0.5, 0.51];
+        coord.loss_reported = vec![true, true];
+
+        coord.wall_ms_accum = vec![100.0, 200.0];
+        coord.steps_since_avg = vec![10, 10];
+
+        coord.finish_averaging_nccl();
+
+        // Anchor should not have changed (or only from ElChe's own auto-tune).
+        assert_eq!(coord.el_che.anchor(), anchor_before,
+            "anchor should be unchanged without divergence");
+        // Overshoot should have grown by 1.
+        let cap = (coord.total_samples / coord.batch_size.max(1) / 50).clamp(3, 10);
+        let expected = (overshoot_before + 1).min(cap).min(coord.overshoot_ceiling);
+        assert_eq!(coord.max_overshoot, expected);
+    }
+
+    #[test]
+    fn finish_averaging_nccl_overshoot_ceiling_caps() {
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        // Set a very low ceiling.
+        coord.overshoot_ceiling = 3;
+        coord.max_overshoot = 5; // Already above ceiling.
+
+        // No divergence signals (nothing reported yet, checks are skipped).
+        coord.wall_ms_accum = vec![100.0, 200.0];
+        coord.steps_since_avg = vec![10, 10];
+
+        coord.finish_averaging_nccl();
+
+        assert!(coord.max_overshoot <= 3,
+            "overshoot {} should be capped at ceiling 3", coord.max_overshoot);
+    }
+
+    #[test]
+    fn process_timing_msg_tracks_param_norm() {
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        assert_eq!(coord.last_param_norm[0], 0.0);
+
+        coord.process_timing_msg(TimingMsg::Batch {
+            rank: 0, batch_ms: 10.0, step_count: 1, param_norm: Some(5.5),
+        });
+        assert!((coord.last_param_norm[0] - 5.5).abs() < 1e-9);
+        // Rank 1 unchanged.
+        assert_eq!(coord.last_param_norm[1], 0.0);
+
+        // None doesn't overwrite.
+        coord.process_timing_msg(TimingMsg::Batch {
+            rank: 0, batch_ms: 10.0, step_count: 2, param_norm: None,
+        });
+        assert!((coord.last_param_norm[0] - 5.5).abs() < 1e-9);
+
+        // New value overwrites.
+        coord.process_timing_msg(TimingMsg::Batch {
+            rank: 0, batch_ms: 10.0, step_count: 3, param_norm: Some(7.0),
+        });
+        assert!((coord.last_param_norm[0] - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn finish_averaging_nccl_stale_signal_no_false_trigger() {
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        coord.el_che.report_timing(&[100.0, 200.0], &[10, 10], 5.0);
+        let anchor_before = coord.el_che.anchor();
+
+        // Only rank 0 has reported loss; rank 1 hasn't.
+        coord.last_loss = vec![0.5, 0.0];
+        coord.loss_reported = vec![true, false];
+        // Only rank 0 has a param norm; rank 1 is still at init (0.0).
+        coord.last_param_norm = vec![10.0, 0.0];
+
+        coord.wall_ms_accum = vec![100.0, 200.0];
+        coord.steps_since_avg = vec![10, 10];
+
+        coord.finish_averaging_nccl();
+
+        // Neither check should fire: both are skipped due to stale/missing data.
+        assert_eq!(coord.el_che.anchor(), anchor_before,
+            "anchor should not change when signals are stale");
     }
 }

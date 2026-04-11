@@ -577,12 +577,32 @@ impl<M: Module> GpuWorker<M> {
     }
 
     /// Send a timing report to the coordinator.
-    pub fn report_timing(&self, batch_ms: f64) -> Result<()> {
+    pub fn report_timing(&self, batch_ms: f64, param_norm: Option<f64>) -> Result<()> {
         self.timing_tx.send(TimingMsg::Batch {
             rank: self.rank,
             batch_ms,
             step_count: self.local_step,
+            param_norm,
         }).map_err(|_| TensorError::new("timing channel disconnected"))
+    }
+
+    /// Compute the L2 norm of all model parameters.
+    ///
+    /// Uses `Tensor::foreach_norm` for a single batched CUDA kernel instead
+    /// of per-parameter norm calls. Returns the global L2 norm (sqrt of sum
+    /// of squared per-tensor norms). Used for NCCL divergence detection.
+    fn compute_param_norm(&self) -> Result<f64> {
+        let data: Vec<Tensor> = self.param_vars.iter().map(|v| v.data()).collect();
+        if data.is_empty() {
+            return Ok(0.0);
+        }
+        let norms = Tensor::foreach_norm(&data, 2.0)?;
+        let mut total_sq = 0.0f64;
+        for n in &norms {
+            let val: f64 = n.item()?;
+            total_sq += val * val;
+        }
+        Ok(total_sq.sqrt())
     }
 
     /// Send the final parameter snapshot on the dedicated channel before exiting.
@@ -770,7 +790,12 @@ impl<M: Module> GpuWorker<M> {
 
                 let (loss, ms) = self.train_step(&prefetched.tensors, train_fn)?;
                 total_loss += loss;
-                let _ = self.report_timing(ms);
+                let norm = if self.steps_since_avg % 10 == 0 {
+                    self.compute_param_norm().ok()
+                } else {
+                    None
+                };
+                let _ = self.report_timing(ms, norm);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }
@@ -816,7 +841,12 @@ impl<M: Module> GpuWorker<M> {
                     crate::tensor::cuda_reset_peak_stats_idx(idx);
                 }
 
-                let _ = self.report_timing(ms);
+                let norm = if self.steps_since_avg % 10 == 0 {
+                    self.compute_param_norm().ok()
+                } else {
+                    None
+                };
+                let _ = self.report_timing(ms, norm);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }
