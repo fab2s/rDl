@@ -391,12 +391,16 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
-    /// Perform in-place NCCL AllReduce(Avg) on this rank's parameters.
+    /// Perform weighted in-place NCCL AllReduce on this rank's parameters.
+    ///
+    /// Each rank pre-scales its parameters by `weight` (= steps_since_avg / total_steps),
+    /// then AllReduce(Sum) produces the FedAvg-style weighted average:
+    ///   w_new = sum(n_k * w_k) / sum(n_k)
     ///
     /// All ranks must process SyncNow concurrently for the collective to complete.
     /// Runs on `comm_stream` and records `copy_done` so the compute stream waits
     /// before the next forward.
-    fn sync_now_nccl(&self) -> Result<()> {
+    fn sync_now_nccl(&self, weight: f64) -> Result<()> {
         let comm = match &self.nccl_comm {
             Some(c) => c,
             None => return Ok(()), // No NCCL comm (CPU backend or single-GPU): no-op
@@ -407,8 +411,22 @@ impl<M: Module> GpuWorker<M> {
         let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
 
         if let Some(stream) = &self.comm_stream {
-            // AllReduce on comm_stream
-            comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream)?;
+            // Pre-scale params by this rank's weight, then AllReduce(Sum).
+            // Device synchronize guarantees all pending GPU work (training
+            // ops on compute_stream, any prior comm_stream work) is complete
+            // before we modify params, and that the scaling is visible to
+            // the AllReduce. No throughput cost: compute and AllReduce
+            // cannot overlap (compute_stream waits on copy_done).
+            {
+                let _no_grad = crate::autograd::NoGradGuard::new();
+                for t in &param_refs {
+                    t.mul_scalar_(weight).ok();
+                }
+            }
+            crate::tensor::cuda_synchronize(self.device.index());
+
+            // AllReduce(Sum) on comm_stream
+            comm.all_reduce_on_stream(&param_refs, ReduceOp::Sum, stream)?;
             // HOST-synchronize: block until AllReduce completes. Without
             // this, the host thread races ahead and reports timing from
             // batches whose GPU ops are queued behind the AllReduce. The
@@ -422,8 +440,15 @@ impl<M: Module> GpuWorker<M> {
                 ev.record_on(stream)?;
             }
         } else {
-            // CPU fallback (should not happen for NCCL backend, but handle gracefully)
-            comm.all_reduce(&param_refs, ReduceOp::Avg)?;
+            // CPU fallback (should not happen for NCCL backend, but handle gracefully).
+            // No stream ordering concern: all ops on default stream.
+            {
+                let _no_grad = crate::autograd::NoGradGuard::new();
+                for t in &param_refs {
+                    t.mul_scalar_(weight).ok();
+                }
+            }
+            comm.all_reduce(&param_refs, ReduceOp::Sum)?;
         }
 
         Ok(())
@@ -508,7 +533,7 @@ impl<M: Module> GpuWorker<M> {
     pub fn drain_until_shutdown(&mut self) {
         while let Ok(msg) = self.control_rx.recv() {
             match msg {
-                ControlMsg::SyncNow => {
+                ControlMsg::SyncNow { .. } => {
                     // Skip: peer may be dead, AllReduce would deadlock.
                     // The coordinator will stop triggering collectives
                     // once it processes our Exiting message.
@@ -533,9 +558,9 @@ impl<M: Module> GpuWorker<M> {
                 self.load_averaged(&avg)?;
                 self.steps_since_avg = 0;
             }
-            ControlMsg::SyncNow => {
-                crate::debug!("  ddp-worker: rank {} SyncNow (step={}, epoch={})", self.rank, self.local_step, self.current_epoch);
-                self.sync_now_nccl()?;
+            ControlMsg::SyncNow { weight } => {
+                crate::debug!("  ddp-worker: rank {} SyncNow weight={:.4} (step={}, epoch={})", self.rank, weight, self.local_step, self.current_epoch);
+                self.sync_now_nccl(weight)?;
                 crate::debug!("  ddp-worker: rank {} SyncNow done", self.rank);
                 self.steps_since_avg = 0;
                 // Bump local_step and send a timing ack so the coordinator's
@@ -560,7 +585,7 @@ impl<M: Module> GpuWorker<M> {
                         Ok(msg) => {
                             let releases = matches!(
                                 &msg,
-                                ControlMsg::SyncNow
+                                ControlMsg::SyncNow { .. }
                                     | ControlMsg::Update(_)
                                     | ControlMsg::Shutdown
                             );
@@ -684,7 +709,7 @@ impl<M: Module> GpuWorker<M> {
                 Ok(msg) => {
                     crate::debug!("  ddp-worker: rank {} wait_for_plan got {:?}", self.rank,
                         match &msg {
-                            ControlMsg::SyncNow => "SyncNow",
+                            ControlMsg::SyncNow { .. } => "SyncNow",
                             ControlMsg::Throttle => "Throttle",
                             ControlMsg::RequestParams => "RequestParams",
                             ControlMsg::Update(_) => "Update",

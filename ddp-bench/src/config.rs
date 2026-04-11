@@ -113,4 +113,6 @@ pub struct RunConfig {
     pub seed: u64,
     pub output_dir: String,
     pub monitor_port: Option<u16>,
+    /// Disable the divergence guardrail (let ElChe auto-tune alone).
+    pub no_guard: bool,
 }

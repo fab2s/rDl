@@ -39,9 +39,10 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     } else {
         String::new()
     };
+    let guard_note = if config.no_guard { ", no-guard" } else { "" };
     eprintln!(
-        "\n=== {} / {} ({} epochs, {} batches x {}{}) ===",
-        model_def.name, mode_str, config.epochs, config.batches_per_epoch, config.batch_size, lr_note,
+        "\n=== {} / {} ({} epochs, {} batches x {}{}{}) ===",
+        model_def.name, mode_str, config.epochs, config.batches_per_epoch, config.batch_size, lr_note, guard_note,
     );
 
     // Create dataset.  Virtual length = batches * batch_size so DataLoader
@@ -294,7 +295,7 @@ fn run_builder(
     let train_fn_ptr = model_def.train_fn;
     let lr = config.lr;
 
-    let handle = Ddp::builder(
+    let mut builder = Ddp::builder(
         move |dev| build_fn(dev),
         move |params: &[Parameter]| Adam::new(params, lr),
         move |model: &Box<dyn Module>, batch: &[Tensor]| -> Result<Variable> {
@@ -306,8 +307,13 @@ fn run_builder(
     .num_epochs(config.epochs)
     .policy(policy)
     .backend(backend)
-    .timeline(Arc::clone(timeline))
-    .run()?;
+    .timeline(Arc::clone(timeline));
+
+    if config.no_guard {
+        builder = builder.no_divergence_guard();
+    }
+
+    let handle = builder.run()?;
 
     let mut epoch_times = Vec::new();
     let mut final_loss = 0.0;

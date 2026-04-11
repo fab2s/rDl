@@ -41,6 +41,10 @@ jobs:
     description: NCCL cadence for all models
     options: { model: all, mode: nccl-cadence }
 
+  nccl-cadence-no-guard:
+    description: NCCL cadence without divergence guardrail
+    options: { model: all, mode: nccl-cadence, no-guard: true }
+
   validate:
     description: Check convergence against structured baselines
     options: { model: all, mode: all, validate: true, baseline: baselines/structured.json }

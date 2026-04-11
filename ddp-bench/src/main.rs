@@ -36,6 +36,7 @@ fn run() -> flodl::tensor::Result<()> {
     let mut tolerance: f64 = 0.15; // 15% relative tolerance
     let mut seed: u64 = 42;
     let mut lr_scale: Option<f64> = None;
+    let mut no_guard = false;
     let mut list = false;
     let mut do_report = false;
     let mut report_file: Option<String> = None;
@@ -103,6 +104,9 @@ fn run() -> flodl::tensor::Result<()> {
             "--lr-scale" => {
                 i += 1;
                 lr_scale = Some(args[i].parse().expect("invalid --lr-scale"));
+            }
+            "--no-guard" => {
+                no_guard = true;
             }
             "--help" | "-h" => {
                 print_help();
@@ -272,6 +276,7 @@ fn run() -> flodl::tensor::Result<()> {
                 seed,
                 output_dir: output.clone(),
                 monitor_port,
+                no_guard,
             };
 
             match harness::run_combo(model_def, mode, &run_config) {
@@ -354,6 +359,7 @@ fn print_help() {
     eprintln!("  --baseline <PATH>    Baseline file (default: baselines/baseline.json)");
     eprintln!("  --tolerance <F>      Validation tolerance, 0.0-1.0 (default: 0.15)");
     eprintln!("  --seed <N>           RNG seed (default: 42)");
+    eprintln!("  --no-guard           Disable divergence guardrail (ElChe auto-tune only)");
     eprintln!("  --report [FILE]      Analyze runs/ and print report (or save to FILE)");
     eprintln!("  --list               Show available models and modes");
     eprintln!("  --help               Show this help");

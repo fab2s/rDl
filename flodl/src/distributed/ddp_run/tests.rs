@@ -22,7 +22,7 @@ fn test_average_backend_variants() {
 fn test_control_msg_variants() {
     // Verify all variants are constructable
     let _req = ControlMsg::RequestParams;
-    let _sync = ControlMsg::SyncNow;
+    let _sync = ControlMsg::SyncNow { weight: 0.5 };
     let _throttle = ControlMsg::Throttle;
     let _start = ControlMsg::StartEpoch(EpochPlan {
         epoch: 0, partition_offset: 0, partition_size: 1000,
@@ -399,7 +399,7 @@ fn test_worker_handle_control_sync_now_noop() {
     let (mut worker, ch) = make_test_worker();
 
     // SyncNow is a no-op without NCCL (Phase 4)
-    ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+    ch.control_tx.send(ControlMsg::SyncNow { weight: 0.5 }).unwrap();
     let shutdown = worker.handle_control().unwrap();
     assert!(!shutdown);
 }
@@ -693,7 +693,7 @@ fn test_coordinator_trigger_nccl() {
     // Workers should receive SyncNow
     for rx in &h.control_rxs {
         match rx.recv().unwrap() {
-            ControlMsg::SyncNow => {}
+            ControlMsg::SyncNow { .. } => {}
             other => panic!("expected SyncNow, got {:?}", std::mem::discriminant(&other)),
         }
     }
@@ -824,7 +824,7 @@ fn test_coordinator_tick_sync_flow() {
 
     // Workers got SyncNow
     for rx in &h.control_rxs {
-        assert!(matches!(rx.recv().unwrap(), ControlMsg::SyncNow));
+        assert!(matches!(rx.recv().unwrap(), ControlMsg::SyncNow { .. }));
     }
 }
 
@@ -1051,7 +1051,7 @@ fn test_throttle_worker_unblocks_on_sync_now() {
     let (mut worker, ch) = make_test_worker();
 
     ch.control_tx.send(ControlMsg::Throttle).unwrap();
-    ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+    ch.control_tx.send(ControlMsg::SyncNow { weight: 0.5 }).unwrap();
 
     // handle_control processes Throttle (blocks on recv), then
     // SyncNow arrives and unblocks it.
@@ -2536,7 +2536,7 @@ fn test_drain_until_shutdown_skips_sync_now() {
     // Queue messages that would arrive during shutdown:
     // SyncNow (stale, from averaging triggered before our Exiting)
     // followed by Shutdown (from coordinator's shutdown_workers).
-    ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+    ch.control_tx.send(ControlMsg::SyncNow { weight: 0.5 }).unwrap();
     ch.control_tx.send(ControlMsg::Shutdown).unwrap();
 
     // drain_until_shutdown should skip SyncNow and exit on Shutdown.
@@ -2552,9 +2552,9 @@ fn test_drain_until_shutdown_handles_multiple_sync_now() {
     // our Exiting. All must be skipped.
     let (mut worker, ch) = make_test_worker();
 
-    ch.control_tx.send(ControlMsg::SyncNow).unwrap();
-    ch.control_tx.send(ControlMsg::SyncNow).unwrap();
-    ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+    ch.control_tx.send(ControlMsg::SyncNow { weight: 0.5 }).unwrap();
+    ch.control_tx.send(ControlMsg::SyncNow { weight: 0.5 }).unwrap();
+    ch.control_tx.send(ControlMsg::SyncNow { weight: 0.5 }).unwrap();
     ch.control_tx.send(ControlMsg::Shutdown).unwrap();
 
     worker.drain_until_shutdown();
@@ -2567,12 +2567,12 @@ fn test_drain_until_shutdown_handles_interleaved_messages() {
     // normally (not treated as shutdown signals).
     let (mut worker, ch) = make_test_worker();
 
-    ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+    ch.control_tx.send(ControlMsg::SyncNow { weight: 0.5 }).unwrap();
     ch.control_tx.send(ControlMsg::Checkpoint { version: 99 }).unwrap();
     ch.control_tx.send(ControlMsg::StartEpoch(EpochPlan {
         epoch: 5, partition_offset: 0, partition_size: 100,
     })).unwrap();
-    ch.control_tx.send(ControlMsg::SyncNow).unwrap();
+    ch.control_tx.send(ControlMsg::SyncNow { weight: 0.5 }).unwrap();
     ch.control_tx.send(ControlMsg::Shutdown).unwrap();
 
     worker.drain_until_shutdown();

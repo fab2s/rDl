@@ -624,9 +624,11 @@ pub enum ControlMsg {
     RequestParams,
     /// \[CPU path\] Deliver averaged parameters.
     Update(AveragedParams),
-    /// \[NCCL path\] Trigger in-place AllReduce on this worker's own params.
-    /// Worker runs AllReduce on comm_stream and records CudaEvent.
-    SyncNow,
+    /// \[NCCL path\] Trigger weighted in-place AllReduce on this worker's params.
+    /// Worker scales params by `weight` then AllReduce(Sum).
+    /// `weight = steps_since_avg[rank] / total_steps` so the average is
+    /// proportional to batches processed (FedAvg-style).
+    SyncNow { weight: f64 },
     /// Begin processing a new epoch with the given partition assignment.
     ///
     /// The coordinator computes partition sizes based on throughput ratios and

@@ -1194,8 +1194,17 @@ impl Coordinator {
         match self.backend {
             AverageBackend::Nccl => {
                 self.nccl_sync_start = Some(Instant::now());
-                for tx in &self.control_txs {
-                    let _ = tx.send(ControlMsg::SyncNow);
+                // Weighted averaging: each rank's contribution is proportional
+                // to the number of batches it processed since last sync.
+                let total_steps: usize = self.steps_since_avg.iter().sum();
+                for (rank, tx) in self.control_txs.iter().enumerate() {
+                    let weight = if total_steps > 0 {
+                        self.steps_since_avg[rank] as f64 / total_steps as f64
+                    } else {
+                        // Fallback: equal weight (shouldn't happen in practice).
+                        1.0 / self.world_size as f64
+                    };
+                    let _ = tx.send(ControlMsg::SyncNow { weight });
                 }
                 // Snapshot each rank's last seen worker step_count and
                 // mark unacknowledged. should_average() won't fire again
