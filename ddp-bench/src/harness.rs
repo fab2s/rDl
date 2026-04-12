@@ -122,7 +122,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             &mut monitor,
         ),
         DdpMode::Sync => run_sync(
-            model_def, dataset, config, actual_batches, real_data,
+            model_def, dataset, test_dataset, config, actual_batches, real_data,
             &timeline, &mut monitor,
         ),
         DdpMode::Builder { policy, backend } => run_builder(
@@ -130,6 +130,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             *policy,
             *backend,
             dataset,
+            test_dataset,
             config,
             &timeline,
             &mut monitor,
@@ -138,6 +139,12 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     timeline.stop();
+
+    // Rotate existing artifacts before overwriting.
+    rotate_artifact(&run_dir, "training.log");
+    rotate_artifact(&run_dir, "timeline.json");
+    rotate_artifact(&run_dir, "timeline.csv");
+    rotate_artifact(&run_dir, "timeline.html");
 
     // Save artifacts
     let _ = timeline.save_json(&format!("{run_dir}/timeline.json"));
@@ -377,15 +384,15 @@ fn run_solo(
                     Ok(if eval_samples > 0 { total_metric / eval_samples as f64 } else { 0.0 })
                 })?;
                 model.train();
-                let mut line = format!("epoch {epoch}: loss={final_loss:.6}, metric={avg:.4}");
+                let mut line = format!("epoch {epoch}: loss={final_loss:.6}, eval={avg:.4}");
                 line.push_str(&format_scalars(&scalars));
-                line.push_str(&format!(", time={epoch_ms:.0}ms"));
+                line.push_str(&format!(", time={:.1}s", epoch_ms / 1000.0));
                 eprintln!("    {line}");
                 log_lines.push(line);
             } else {
                 let mut line = format!("epoch {epoch}: loss={final_loss:.6}");
                 line.push_str(&format_scalars(&scalars));
-                line.push_str(&format!(", time={epoch_ms:.0}ms"));
+                line.push_str(&format!(", time={:.1}s", epoch_ms / 1000.0));
                 eprintln!("    {line}");
                 log_lines.push(line);
             }
@@ -440,9 +447,11 @@ fn run_solo(
 // ---------------------------------------------------------------------------
 
 /// Sync mode: Ddp::setup_with() with Graph.
+#[allow(clippy::too_many_arguments)]
 fn run_sync(
     model_def: &ModelDef,
     dataset: Arc<dyn flodl::data::BatchDataSet>,
+    test_dataset: Option<Arc<dyn flodl::data::BatchDataSet>>,
     config: &RunConfig,
     batches_per_epoch: usize,
     real_data: bool,
@@ -503,7 +512,7 @@ fn run_sync(
             let scalars = drain_epoch_scalars();
             let mut line = format!("epoch {epoch}: loss={final_loss:.6}");
             line.push_str(&format_scalars(&scalars));
-            line.push_str(&format!(", time={epoch_ms:.0}ms"));
+            line.push_str(&format!(", time={:.1}s", epoch_ms / 1000.0));
             eprintln!("    {line}");
             log_lines.push(line);
 
@@ -540,7 +549,7 @@ fn run_sync(
             let scalars = drain_epoch_scalars();
             let mut line = format!("epoch {epoch}: loss={final_loss:.6}");
             line.push_str(&format_scalars(&scalars));
-            line.push_str(&format!(", time={epoch_ms:.0}ms"));
+            line.push_str(&format!(", time={:.1}s", epoch_ms / 1000.0));
             eprintln!("    {line}");
             log_lines.push(line);
 
@@ -554,6 +563,31 @@ fn run_sync(
         }
     }
 
+    // Final evaluation on test set (same as solo mode).
+    if let Some(eval_fn) = model_def.eval_fn {
+        model.eval();
+        let eval_dataset = test_dataset.as_ref().unwrap_or(&dataset);
+        let eval_data = preload_full_dataset(eval_dataset.as_ref(), device)?;
+        let n = eval_data[0].shape()[0] as usize;
+        let bs = config.batch_size;
+        let avg = flodl::autograd::no_grad(|| -> Result<f64> {
+            let mut total_metric = 0.0;
+            let mut eval_samples = 0usize;
+            for batch_start in (0..n).step_by(bs) {
+                let end = (batch_start + bs).min(n);
+                if end - batch_start < bs { break; }
+                let batch = slice_batch(&eval_data, batch_start, end, device)?;
+                let metric = eval_fn(model.as_ref(), &batch)?;
+                total_metric += metric * (end - batch_start) as f64;
+                eval_samples += end - batch_start;
+            }
+            Ok(if eval_samples > 0 { total_metric / eval_samples as f64 } else { 0.0 })
+        })?;
+        let line = format!("final eval={avg:.4}");
+        eprintln!("    {line}");
+        log_lines.push(line);
+    }
+
     Ok((final_loss, epoch_times, log_lines))
 }
 
@@ -562,18 +596,20 @@ fn run_sync(
 // ---------------------------------------------------------------------------
 
 /// Builder mode: Ddp::builder() with thread-per-GPU.
-#[allow(clippy::borrowed_box, clippy::type_complexity)]
+#[allow(clippy::borrowed_box, clippy::type_complexity, clippy::too_many_arguments)]
 fn run_builder(
     model_def: &ModelDef,
     policy: ApplyPolicy,
     backend: AverageBackend,
     dataset: Arc<dyn flodl::data::BatchDataSet>,
+    test_dataset: Option<Arc<dyn flodl::data::BatchDataSet>>,
     config: &RunConfig,
     timeline: &Arc<Timeline>,
     monitor: &mut Monitor,
 ) -> Result<(f64, Vec<f64>, Vec<String>)> {
     let build_fn = model_def.build;
     let train_fn_ptr = model_def.train_fn;
+    let augment_fn = model_def.augment_fn;
     let opt_fn = model_def.optimizer;
     let lr = config.lr;
 
@@ -587,10 +623,15 @@ fn run_builder(
         build_fn,
         move |params: &[Parameter]| DynOptimizer(opt_fn(params, lr)),
         move |model: &Box<dyn Module>, batch: &[Tensor]| -> Result<Variable> {
-            train_fn_ptr(model.as_ref(), batch)
+            let batch = if let Some(aug) = augment_fn {
+                aug(batch)?
+            } else {
+                batch.to_vec()
+            };
+            train_fn_ptr(model.as_ref(), &batch)
         },
     )
-    .dataset(dataset)
+    .dataset(dataset.clone())
     .batch_size(config.batch_size)
     .num_epochs(config.epochs)
     .policy(policy)
@@ -619,7 +660,7 @@ fn run_builder(
             metrics.scalars.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let mut line = format!("epoch {}: loss={:.6}", metrics.epoch, metrics.avg_loss);
         line.push_str(&format_scalars(&scalars));
-        line.push_str(&format!(", time={:.0}ms", metrics.epoch_ms));
+        line.push_str(&format!(", time={:.1}s", metrics.epoch_ms / 1000.0));
         eprintln!("    {line}");
         log_lines.push(line);
         monitor.log(
@@ -629,7 +670,54 @@ fn run_builder(
         );
     }
 
-    let _state = handle.join()?;
+    let state = handle.join()?;
+
+    // Final evaluation: load averaged params into a fresh model, run eval_fn
+    // on the test set. This gives the same definitive metric as solo mode.
+    if let Some(eval_fn) = model_def.eval_fn {
+        let device = Device::CUDA(0);
+        let model = (model_def.build)(device)?;
+        let model_params = model.parameters();
+        let model_bufs = model.buffers();
+        eprintln!("  final eval: loading state ({} params, {} buffers -> model has {} params, {} buffers)",
+            state.params.len(), state.buffers.len(), model_params.len(), model_bufs.len());
+        // Load trained state into model.
+        {
+            let _no_grad = flodl::autograd::NoGradGuard::new();
+            for (param, src) in model_params.iter().zip(&state.params) {
+                param.variable.data().copy_(&src.to_device(device)?, false)?;
+            }
+        }
+        for (buf, src) in model_bufs.iter().zip(&state.buffers) {
+            buf.get().copy_(&src.to_device(device)?, false)?;
+        }
+        model.eval();
+
+        // Load test data (or fall back to training data).
+        let eval_dataset = test_dataset.as_ref().unwrap_or(&dataset);
+        let eval_data = preload_full_dataset(eval_dataset.as_ref(), device)?;
+        let n = eval_data[0].shape()[0] as usize;
+        let bs = config.batch_size;
+
+        let avg = flodl::autograd::no_grad(|| -> Result<f64> {
+            let mut total_metric = 0.0;
+            let mut eval_samples = 0usize;
+            for batch_start in (0..n).step_by(bs) {
+                let end = (batch_start + bs).min(n);
+                if end - batch_start < bs { break; }
+                let batch = slice_batch(&eval_data, batch_start, end, device)?;
+                let metric = eval_fn(model.as_ref(), &batch)?;
+                total_metric += metric * (end - batch_start) as f64;
+                eval_samples += end - batch_start;
+            }
+            Ok(if eval_samples > 0 { total_metric / eval_samples as f64 } else { 0.0 })
+        })?;
+
+        let line = format!("final eval={avg:.4}");
+        eprintln!("    {line}");
+        log_lines.push(line);
+    }
+
     Ok((final_loss, epoch_times, log_lines))
 }
 
@@ -656,4 +744,46 @@ fn format_scalars(scalars: &std::collections::BTreeMap<String, f64>) -> String {
         s.push_str(&format!(", {k}={v:.4}"));
     }
     s
+}
+
+/// Rotate an existing artifact file by appending a timestamp before the extension.
+/// e.g. `training.log` -> `training_2026-04-13_00-39-34.log`
+fn rotate_artifact(dir: &str, filename: &str) {
+    let path = format!("{dir}/{filename}");
+    if !std::path::Path::new(&path).exists() {
+        return;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Format as YYYY-MM-DD-HH-MM-SS (UTC) without chrono.
+    let s = secs;
+    let days = s / 86400;
+    let time = s % 86400;
+    let hh = time / 3600;
+    let mm = (time % 3600) / 60;
+    let ss = time % 60;
+    // Days since 1970-01-01 to (y, m, d) -- civil calendar algorithm.
+    let (y, m, d) = {
+        let z = days as i64 + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z.rem_euclid(146097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        (y, m, d)
+    };
+    let ts = format!("{y:04}-{m:02}-{d:02}-{hh:02}-{mm:02}-{ss:02}");
+    let (stem, ext) = filename.rsplit_once('.').unwrap_or((filename, ""));
+    let rotated = if ext.is_empty() {
+        format!("{dir}/{stem}_{ts}")
+    } else {
+        format!("{dir}/{stem}_{ts}.{ext}")
+    };
+    let _ = std::fs::rename(&path, &rotated);
 }

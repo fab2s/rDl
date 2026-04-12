@@ -1005,6 +1005,30 @@ impl Module for Graph {
         params
     }
 
+    fn buffers(&self) -> Vec<crate::nn::Buffer> {
+        let mut bufs = Vec::new();
+        let mut seen = HashSet::new();
+
+        for &ni in &self.order {
+            if let Some(ref module) = self.nodes[ni].module {
+                crate::nn::walk_modules_visited(
+                    module.as_ref(),
+                    &mut HashSet::new(),
+                    &mut |m: &dyn crate::nn::Module| {
+                        for b in m.buffers() {
+                            let ptr = Rc::as_ptr(&b.inner) as usize;
+                            if seen.insert(ptr) {
+                                bufs.push(b);
+                            }
+                        }
+                    },
+                );
+            }
+        }
+
+        bufs
+    }
+
     fn set_training(&self, training: bool) {
         let mut visited = HashSet::new();
         for &ni in &self.order {

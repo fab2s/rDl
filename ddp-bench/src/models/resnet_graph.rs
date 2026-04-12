@@ -53,7 +53,7 @@ fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
     let predicted = pred.data().argmax(-1, false)?;
     let correct: f64 = predicted.eq_tensor(&target.data())?.sum()?.item()?;
     let total = target.data().shape()[0] as f64;
-    flodl::record_scalar("accuracy", correct / total);
+    flodl::record_scalar("train_acc", correct / total);
 
     flodl::cross_entropy_loss(&pred, &target)
 }
