@@ -1,39 +1,54 @@
 //! Benchmark model definitions.
 //!
-//! Each model provides a factory for building on a given device,
-//! a synthetic dataset generator, a training closure, and default config.
+//! Each model reproduces a published architecture with known convergence
+//! curves, enabling verification against literature before DDP comparison.
 
-pub mod autoencoder;
-pub mod convnet;
-pub mod feedback;
-pub mod linear;
-pub mod lstm;
+pub mod char_rnn;
+pub mod conv_ae;
+pub mod gpt_nano;
+pub mod lenet;
+pub mod logistic;
 pub mod mlp;
-pub mod moe;
-pub mod residual;
-pub mod transformer;
+pub mod resnet;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use flodl::autograd::Variable;
 use flodl::data::BatchDataSet;
-use flodl::nn::Module;
+use flodl::nn::{Module, Optimizer, Parameter, Scheduler};
 use flodl::tensor::{Device, Result, Tensor};
 
 use crate::config::ModelDefaults;
 
+/// Dataset configuration passed to each model's dataset factory.
+#[allow(dead_code)]
+pub struct DatasetConfig {
+    pub seed: u64,
+    pub data_dir: PathBuf,
+    pub virtual_len: usize,
+    pub pool_size: usize,
+}
+
 /// A benchmark model definition.
+#[allow(clippy::type_complexity)]
 pub struct ModelDef {
     /// Short name (used in CLI and output paths).
     pub name: &'static str,
-    /// What this model tests in DDP context.
+    /// What this model tests (architecture + dataset + reference).
     pub description: &'static str,
     /// Build the model on a specific device.
     pub build: fn(Device) -> Result<Box<dyn Module>>,
-    /// Create a synthetic dataset.  Args: (seed, virtual_len, pool_size).
-    pub dataset: fn(u64, usize, usize) -> Result<Arc<dyn BatchDataSet>>,
+    /// Create the dataset for this model.
+    pub dataset: fn(&DatasetConfig) -> Result<Arc<dyn BatchDataSet>>,
     /// Training step: forward + loss. Returns the loss Variable.
     pub train_fn: fn(&dyn Module, &[Tensor]) -> Result<Variable>,
+    /// Optional evaluation metric (e.g. accuracy). Called after each epoch.
+    pub eval_fn: Option<fn(&dyn Module, &[Tensor]) -> Result<f64>>,
+    /// Create the optimizer for this model's parameters.
+    pub optimizer: fn(&[Parameter], f64) -> Box<dyn Optimizer>,
+    /// Optional LR scheduler factory. Args: (base_lr, total_batches, world_size).
+    pub scheduler: Option<fn(f64, usize, usize) -> Box<dyn Scheduler>>,
     /// Default configuration.
     pub defaults: ModelDefaults,
 }
@@ -41,15 +56,13 @@ pub struct ModelDef {
 /// All registered benchmark models.
 pub fn all_models() -> Vec<ModelDef> {
     vec![
-        linear::def(),
+        logistic::def(),
         mlp::def(),
-        convnet::def(),
-        lstm::def(),
-        transformer::def(),
-        autoencoder::def(),
-        residual::def(),
-        moe::def(),
-        feedback::def(),
+        lenet::def(),
+        resnet::def(),
+        char_rnn::def(),
+        gpt_nano::def(),
+        conv_ae::def(),
     ]
 }
 
@@ -61,14 +74,12 @@ pub fn find_model(name: &str) -> Option<ModelDef> {
 /// All model names.
 pub fn model_names() -> Vec<&'static str> {
     vec![
-        "linear",
+        "logistic",
         "mlp",
-        "convnet",
-        "lstm",
-        "transformer",
-        "autoencoder",
-        "residual",
-        "moe",
-        "feedback",
+        "lenet",
+        "resnet",
+        "char-rnn",
+        "gpt-nano",
+        "conv-ae",
     ]
 }

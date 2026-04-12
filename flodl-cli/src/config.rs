@@ -105,7 +105,7 @@ pub struct DdpConfig {
     /// "auto" or bool.
     pub progressive: Option<serde_json::Value>,
     pub max_grad_norm: Option<f64>,
-    pub auto_scale_lr: Option<bool>,
+    pub lr_scale_ratio: Option<f64>,
     pub snapshot_timeout: Option<u32>,
     pub checkpoint_every: Option<u32>,
     pub timeline: Option<bool>,
@@ -335,7 +335,7 @@ fn merge_ddp(base: &Option<DdpConfig>, over: &Option<DdpConfig>) -> DdpConfig {
         partition_ratios: merge_field!(base, over, partition_ratios),
         progressive: merge_field!(base, over, progressive),
         max_grad_norm: merge_field!(base, over, max_grad_norm),
-        auto_scale_lr: merge_field!(base, over, auto_scale_lr),
+        lr_scale_ratio: merge_field!(base, over, lr_scale_ratio),
         snapshot_timeout: merge_field!(base, over, snapshot_timeout),
         checkpoint_every: merge_field!(base, over, checkpoint_every),
         timeline: merge_field!(base, over, timeline),

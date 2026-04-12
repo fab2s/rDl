@@ -1,6 +1,7 @@
-//! Conv encoder-decoder on 64x64 images, MSE reconstruction.
+//! Convolutional autoencoder on MNIST.
 //!
-//! Tests symmetric gradient flow under parameter averaging.
+//! Ref: Standard PyTorch tutorials.
+//! Expected: MSE monotonically decreasing.
 
 use std::sync::Arc;
 
@@ -10,20 +11,23 @@ use flodl::nn::Module;
 use flodl::tensor::{Device, Result, Tensor};
 use flodl::*;
 
-use super::ModelDef;
+use super::{DatasetConfig, ModelDef};
 use crate::config::ModelDefaults;
-use crate::data::SyntheticDataSet;
+use flodl::nn::Adam;
 
 pub fn def() -> ModelDef {
     ModelDef {
-        name: "autoencoder",
-        description: "Conv autoencoder, tests symmetric gradient flow",
+        name: "conv-ae",
+        description: "Conv autoencoder on MNIST (PyTorch tutorial)",
         build: build_model,
         dataset: make_dataset,
         train_fn: train_step,
+        eval_fn: None, // loss is the metric
+        optimizer: |p, lr| Box::new(Adam::new(p, lr)),
+        scheduler: None,
         defaults: ModelDefaults {
             epochs: 5,
-            batches_per_epoch: 1000,
+            batches_per_epoch: 0, // full dataset
             batch_size: 64,
             lr: 0.001,
         },
@@ -31,10 +35,10 @@ pub fn def() -> ModelDef {
 }
 
 fn build_model(device: Device) -> Result<Box<dyn Module>> {
-    // Encoder: 3->64->128->256, stride 2 each, 64x64 -> 8x8
-    // Decoder: 256->128->64->3, stride 2 each, 8x8 -> 64x64
+    // Encoder: (1,28,28) -> (16,14,14) -> (32,7,7)
+    // Decoder: (32,7,7) -> (16,14,14) -> (1,28,28)
     let model = FlowBuilder::from(
-        Conv2d::configure(3, 64, 4)
+        Conv2d::configure(1, 16, 3)
             .with_stride(2)
             .with_padding(1)
             .on_device(device)
@@ -42,15 +46,7 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
     )
     .through(ReLU)
     .through(
-        Conv2d::configure(64, 128, 4)
-            .with_stride(2)
-            .with_padding(1)
-            .on_device(device)
-            .done()?,
-    )
-    .through(ReLU)
-    .through(
-        Conv2d::configure(128, 256, 4)
+        Conv2d::configure(16, 32, 3)
             .with_stride(2)
             .with_padding(1)
             .on_device(device)
@@ -59,41 +55,36 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
     .through(ReLU)
     // Decoder
     .through(
-        ConvTranspose2d::configure(256, 128, 4)
+        ConvTranspose2d::configure(32, 16, 3)
             .with_stride(2)
             .with_padding(1)
+            .with_output_padding(1)
             .on_device(device)
             .done()?,
     )
     .through(ReLU)
     .through(
-        ConvTranspose2d::configure(128, 64, 4)
+        ConvTranspose2d::configure(16, 1, 3)
             .with_stride(2)
             .with_padding(1)
+            .with_output_padding(1)
             .on_device(device)
             .done()?,
     )
-    .through(ReLU)
-    .through(
-        ConvTranspose2d::configure(64, 3, 4)
-            .with_stride(2)
-            .with_padding(1)
-            .on_device(device)
-            .done()?,
-    )
-    .through(Tanh)
+    .through(Sigmoid)
     .build()?;
     Ok(Box::new(model))
 }
 
-fn make_dataset(seed: u64, virtual_len: usize, pool_size: usize) -> Result<Arc<dyn BatchDataSet>> {
-    // 16 basis vectors; data lives on a low-rank subspace the autoencoder can learn
-    SyntheticDataSet::low_rank_reconstruction(seed, virtual_len, pool_size, 3, 64, 64, 16)
+fn make_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
+    let mnist = crate::download::ensure_mnist(&cfg.data_dir)?;
+    Ok(Arc::new(mnist))
 }
 
 fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+    // Autoencoder: input = target = images
     let input = Variable::new(batch[0].clone(), false);
-    let target = Variable::new(batch[1].clone(), false);
+    let target = Variable::new(batch[0].clone(), false);
     let pred = model.forward(&input)?;
     mse_loss(&pred, &target)
 }

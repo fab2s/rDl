@@ -1,7 +1,6 @@
-//! 2-layer MLP on MNIST.
+//! Logistic regression on MNIST.
 //!
-//! Ref: every DL textbook, PyTorch MNIST tutorial.
-//! Expected: ~97-98% accuracy @ 5 epochs.
+//! Ref: every ML textbook. Expected: ~92% accuracy @ 5 epochs.
 
 use std::sync::Arc;
 
@@ -17,8 +16,8 @@ use flodl::nn::Adam;
 
 pub fn def() -> ModelDef {
     ModelDef {
-        name: "mlp",
-        description: "2-layer MLP on MNIST (~97% acc)",
+        name: "logistic",
+        description: "Logistic regression on MNIST (~92% acc)",
         build: build_model,
         dataset: make_dataset,
         train_fn: train_step,
@@ -36,9 +35,7 @@ pub fn def() -> ModelDef {
 
 fn build_model(device: Device) -> Result<Box<dyn Module>> {
     let model = FlowBuilder::from(Flatten::default())
-        .through(Linear::on_device(784, 256, device)?)
-        .through(ReLU)
-        .through(Linear::on_device(256, 10, device)?)
+        .through(Linear::on_device(784, 10, device)?)
         .build()?;
     Ok(Box::new(model))
 }

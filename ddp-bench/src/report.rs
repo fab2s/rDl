@@ -274,10 +274,10 @@ fn speed_ratio(groups: &[(String, Vec<RunAnalysis>)]) -> Option<f64> {
     for (_, runs) in groups {
         let s0 = runs.iter().find(|r| r.mode == "solo-0");
         let s1 = runs.iter().find(|r| r.mode == "solo-1");
-        if let (Some(a), Some(b)) = (s0, s1) {
-            if a.total_ms > 0 {
-                ratios.push(b.total_ms as f64 / a.total_ms as f64);
-            }
+        if let (Some(a), Some(b)) = (s0, s1)
+            && a.total_ms > 0
+        {
+            ratios.push(b.total_ms as f64 / a.total_ms as f64);
         }
     }
     if ratios.is_empty() {

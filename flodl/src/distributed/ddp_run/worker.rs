@@ -79,6 +79,13 @@ pub struct GpuWorker<M: Module> {
     pub(super) current_epoch: usize,
     /// Queued epoch plan from coordinator (set if StartEpoch arrives during run_epoch_plan).
     pub(super) pending_plan: Option<EpochPlan>,
+    /// Cumulative total batches across all GPUs at last sync.
+    /// Updated by `SetGlobalStep` from the coordinator after averaging.
+    /// Workers compute per-batch LR as `scheduler.lr(global_step + steps_since_avg)`.
+    global_step: usize,
+    /// Per-batch LR scheduler. When set, the worker adjusts the optimizer's
+    /// learning rate before each `optimizer.step()`.
+    scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
 
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.
@@ -273,6 +280,8 @@ impl<M: Module> GpuWorker<M> {
             current_version: 0,
             current_epoch: 0,
             pending_plan: None,
+            global_step: 0,
+            scheduler: None,
             checkpoint_fn,
             prefetch,
             per_sample_bytes,
@@ -315,6 +324,14 @@ impl<M: Module> GpuWorker<M> {
     /// Scale the learning rate by a factor (for DDP linear scaling rule).
     pub fn scale_lr(&mut self, factor: f64) {
         self.optimizer.scale_lr(factor);
+    }
+
+    /// Attach a per-batch LR scheduler.
+    ///
+    /// When set, the worker computes `scheduler.lr(global_step + steps_since_avg)`
+    /// before each optimizer step, ensuring the LR tracks global training progress.
+    pub fn set_scheduler(&mut self, sched: Arc<dyn crate::nn::Scheduler>) {
+        self.scheduler = Some(sched);
     }
 
     /// A reference to the concrete model.
@@ -391,16 +408,12 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
-    /// Perform weighted in-place NCCL AllReduce on this rank's parameters.
-    ///
-    /// Each rank pre-scales its parameters by `weight` (= steps_since_avg / total_steps),
-    /// then AllReduce(Sum) produces the FedAvg-style weighted average:
-    ///   w_new = sum(n_k * w_k) / sum(n_k)
+    /// Perform in-place NCCL AllReduce(Avg) on this rank's parameters.
     ///
     /// All ranks must process SyncNow concurrently for the collective to complete.
     /// Runs on `comm_stream` and records `copy_done` so the compute stream waits
     /// before the next forward.
-    fn sync_now_nccl(&self, weight: f64) -> Result<()> {
+    fn sync_now_nccl(&self) -> Result<()> {
         let comm = match &self.nccl_comm {
             Some(c) => c,
             None => return Ok(()), // No NCCL comm (CPU backend or single-GPU): no-op
@@ -411,22 +424,8 @@ impl<M: Module> GpuWorker<M> {
         let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
 
         if let Some(stream) = &self.comm_stream {
-            // Pre-scale params by this rank's weight, then AllReduce(Sum).
-            // Device synchronize guarantees all pending GPU work (training
-            // ops on compute_stream, any prior comm_stream work) is complete
-            // before we modify params, and that the scaling is visible to
-            // the AllReduce. No throughput cost: compute and AllReduce
-            // cannot overlap (compute_stream waits on copy_done).
-            {
-                let _no_grad = crate::autograd::NoGradGuard::new();
-                for t in &param_refs {
-                    t.mul_scalar_(weight).ok();
-                }
-            }
-            crate::tensor::cuda_synchronize(self.device.index());
-
-            // AllReduce(Sum) on comm_stream
-            comm.all_reduce_on_stream(&param_refs, ReduceOp::Sum, stream)?;
+            // AllReduce on comm_stream
+            comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream)?;
             // HOST-synchronize: block until AllReduce completes. Without
             // this, the host thread races ahead and reports timing from
             // batches whose GPU ops are queued behind the AllReduce. The
@@ -440,15 +439,8 @@ impl<M: Module> GpuWorker<M> {
                 ev.record_on(stream)?;
             }
         } else {
-            // CPU fallback (should not happen for NCCL backend, but handle gracefully).
-            // No stream ordering concern: all ops on default stream.
-            {
-                let _no_grad = crate::autograd::NoGradGuard::new();
-                for t in &param_refs {
-                    t.mul_scalar_(weight).ok();
-                }
-            }
-            comm.all_reduce(&param_refs, ReduceOp::Sum)?;
+            // CPU fallback (should not happen for NCCL backend, but handle gracefully)
+            comm.all_reduce(&param_refs, ReduceOp::Avg)?;
         }
 
         Ok(())
@@ -500,6 +492,14 @@ impl<M: Module> GpuWorker<M> {
             }
         }
 
+        // Per-batch LR: scheduler tracks global progress.
+        // global_step = total batches at last sync, steps_since_avg = local
+        // batches since then. The LR reflects this worker's real position
+        // in the global schedule.
+        if let Some(ref sched) = self.scheduler {
+            self.optimizer.set_lr(sched.lr(self.global_step + self.steps_since_avg));
+        }
+
         // Optimizer step (GPU-local Adam, ~0.1ms fused kernel)
         self.optimizer.step()?;
         self.optimizer.zero_grad();
@@ -533,7 +533,7 @@ impl<M: Module> GpuWorker<M> {
     pub fn drain_until_shutdown(&mut self) {
         while let Ok(msg) = self.control_rx.recv() {
             match msg {
-                ControlMsg::SyncNow { .. } => {
+                ControlMsg::SyncNow => {
                     // Skip: peer may be dead, AllReduce would deadlock.
                     // The coordinator will stop triggering collectives
                     // once it processes our Exiting message.
@@ -558,9 +558,9 @@ impl<M: Module> GpuWorker<M> {
                 self.load_averaged(&avg)?;
                 self.steps_since_avg = 0;
             }
-            ControlMsg::SyncNow { weight } => {
-                crate::debug!("  ddp-worker: rank {} SyncNow weight={:.4} (step={}, epoch={})", self.rank, weight, self.local_step, self.current_epoch);
-                self.sync_now_nccl(weight)?;
+            ControlMsg::SyncNow => {
+                crate::debug!("  ddp-worker: rank {} SyncNow (step={}, epoch={})", self.rank, self.local_step, self.current_epoch);
+                self.sync_now_nccl()?;
                 crate::debug!("  ddp-worker: rank {} SyncNow done", self.rank);
                 self.steps_since_avg = 0;
                 // Bump local_step and send a timing ack so the coordinator's
@@ -585,7 +585,7 @@ impl<M: Module> GpuWorker<M> {
                         Ok(msg) => {
                             let releases = matches!(
                                 &msg,
-                                ControlMsg::SyncNow { .. }
+                                ControlMsg::SyncNow
                                     | ControlMsg::Update(_)
                                     | ControlMsg::Shutdown
                             );
@@ -597,6 +597,9 @@ impl<M: Module> GpuWorker<M> {
                         Err(_) => return Ok(true), // channel dead
                     }
                 }
+            }
+            ControlMsg::SetGlobalStep(step) => {
+                self.global_step = step;
             }
             ControlMsg::Checkpoint { version } => {
                 if let Some(ref f) = self.checkpoint_fn {
@@ -709,10 +712,11 @@ impl<M: Module> GpuWorker<M> {
                 Ok(msg) => {
                     crate::debug!("  ddp-worker: rank {} wait_for_plan got {:?}", self.rank,
                         match &msg {
-                            ControlMsg::SyncNow { .. } => "SyncNow",
+                            ControlMsg::SyncNow => "SyncNow",
                             ControlMsg::Throttle => "Throttle",
                             ControlMsg::RequestParams => "RequestParams",
                             ControlMsg::Update(_) => "Update",
+                            ControlMsg::SetGlobalStep(_) => "SetGlobalStep",
                             ControlMsg::Checkpoint { .. } => "Checkpoint",
                             ControlMsg::Shutdown => "Shutdown",
                             ControlMsg::StartEpoch(_) => "StartEpoch",

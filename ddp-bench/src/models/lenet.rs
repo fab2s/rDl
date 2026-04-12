@@ -1,7 +1,7 @@
-//! 2-layer MLP on MNIST.
+//! LeNet-5 on MNIST (modern variant with BN + ReLU).
 //!
-//! Ref: every DL textbook, PyTorch MNIST tutorial.
-//! Expected: ~97-98% accuracy @ 5 epochs.
+//! Ref: LeCun 1998 "Gradient-Based Learning Applied to Document Recognition".
+//! Expected: ~99% accuracy @ 5 epochs.
 
 use std::sync::Arc;
 
@@ -17,8 +17,8 @@ use flodl::nn::Adam;
 
 pub fn def() -> ModelDef {
     ModelDef {
-        name: "mlp",
-        description: "2-layer MLP on MNIST (~97% acc)",
+        name: "lenet",
+        description: "LeNet-5 on MNIST (~99% acc, LeCun 1998)",
         build: build_model,
         dataset: make_dataset,
         train_fn: train_step,
@@ -35,11 +35,28 @@ pub fn def() -> ModelDef {
 }
 
 fn build_model(device: Device) -> Result<Box<dyn Module>> {
-    let model = FlowBuilder::from(Flatten::default())
-        .through(Linear::on_device(784, 256, device)?)
-        .through(ReLU)
-        .through(Linear::on_device(256, 10, device)?)
-        .build()?;
+    // LeNet-5 modern variant: BN + ReLU instead of Tanh
+    // Input: [B, 1, 28, 28]
+    // Conv1: 1->6, 5x5 -> [B, 6, 24, 24] -> MaxPool -> [B, 6, 12, 12]
+    // Conv2: 6->16, 5x5 -> [B, 16, 8, 8] -> MaxPool -> [B, 16, 4, 4]
+    // Flatten: 16*4*4 = 256
+    let model = FlowBuilder::from(
+        Conv2d::configure(1, 6, 5).on_device(device).done()?,
+    )
+    .through(BatchNorm2d::on_device(6, device)?)
+    .through(ReLU)
+    .through(MaxPool2d::new(2))
+    .through(Conv2d::configure(6, 16, 5).on_device(device).done()?)
+    .through(BatchNorm2d::on_device(16, device)?)
+    .through(ReLU)
+    .through(MaxPool2d::new(2))
+    .through(Flatten::default())
+    .through(Linear::on_device(256, 120, device)?)
+    .through(ReLU)
+    .through(Linear::on_device(120, 84, device)?)
+    .through(ReLU)
+    .through(Linear::on_device(84, 10, device)?)
+    .build()?;
     Ok(Box::new(model))
 }
 

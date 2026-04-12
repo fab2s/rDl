@@ -40,8 +40,9 @@ pub fn config_to_args(resolved: &ResolvedConfig) -> Vec<String> {
         args.push("--partition-ratios".into());
         args.push(s.join(","));
     }
-    if d.auto_scale_lr == Some(false) {
-        args.push("--no-lr-scaling".into());
+    if let Some(ratio) = d.lr_scale_ratio {
+        args.push("--lr-scale-ratio".into());
+        args.push(format!("{ratio}"));
     }
     if d.timeline == Some(true) {
         args.push("--timeline".into());

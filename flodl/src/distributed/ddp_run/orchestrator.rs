@@ -144,12 +144,12 @@ impl DdpHandle {
         Self::launch(
             model_factory, optim_factory, train_fn,
             dataset, batch_size, num_epochs,
-            policy, backend, config, None, None,
+            policy, backend, config, None, None, None,
         )
     }
 
     /// Internal launcher shared by `auto_with` and the builder.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn launch<F, M, G, O, T>(
         model_factory: F,
         optim_factory: G,
@@ -162,6 +162,7 @@ impl DdpHandle {
         config: DdpRunConfig,
         checkpoint_fn: Option<CheckpointFn<M>>,
         epoch_fn: Option<EpochFn<M>>,
+        scheduler_fn: Option<Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -177,6 +178,7 @@ impl DdpHandle {
         // Single-GPU fallback: run on main thread, no coordinator
         if devices.len() < 2 {
             let dev = devices.first().copied().unwrap_or(Device::CPU);
+            let scheduler = scheduler_fn.map(|f| f(1));
             return Self::run_single(
                 &model_factory, &optim_factory, &train_fn,
                 dataset, batch_size, num_epochs, dev,
@@ -184,6 +186,7 @@ impl DdpHandle {
                 config.checkpoint_every,
                 epoch_fn,
                 config.max_grad_norm,
+                scheduler,
             );
         }
 
@@ -210,17 +213,17 @@ impl DdpHandle {
         let world_size = devices.len();
         let total_samples = dataset.len();
 
-        // Linear LR scaling: compensate for data partitioning across GPUs.
-        // Each GPU sees total_samples/world_size, so the effective batch size
-        // is batch_size * world_size. Scale LR proportionally (Goyal et al., 2017).
-        let lr_scale_factor = if config.auto_scale_lr && world_size > 1 {
-            let scale = world_size as f64;
+        // LR scaling: factor = 1.0 + (world_size - 1) * ratio.
+        // Compensates for the LR schedule advancing faster when global_step
+        // tracks all GPUs' batches. (Goyal et al., 2017 linear scaling rule.)
+        let lr_scale_factor = if world_size > 1 && config.lr_scale_ratio > 0.0 {
+            let factor = 1.0 + (world_size as f64 - 1.0) * config.lr_scale_ratio;
             crate::verbose!(
-                "  ddp: LR scaled by {world_size}x (effective batch size = {}). \
-                 Disable with .no_lr_scaling()",
-                batch_size * world_size,
+                "  ddp: LR scaled by {factor:.2}x (ratio={:.2}, world_size={world_size}). \
+                 Adjust with .lr_scale_ratio()",
+                config.lr_scale_ratio,
             );
-            scale
+            factor
         } else {
             1.0
         };
@@ -415,6 +418,7 @@ impl DdpHandle {
             .map_err(|e| TensorError::new(&format!("failed to spawn coordinator: {e}")))?;
 
         // Step 5: Spawn GPU worker threads
+        let scheduler = scheduler_fn.map(|f| f(world_size));
         let model_factory = Arc::new(model_factory);
         let optim_factory = Arc::new(optim_factory);
         let train_fn = Arc::new(train_fn);
@@ -436,6 +440,7 @@ impl DdpHandle {
             let fp_tx = worker_final_txs.remove(0);
             let ckpt_fn = checkpoint_fn.clone();
             let epoch_fn_w = epoch_fn.clone();
+            let scheduler_w = scheduler.clone();
             let shutdown_w = shutdown.clone();
 
             let worker_nccl = rank_comms[rank].take();
@@ -485,6 +490,11 @@ impl DdpHandle {
                         // Apply linear LR scaling for DDP.
                         if lr_scale > 1.0 {
                             worker.scale_lr(lr_scale);
+                        }
+
+                        // Attach per-batch LR scheduler (global step tracking).
+                        if let Some(ref sched) = scheduler_w {
+                            worker.set_scheduler(Arc::clone(sched));
                         }
 
                         // Training loop: coordinator-driven epochs.
@@ -589,6 +599,7 @@ impl DdpHandle {
         checkpoint_every: Option<usize>,
         epoch_fn: Option<EpochFn<M>>,
         max_grad_norm: Option<f64>,
+        scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M>,
@@ -656,6 +667,11 @@ impl DdpHandle {
             final_param_tx,
             control_rx,
         )?;
+
+        // Attach per-batch LR scheduler.
+        if let Some(sched) = scheduler {
+            worker.set_scheduler(sched);
+        }
 
         // Train directly on this thread (no coordinator, local epoch management)
         for epoch in 0..num_epochs {
@@ -1005,6 +1021,7 @@ impl DdpHandle {
 ///
 /// let state = handle.join()?; // blocks until training completes
 /// ```
+#[allow(clippy::type_complexity)]
 pub struct DdpBuilder<F, M, G, O, T>
 where
     F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1024,6 +1041,8 @@ where
     config: DdpRunConfig,
     checkpoint_fn: Option<CheckpointFn<M>>,
     epoch_fn: Option<EpochFn<M>>,
+    /// Factory receives `world_size`, returns the scheduler.
+    scheduler_fn: Option<Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>>,
     _phantom: PhantomData<(M, O)>,
 }
 
@@ -1147,17 +1166,15 @@ where
         self
     }
 
-    /// Disable automatic LR scaling by `world_size`.
+    /// Set the LR scaling ratio for multi-GPU training.
     ///
-    /// By default, flodl scales the learning rate by `world_size` to compensate
-    /// for data partitioning. Each GPU sees `total_samples / world_size` per
-    /// epoch, so the effective batch size is `batch_size * world_size`. The
-    /// linear scaling rule (Goyal et al., 2017) compensates by increasing LR.
+    /// Formula: `lr_factor = 1.0 + (world_size - 1) * ratio`.
     ///
-    /// Call this if you already handle LR scaling in your optimizer factory
-    /// or epoch callback.
-    pub fn no_lr_scaling(mut self) -> Self {
-        self.config = self.config.without_auto_scale_lr();
+    /// - `1.0` (default): full linear scaling (Goyal et al., 2017).
+    /// - `0.0`: no scaling.
+    /// - `0.5`: half linear scaling.
+    pub fn lr_scale_ratio(mut self, ratio: f64) -> Self {
+        self.config = self.config.with_lr_scale_ratio(ratio);
         self
     }
 
@@ -1174,16 +1191,39 @@ where
         self
     }
 
+    /// Attach a per-batch LR scheduler factory.
+    ///
+    /// The factory receives `world_size` so user-defined schedulers can
+    /// account for multi-GPU training (e.g. scale warmup duration).
+    ///
+    /// Each worker adjusts its optimizer's LR before every `optimizer.step()`:
+    ///
+    /// ```text
+    /// lr = scheduler.lr(global_step + steps_since_last_sync)
+    /// ```
+    ///
+    /// At each sync point, the coordinator broadcasts the updated global step
+    /// so all workers track the same schedule.
+    pub fn scheduler<S>(mut self, factory: S) -> Self
+    where
+        S: Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync + 'static,
+    {
+        self.scheduler_fn = Some(Box::new(factory));
+        self
+    }
+
     /// Set an epoch callback called at the start of each epoch inside each worker thread.
     ///
     /// Receives `(epoch, &mut GpuWorker<M>)`. Runs before [`run_epoch_plan`](GpuWorker::run_epoch_plan),
     /// so [`current_epoch()`](GpuWorker::current_epoch) is already correct.
     ///
-    /// Typical uses: learning rate schedules, noise curricula, dynamic loss weights.
+    /// Typical uses: noise curricula, dynamic loss weights.
+    /// For LR scheduling, prefer [`.scheduler()`](Self::scheduler) which
+    /// provides per-batch granularity with global step tracking.
     ///
     /// ```text
     /// .epoch_fn(move |epoch, worker| {
-    ///     worker.set_lr(scheduler.lr(epoch));
+    ///     // custom per-epoch logic
     /// })
     /// ```
     pub fn epoch_fn<E>(mut self, f: E) -> Self
@@ -1219,6 +1259,7 @@ where
             self.config,
             self.checkpoint_fn,
             self.epoch_fn,
+            self.scheduler_fn,
         )
     }
 }
@@ -1269,6 +1310,7 @@ impl DdpHandle {
             config: DdpRunConfig::new(),
             checkpoint_fn: None,
             epoch_fn: None,
+            scheduler_fn: None,
             _phantom: PhantomData,
         }
     }

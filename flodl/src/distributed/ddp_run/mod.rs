@@ -352,17 +352,19 @@ pub struct DdpRunConfig {
     ///
     /// Default: `None` (auto).
     pub max_overshoot: Option<usize>,
-    /// Automatically scale the learning rate by `world_size` to compensate
-    /// for data partitioning across GPUs. Default: `true`.
+    /// LR scaling ratio for multi-GPU training. Default: `1.0`.
     ///
-    /// In DDP, the dataset is split across workers so each GPU sees
-    /// `total_samples / world_size` per epoch. With gradient averaging,
-    /// the effective batch size is `batch_size * world_size`. The linear
-    /// scaling rule (Goyal et al.) compensates by scaling LR proportionally.
+    /// Controls how much the learning rate is scaled with `world_size`.
+    /// Formula: `lr_factor = 1.0 + (world_size - 1) * ratio`.
     ///
-    /// Set to `false` if you already account for multi-GPU LR scaling
-    /// in your optimizer factory or epoch callback.
-    pub auto_scale_lr: bool,
+    /// - `1.0` (default): full linear scaling (Goyal et al., 2017).
+    ///   With 2 GPUs, LR is doubled. Compensates for the LR schedule
+    ///   advancing faster when global_step counts all GPUs' batches.
+    /// - `0.0`: no scaling. Each GPU uses the base LR as-is.
+    /// - `0.5`: half linear scaling. With 2 GPUs, LR *= 1.5.
+    ///
+    /// Tune this if convergence degrades at higher GPU counts.
+    pub lr_scale_ratio: f64,
 }
 
 impl Default for DdpRunConfig {
@@ -388,7 +390,7 @@ impl DdpRunConfig {
             max_grad_norm: None,
             timeline: None,
             max_overshoot: None,
-            auto_scale_lr: true,
+            lr_scale_ratio: 1.0,
         }
     }
 
@@ -503,13 +505,12 @@ impl DdpRunConfig {
         self
     }
 
-    /// Disable automatic LR scaling by `world_size`.
+    /// Set the LR scaling ratio for multi-GPU training.
     ///
-    /// By default, flodl scales the learning rate by `world_size` to compensate
-    /// for the reduced per-GPU dataset partition. Call this if you already handle
-    /// LR scaling in your optimizer factory or epoch callback.
-    pub fn without_auto_scale_lr(mut self) -> Self {
-        self.auto_scale_lr = false;
+    /// Formula: `lr_factor = 1.0 + (world_size - 1) * ratio`.
+    /// Default: 1.0 (full linear scaling). Set to 0.0 to disable.
+    pub fn with_lr_scale_ratio(mut self, ratio: f64) -> Self {
+        self.lr_scale_ratio = ratio;
         self
     }
 }
@@ -624,11 +625,9 @@ pub enum ControlMsg {
     RequestParams,
     /// \[CPU path\] Deliver averaged parameters.
     Update(AveragedParams),
-    /// \[NCCL path\] Trigger weighted in-place AllReduce on this worker's params.
-    /// Worker scales params by `weight` then AllReduce(Sum).
-    /// `weight = steps_since_avg[rank] / total_steps` so the average is
-    /// proportional to batches processed (FedAvg-style).
-    SyncNow { weight: f64 },
+    /// \[NCCL path\] Trigger in-place AllReduce on this worker's own params.
+    /// Worker runs AllReduce on comm_stream and records CudaEvent.
+    SyncNow,
     /// Begin processing a new epoch with the given partition assignment.
     ///
     /// The coordinator computes partition sizes based on throughput ratios and
@@ -639,6 +638,12 @@ pub enum ControlMsg {
     /// Worker is too far ahead: block until the next real command arrives.
     /// Sent when the worker's batch lead exceeds `ElChe::max_batch_diff`.
     Throttle,
+    /// Update the worker's global step count after averaging.
+    ///
+    /// `global_step` = cumulative total batches across all GPUs up to this
+    /// sync point. Workers use this to compute per-batch LR:
+    /// `scheduler.lr(global_step + steps_since_avg)`.
+    SetGlobalStep(usize),
     /// Save a checkpoint from rank 0 after averaging.
     Checkpoint {
         /// Version number (averaging event count in multi-GPU, epoch in single-GPU).

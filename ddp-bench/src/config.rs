@@ -112,7 +112,6 @@ pub struct RunConfig {
     pub lr: f64,
     pub seed: u64,
     pub output_dir: String,
+    pub data_dir: std::path::PathBuf,
     pub monitor_port: Option<u16>,
-    /// Disable the divergence guardrail (let ElChe auto-tune alone).
-    pub no_guard: bool,
 }

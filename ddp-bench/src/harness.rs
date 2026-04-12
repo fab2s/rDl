@@ -6,11 +6,23 @@ use std::time::{Duration, Instant};
 use flodl::autograd::Variable;
 use flodl::distributed::{ApplyPolicy, AverageBackend, Ddp, DdpConfig};
 use flodl::monitor::{Monitor, Timeline};
-use flodl::nn::{Adam, Module, Optimizer, Parameter};
+use flodl::nn::{Module, Optimizer, Parameter};
 use flodl::tensor::{Device, Result, Tensor, TensorError};
 
 use crate::config::{DdpMode, RunConfig};
 use crate::models::ModelDef;
+
+/// Wrapper so `Box<dyn Optimizer>` satisfies the `O: Optimizer` bound
+/// in DDP generic closures.
+struct DynOptimizer(Box<dyn Optimizer>);
+
+
+impl Optimizer for DynOptimizer {
+    fn step(&mut self) -> Result<()> { self.0.step() }
+    fn zero_grad(&self) { self.0.zero_grad() }
+    fn lr(&self) -> f64 { self.0.lr() }
+    fn set_lr(&mut self, lr: f64) { self.0.set_lr(lr) }
+}
 
 /// Result of a single (model, mode) benchmark run.
 #[derive(Clone)]
@@ -39,22 +51,44 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     } else {
         String::new()
     };
-    let guard_note = if config.no_guard { ", no-guard" } else { "" };
-    eprintln!(
-        "\n=== {} / {} ({} epochs, {} batches x {}{}{}) ===",
-        model_def.name, mode_str, config.epochs, config.batches_per_epoch, config.batch_size, lr_note, guard_note,
-    );
 
-    // Create dataset.  Virtual length = batches * batch_size so DataLoader
-    // sees the right epoch size.  Physical pool is much smaller (POOL_MUL x
-    // batch_size); get_batch wraps indices via modulo.
+    // Create dataset.
     let load_start = Instant::now();
     let virtual_len = config.batches_per_epoch * config.batch_size;
     let pool_size = (config.batch_size * crate::data::POOL_MUL).min(virtual_len);
-    let dataset = (model_def.dataset)(config.seed, virtual_len, pool_size)?;
+    let dataset_cfg = crate::models::DatasetConfig {
+        seed: config.seed,
+        data_dir: config.data_dir.clone(),
+        virtual_len,
+        pool_size,
+    };
+    let dataset = (model_def.dataset)(&dataset_cfg)?;
     let load_ms = load_start.elapsed().as_millis();
+
+    // Real-data mode: batches_per_epoch == 0 means "use full dataset".
+    // Compute actual batches from dataset size.
+    let real_data = config.batches_per_epoch == 0;
+    let actual_batches = if real_data {
+        dataset.len() / config.batch_size
+    } else {
+        config.batches_per_epoch
+    };
+
     let preload_tag = if mode.requires_multi_gpu() { "cpu" } else { "gpu-preload" };
-    eprintln!("  data: pool={pool_size}, virtual={virtual_len}, mode={preload_tag} ({load_ms}ms)");
+    if real_data {
+        eprintln!(
+            "\n=== {} / {} ({} epochs, {} samples, {} batches x {}{}) ===",
+            model_def.name, mode_str, config.epochs, dataset.len(), actual_batches,
+            config.batch_size, lr_note,
+        );
+        eprintln!("  data: {} samples, mode={preload_tag} ({load_ms}ms)", dataset.len());
+    } else {
+        eprintln!(
+            "\n=== {} / {} ({} epochs, {} batches x {}{}) ===",
+            model_def.name, mode_str, config.epochs, actual_batches, config.batch_size, lr_note,
+        );
+        eprintln!("  data: pool={pool_size}, virtual={virtual_len}, mode={preload_tag} ({load_ms}ms)");
+    }
 
     // Start timeline AFTER data loading so measurements reflect training only.
     let timeline = Timeline::new(100);
@@ -75,10 +109,15 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             *gpu_idx,
             dataset,
             config,
+            actual_batches,
+            real_data,
             &timeline,
             &mut monitor,
         ),
-        DdpMode::Sync => run_sync(model_def, dataset, config, &timeline, &mut monitor),
+        DdpMode::Sync => run_sync(
+            model_def, dataset, config, actual_batches, real_data,
+            &timeline, &mut monitor,
+        ),
         DdpMode::Builder { policy, backend } => run_builder(
             model_def,
             *policy,
@@ -99,7 +138,13 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     let _ = timeline.save_html(&format!("{run_dir}/timeline.html"));
     monitor.finish();
 
-    let (final_loss, epoch_times) = result?;
+    let (final_loss, epoch_times, log_lines) = result?;
+
+    // Save training log
+    if !log_lines.is_empty() {
+        let log_path = format!("{run_dir}/training.log");
+        let _ = std::fs::write(&log_path, log_lines.join("\n") + "\n");
+    }
 
     // Clean up CUDA state between runs. NCCL communicators and cached
     // allocator blocks from the previous run can fragment VRAM or leave
@@ -136,12 +181,31 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         total_ms,
         timeline_summary: summary,
         epochs: config.epochs,
-        batches_per_epoch: config.batches_per_epoch,
+        batches_per_epoch: actual_batches,
         batch_size: config.batch_size,
     })
 }
 
-/// Preload a small pool of batches to GPU.  Returns `POOL_MUL` batches;
+// ---------------------------------------------------------------------------
+// Preloading
+// ---------------------------------------------------------------------------
+
+/// Preload entire dataset to GPU as bulk tensors.
+/// Returns one tensor per output group (e.g. [images, labels]).
+fn preload_full_dataset(
+    dataset: &dyn flodl::data::BatchDataSet,
+    device: Device,
+) -> Result<Vec<Tensor>> {
+    let n = dataset.len();
+    let indices: Vec<usize> = (0..n).collect();
+    let tensors = dataset.get_batch(&indices)?;
+    tensors
+        .into_iter()
+        .map(|t| t.to_device(device))
+        .collect::<Result<Vec<_>>>()
+}
+
+/// Preload a small pool of batches to GPU. Returns `POOL_MUL` batches;
 /// the training loop cycles through them via `batch_idx % pool.len()`.
 fn preload_gpu_batches(
     dataset: &dyn flodl::data::BatchDataSet,
@@ -163,125 +227,273 @@ fn preload_gpu_batches(
     Ok(pool)
 }
 
+/// Form a batch from bulk GPU tensors via index_select.
+fn slice_batch(gpu_data: &[Tensor], start: usize, end: usize, device: Device) -> Result<Vec<Tensor>> {
+    let idx: Vec<i64> = (start as i64..end as i64).collect();
+    let idx_tensor = Tensor::from_i64(&idx, &[idx.len() as i64], device)?;
+    gpu_data
+        .iter()
+        .map(|t| t.index_select(0, &idx_tensor))
+        .collect::<Result<Vec<_>>>()
+}
+
+// ---------------------------------------------------------------------------
+// Solo GPU
+// ---------------------------------------------------------------------------
+
 /// Solo GPU: no DDP, standard training loop.
+#[allow(clippy::too_many_arguments)]
 fn run_solo(
     model_def: &ModelDef,
     gpu_idx: usize,
     dataset: Arc<dyn flodl::data::BatchDataSet>,
     config: &RunConfig,
+    batches_per_epoch: usize,
+    real_data: bool,
     timeline: &Arc<Timeline>,
     monitor: &mut Monitor,
-) -> Result<(f64, Vec<f64>)> {
+) -> Result<(f64, Vec<f64>, Vec<String>)> {
     let device = Device::CUDA(gpu_idx as u8);
     let model = (model_def.build)(device)?;
     let params = model.parameters();
-    let mut optimizer = Adam::new(&params, config.lr);
+    let mut optimizer = (model_def.optimizer)(&params, config.lr);
+    // Per-batch scheduling: total_steps = batches * epochs (matches nanoGPT etc.).
+    // Solo: world_size=1.
+    let solo_batches = if real_data {
+        dataset.len() / config.batch_size
+    } else {
+        batches_per_epoch
+    };
+    let scheduler = model_def.scheduler.map(|f| f(config.lr, solo_batches * config.epochs, 1));
+    let mut global_batch: usize = 0;
+    let mut log_lines: Vec<String> = Vec::new();
     model.train();
-
-    // Preload batches to GPU -- training loop has zero data overhead.
-    let gpu_pool = preload_gpu_batches(dataset.as_ref(), device, config.batch_size)?;
-    let pool_len = gpu_pool.len();
 
     let mut epoch_times = Vec::with_capacity(config.epochs);
     let mut final_loss = 0.0;
 
-    for epoch in 0..config.epochs {
-        timeline.event(flodl::monitor::EventKind::EpochStart { epoch });
-        let epoch_start = Instant::now();
-        let mut total_loss = 0.0;
+    if real_data {
+        // Full-dataset mode: preload everything, iterate through all data.
+        let gpu_data = preload_full_dataset(dataset.as_ref(), device)?;
+        let n = gpu_data[0].shape()[0] as usize;
+        let bs = config.batch_size;
 
-        for batch_idx in 0..config.batches_per_epoch {
-            let batch = &gpu_pool[batch_idx % pool_len];
+        for epoch in 0..config.epochs {
+            timeline.event(flodl::monitor::EventKind::EpochStart { epoch });
+            let epoch_start = Instant::now();
+            let mut total_loss = 0.0;
+            let mut batch_count = 0;
 
-            let loss = (model_def.train_fn)(model.as_ref(), batch)?;
-            let loss_val = loss.item()?;
+            for batch_start in (0..n).step_by(bs) {
+                let end = (batch_start + bs).min(n);
+                if end - batch_start < bs { break; } // drop incomplete last batch
+                let batch = slice_batch(&gpu_data, batch_start, end, device)?;
 
-            optimizer.zero_grad();
-            loss.backward()?;
-            optimizer.step()?;
+                let loss = (model_def.train_fn)(model.as_ref(), &batch)?;
+                let loss_val = loss.item()?;
 
-            total_loss += loss_val;
+                if let Some(ref sched) = scheduler {
+                    optimizer.set_lr(sched.lr(global_batch));
+                }
+                optimizer.zero_grad();
+                loss.backward()?;
+                optimizer.step()?;
+
+                total_loss += loss_val;
+                batch_count += 1;
+                global_batch += 1;
+            }
+
+            let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
+            final_loss = if batch_count > 0 { total_loss / batch_count as f64 } else { 0.0 };
+            timeline.event(flodl::monitor::EventKind::EpochEnd {
+                epoch,
+                loss: final_loss,
+            });
+
+            // Eval metric (accuracy, etc.) if available
+            if let Some(eval_fn) = model_def.eval_fn {
+                model.eval();
+                let avg = flodl::autograd::no_grad(|| -> Result<f64> {
+                    let mut total_metric = 0.0;
+                    let mut eval_samples = 0usize;
+                    for batch_start in (0..n).step_by(bs) {
+                        let end = (batch_start + bs).min(n);
+                        if end - batch_start < bs { break; }
+                        let batch = slice_batch(&gpu_data, batch_start, end, device)?;
+                        let metric = eval_fn(model.as_ref(), &batch)?;
+                        total_metric += metric * (end - batch_start) as f64;
+                        eval_samples += end - batch_start;
+                    }
+                    Ok(if eval_samples > 0 { total_metric / eval_samples as f64 } else { 0.0 })
+                })?;
+                model.train();
+                let line = format!("epoch {epoch}: loss={final_loss:.6}, metric={avg:.4}");
+                eprintln!("    {line}");
+                log_lines.push(line);
+            } else {
+                let line = format!("epoch {epoch}: loss={final_loss:.6}");
+                eprintln!("    {line}");
+                log_lines.push(line);
+            }
+
+            monitor.log(epoch, epoch_start.elapsed(), &[("loss", final_loss)]);
+            epoch_times.push(epoch_ms);
         }
+    } else {
+        // Synthetic pool mode: preload small pool, recycle batches.
+        let gpu_pool = preload_gpu_batches(dataset.as_ref(), device, config.batch_size)?;
+        let pool_len = gpu_pool.len();
 
-        let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
-        final_loss = total_loss / config.batches_per_epoch as f64;
-        timeline.event(flodl::monitor::EventKind::EpochEnd {
-            epoch,
-            loss: final_loss,
-        });
+        for epoch in 0..config.epochs {
+            timeline.event(flodl::monitor::EventKind::EpochStart { epoch });
+            let epoch_start = Instant::now();
+            let mut total_loss = 0.0;
 
-        monitor.log(epoch, epoch_start.elapsed(), &[("loss", final_loss)]);
-        epoch_times.push(epoch_ms);
+            for batch_idx in 0..batches_per_epoch {
+                let batch = &gpu_pool[batch_idx % pool_len];
+
+                let loss = (model_def.train_fn)(model.as_ref(), batch)?;
+                let loss_val = loss.item()?;
+
+                if let Some(ref sched) = scheduler {
+                    optimizer.set_lr(sched.lr(global_batch));
+                }
+                optimizer.zero_grad();
+                loss.backward()?;
+                optimizer.step()?;
+
+                total_loss += loss_val;
+                global_batch += 1;
+            }
+
+            let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
+            final_loss = total_loss / batches_per_epoch as f64;
+            timeline.event(flodl::monitor::EventKind::EpochEnd {
+                epoch,
+                loss: final_loss,
+            });
+
+            monitor.log(epoch, epoch_start.elapsed(), &[("loss", final_loss)]);
+            epoch_times.push(epoch_ms);
+        }
     }
 
-    Ok((final_loss, epoch_times))
+    Ok((final_loss, epoch_times, log_lines))
 }
+
+// ---------------------------------------------------------------------------
+// Sync mode (Graph-based DDP)
+// ---------------------------------------------------------------------------
 
 /// Sync mode: Ddp::setup_with() with Graph.
 fn run_sync(
     model_def: &ModelDef,
     dataset: Arc<dyn flodl::data::BatchDataSet>,
     config: &RunConfig,
+    batches_per_epoch: usize,
+    real_data: bool,
     timeline: &Arc<Timeline>,
     monitor: &mut Monitor,
-) -> Result<(f64, Vec<f64>)> {
-    // Build as Graph (the build fn returns Box<dyn Module>, we need Graph)
+) -> Result<(f64, Vec<f64>, Vec<String>)> {
     let device = Device::CUDA(0);
     let model = (model_def.build)(device)?;
 
-    // Try to get the Graph reference for setup
     let graph = model
         .as_graph()
         .ok_or_else(|| TensorError::new("sync mode requires a Graph-based model"))?;
 
     let build_fn = model_def.build;
+    let opt_fn = model_def.optimizer;
     let lr = config.lr;
 
     Ddp::setup_with(
         graph,
         move |dev| -> Result<Box<dyn Module>> { build_fn(dev) },
-        move |params: &[Parameter]| Adam::new(params, lr),
+        move |params: &[Parameter]| DynOptimizer(opt_fn(params, lr)),
         DdpConfig::new().timeline(Arc::clone(timeline)),
     )?;
 
     monitor.watch(graph);
 
-    // Preload batches to GPU -- training loop has zero data overhead.
-    let gpu_pool = preload_gpu_batches(dataset.as_ref(), device, config.batch_size)?;
-    let pool_len = gpu_pool.len();
-
     let mut epoch_times = Vec::with_capacity(config.epochs);
     let mut final_loss = 0.0;
+    let mut log_lines: Vec<String> = Vec::new();
 
-    for epoch in 0..config.epochs {
-        let epoch_start = Instant::now();
-        let mut total_loss = 0.0;
+    if real_data {
+        let gpu_data = preload_full_dataset(dataset.as_ref(), device)?;
+        let n = gpu_data[0].shape()[0] as usize;
+        let bs = config.batch_size;
 
-        for batch_idx in 0..config.batches_per_epoch {
-            let batch = &gpu_pool[batch_idx % pool_len];
+        for epoch in 0..config.epochs {
+            let epoch_start = Instant::now();
+            let mut total_loss = 0.0;
+            let mut batch_count = 0;
 
-            let loss = (model_def.train_fn)(graph, batch)?;
-            let loss_val = loss.item()?;
+            for batch_start in (0..n).step_by(bs) {
+                let end = (batch_start + bs).min(n);
+                if end - batch_start < bs { break; }
+                let batch = slice_batch(&gpu_data, batch_start, end, device)?;
 
-            loss.backward()?;
-            graph.step()?;
+                let loss = (model_def.train_fn)(graph, &batch)?;
+                let loss_val = loss.item()?;
 
-            total_loss += loss_val;
+                loss.backward()?;
+                graph.step()?;
+
+                total_loss += loss_val;
+                batch_count += 1;
+            }
+
+            let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
+            final_loss = if batch_count > 0 { total_loss / batch_count as f64 } else { 0.0 };
+            log_lines.push(format!("epoch {epoch}: loss={final_loss:.6}"));
+
+            graph.record_scalar("loss", final_loss);
+            graph.flush(&[]);
+            monitor.log(epoch, epoch_start.elapsed(), graph);
+            epoch_times.push(epoch_ms);
         }
+    } else {
+        let gpu_pool = preload_gpu_batches(dataset.as_ref(), device, config.batch_size)?;
+        let pool_len = gpu_pool.len();
 
-        let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
-        final_loss = total_loss / config.batches_per_epoch as f64;
+        for epoch in 0..config.epochs {
+            let epoch_start = Instant::now();
+            let mut total_loss = 0.0;
 
-        graph.record_scalar("loss", final_loss);
-        graph.flush(&[]);
-        monitor.log(epoch, epoch_start.elapsed(), graph);
-        epoch_times.push(epoch_ms);
+            for batch_idx in 0..batches_per_epoch {
+                let batch = &gpu_pool[batch_idx % pool_len];
+
+                let loss = (model_def.train_fn)(graph, batch)?;
+                let loss_val = loss.item()?;
+
+                loss.backward()?;
+                graph.step()?;
+
+                total_loss += loss_val;
+            }
+
+            let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
+            final_loss = total_loss / batches_per_epoch as f64;
+            log_lines.push(format!("epoch {epoch}: loss={final_loss:.6}"));
+
+            graph.record_scalar("loss", final_loss);
+            graph.flush(&[]);
+            monitor.log(epoch, epoch_start.elapsed(), graph);
+            epoch_times.push(epoch_ms);
+        }
     }
 
-    Ok((final_loss, epoch_times))
+    Ok((final_loss, epoch_times, log_lines))
 }
 
+// ---------------------------------------------------------------------------
+// Builder mode (thread-per-GPU DDP)
+// ---------------------------------------------------------------------------
+
 /// Builder mode: Ddp::builder() with thread-per-GPU.
+#[allow(clippy::borrowed_box, clippy::type_complexity)]
 fn run_builder(
     model_def: &ModelDef,
     policy: ApplyPolicy,
@@ -290,14 +502,21 @@ fn run_builder(
     config: &RunConfig,
     timeline: &Arc<Timeline>,
     monitor: &mut Monitor,
-) -> Result<(f64, Vec<f64>)> {
+) -> Result<(f64, Vec<f64>, Vec<String>)> {
     let build_fn = model_def.build;
     let train_fn_ptr = model_def.train_fn;
+    let opt_fn = model_def.optimizer;
     let lr = config.lr;
 
+    // Per-batch scheduler factory: receives world_size from the framework
+    // so user-defined schedulers can account for multi-GPU training.
+    let batches_per_epoch = dataset.len() / config.batch_size;
+    let sched_factory = model_def.scheduler;
+    let sched_epochs = config.epochs;
+
     let mut builder = Ddp::builder(
-        move |dev| build_fn(dev),
-        move |params: &[Parameter]| Adam::new(params, lr),
+        build_fn,
+        move |params: &[Parameter]| DynOptimizer(opt_fn(params, lr)),
         move |model: &Box<dyn Module>, batch: &[Tensor]| -> Result<Variable> {
             train_fn_ptr(model.as_ref(), batch)
         },
@@ -309,18 +528,25 @@ fn run_builder(
     .backend(backend)
     .timeline(Arc::clone(timeline));
 
-    if config.no_guard {
-        builder = builder.no_divergence_guard();
+    if let Some(sf) = sched_factory {
+        let bpe = batches_per_epoch;
+        builder = builder.scheduler(move |world_size| {
+            let total_steps = bpe * sched_epochs;
+            Arc::from(sf(lr, total_steps, world_size))
+        });
     }
 
     let handle = builder.run()?;
 
     let mut epoch_times = Vec::new();
     let mut final_loss = 0.0;
+    let mut log_lines: Vec<String> = Vec::new();
 
     while let Some(metrics) = handle.next_metrics() {
         final_loss = metrics.avg_loss;
         epoch_times.push(metrics.epoch_ms);
+        let line = format!("epoch {}: loss={:.6}", metrics.epoch, metrics.avg_loss);
+        log_lines.push(line);
         monitor.log(
             metrics.epoch,
             Duration::from_millis(metrics.epoch_ms as u64),
@@ -329,5 +555,5 @@ fn run_builder(
     }
 
     let _state = handle.join()?;
-    Ok((final_loss, epoch_times))
+    Ok((final_loss, epoch_times, log_lines))
 }

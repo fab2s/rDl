@@ -57,8 +57,8 @@ scripts:
     run: cargo test --features cuda -- --nocapture --ignored --test-threads=1 cuda_graph
     docker: cuda
   cuda-clippy:
-    description: Lint with CUDA feature (including tests)
-    run: cargo clippy --features cuda --tests -- -W clippy::all
+    description: Lint with CUDA feature (including tests, workspace + ddp-bench)
+    run: cargo clippy --features cuda --tests -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features cuda -- -W clippy::all
     docker: cuda
   cuda-shell:
     description: Interactive shell in CUDA container

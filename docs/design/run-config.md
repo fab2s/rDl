@@ -173,7 +173,7 @@ Maps 1:1 to `DdpConfig` and `DdpRunConfig`.
 | partition_ratios | list/null | null | Explicit e.g. [0.7, 0.3], disables auto-balance |
 | progressive | auto/bool | auto | Chunk dispatch mode |
 | max_grad_norm | float/null | null | Per-rank L2 gradient clip before AllReduce |
-| auto_scale_lr | bool | true | Scale LR by world_size |
+| lr_scale_ratio | float | 1.0 | LR scaling ratio: factor = 1 + (world_size-1)*ratio |
 | snapshot_timeout | int | 5 | Seconds, CPU backend only |
 | checkpoint_every | int/null | null | Epochs between DDP checkpoints |
 | timeline | bool | false | Record timeline events |

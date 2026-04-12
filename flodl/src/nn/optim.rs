@@ -95,6 +95,7 @@ pub struct SGD {
     params: Vec<Variable>,
     lr: f64,
     momentum: f64,
+    weight_decay: f64,
     velocity: Vec<Option<crate::tensor::Tensor>>,
     groups: Vec<GroupMeta>,
 }
@@ -108,14 +109,22 @@ impl SGD {
             params: variables,
             lr,
             momentum,
+            weight_decay: 0.0,
             velocity,
             groups: vec![],
         }
     }
 
+    /// Set L2 weight decay (default 0.0). Applied as `grad += wd * param`
+    /// before the momentum update, matching PyTorch's SGD behavior.
+    pub fn weight_decay(mut self, wd: f64) -> Self {
+        self.weight_decay = wd;
+        self
+    }
+
     /// Create a builder for SGD with per-group learning rates.
     pub fn with_groups(momentum: f64) -> SGDBuilder {
-        SGDBuilder { momentum, groups: vec![] }
+        SGDBuilder { momentum, weight_decay: 0.0, groups: vec![] }
     }
 
     /// Current learning rate (base LR, or first group's LR).
@@ -136,6 +145,7 @@ impl SGD {
 /// Builder for SGD with per-group learning rates.
 pub struct SGDBuilder {
     momentum: f64,
+    weight_decay: f64,
     groups: Vec<(Vec<Variable>, f64)>,
 }
 
@@ -144,6 +154,12 @@ impl SGDBuilder {
     pub fn group(mut self, params: &[Parameter], lr: f64) -> Self {
         let vars: Vec<Variable> = params.iter().map(|p| p.variable.clone()).collect();
         self.groups.push((vars, lr));
+        self
+    }
+
+    /// Set L2 weight decay (default 0.0).
+    pub fn weight_decay(mut self, wd: f64) -> Self {
+        self.weight_decay = wd;
         self
     }
 
@@ -165,6 +181,7 @@ impl SGDBuilder {
             params: all_params,
             lr: base_lr,
             momentum: self.momentum,
+            weight_decay: self.weight_decay,
             velocity,
             groups,
         }
@@ -179,6 +196,14 @@ impl Optimizer for SGD {
                 if let Some(grad) = param.grad() {
                     let lr = self.lr_for_param(i);
                     let data = param.data().detach()?;
+
+                    // L2 weight decay: grad += wd * param (PyTorch convention)
+                    let grad = if self.weight_decay > 0.0 {
+                        grad.add(&data.mul_scalar(self.weight_decay)?)?
+                    } else {
+                        grad
+                    };
+
                     if self.momentum > 0.0 {
                         let v = match self.velocity[i].take() {
                             Some(v) => {
@@ -229,6 +254,7 @@ impl Stateful for SGD {
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
         write_f64_le(w, self.lr)?;
+        write_f64_le(w, self.weight_decay)?;
         for v in &self.velocity {
             write_tensor_state(w, v.as_ref())?;
         }
@@ -250,6 +276,7 @@ impl Stateful for SGD {
             )));
         }
         self.lr = read_f64_le(r)?;
+        self.weight_decay = read_f64_le(r)?;
         for (i, param) in self.params.iter().enumerate() {
             let dev = param.data().device();
             self.velocity[i] = read_tensor_state(r, dev)?;

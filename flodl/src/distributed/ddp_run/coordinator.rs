@@ -186,6 +186,10 @@ pub struct Coordinator {
     version: u64,
     /// Per-rank steps since last averaging.
     pub(super) steps_since_avg: Vec<usize>,
+    /// Cumulative total batches across all GPUs. Updated at each sync:
+    /// `global_step += sum(steps_since_avg)`. Broadcast to workers so they
+    /// can compute per-batch LR as `scheduler.lr(global_step + local_offset)`.
+    pub(super) global_step: usize,
 
     // Divergence monitoring (optional guardrail on top of ElChe)
     divergence_threshold: f64,
@@ -457,6 +461,7 @@ impl CoordinatorBuilder {
             el_che: self.el_che,
             version: 0,
             steps_since_avg: vec![0; self.world_size],
+            global_step: 0,
             divergence_threshold: self.divergence_threshold,
             divergence_guard: self.divergence_guard,
             calibrated: false,
@@ -1194,17 +1199,8 @@ impl Coordinator {
         match self.backend {
             AverageBackend::Nccl => {
                 self.nccl_sync_start = Some(Instant::now());
-                // Weighted averaging: each rank's contribution is proportional
-                // to the number of batches it processed since last sync.
-                let total_steps: usize = self.steps_since_avg.iter().sum();
-                for (rank, tx) in self.control_txs.iter().enumerate() {
-                    let weight = if total_steps > 0 {
-                        self.steps_since_avg[rank] as f64 / total_steps as f64
-                    } else {
-                        // Fallback: equal weight (shouldn't happen in practice).
-                        1.0 / self.world_size as f64
-                    };
-                    let _ = tx.send(ControlMsg::SyncNow { weight });
+                for tx in &self.control_txs {
+                    let _ = tx.send(ControlMsg::SyncNow);
                 }
                 // Snapshot each rank's last seen worker step_count and
                 // mark unacknowledged. should_average() won't fire again
@@ -1314,9 +1310,19 @@ impl Coordinator {
             }
         }
 
+        // Advance global step by total batches from all GPUs in this cycle.
+        let cycle_batches: usize = self.steps_since_avg.iter().sum();
+        self.global_step += cycle_batches;
+
+        // Broadcast new global step to all workers so they can compute
+        // per-batch LR as scheduler.lr(global_step + local_offset).
+        for tx in &self.control_txs {
+            let _ = tx.send(ControlMsg::SetGlobalStep(self.global_step));
+        }
+
         crate::verbose!(
-            "  ddp: NCCL averaging #{} complete (v{})",
-            self.avg_count, self.version
+            "  ddp: NCCL averaging #{} complete (v{}, global_step={})",
+            self.avg_count, self.version, self.global_step
         );
 
         for s in &mut self.steps_since_avg {
@@ -1493,9 +1499,20 @@ impl Coordinator {
             }
         }
 
+        // Advance global step by total batches from all GPUs at trigger time.
+        // Use snapshot (not current) counters -- batches during the averaging
+        // window belong to the next cycle.
+        let cycle_batches: usize = steps_snapshot.iter().sum();
+        self.global_step += cycle_batches;
+
+        // Broadcast new global step to all workers.
+        for tx in &self.control_txs {
+            let _ = tx.send(ControlMsg::SetGlobalStep(self.global_step));
+        }
+
         crate::verbose!(
-            "  ddp: CPU averaging #{} complete (v{}, {:.1}ms)",
-            self.avg_count, self.version, avg_ms
+            "  ddp: CPU averaging #{} complete (v{}, {:.1}ms, global_step={})",
+            self.avg_count, self.version, avg_ms, self.global_step
         );
 
         // Subtract snapshot from current counters. Residual = batches

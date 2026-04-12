@@ -31,6 +31,7 @@ pub struct SyntheticDataSet {
 
 // ── Structured data generators ─────────────────────────────────────────
 
+#[allow(dead_code, clippy::too_many_arguments)]
 impl SyntheticDataSet {
     // ── Linear: known linear mapping ───────────────────────────────────
 

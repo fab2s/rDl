@@ -292,8 +292,8 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
                 }
             }
         }
-        for (i, sum) in vram_sums.iter().enumerate() {
-            vram_stats[i].mean_allocated = sum / sample_count as u64;
+        for (vs, sum) in vram_stats.iter_mut().zip(vram_sums.iter()) {
+            vs.mean_allocated = sum / sample_count as u64;
         }
     }
 
@@ -359,8 +359,7 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
             .collect();
         // Loss: use the last EpochEnd for this epoch (most complete)
         let loss = epoch_ends.iter()
-            .filter(|(e, _, _)| *e == ep)
-            .last()
+            .rfind(|(e, _, _)| *e == ep)
             .map(|(_, l, _)| *l)
             .unwrap_or(0.0);
 
@@ -404,7 +403,7 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
     // First training event timestamp (skip startup idle)
     let first_training_t = tl.events.first().map(|e| e.t).unwrap_or(0);
 
-    for gpu_idx in 0..n_gpus {
+    for (gpu_idx, idle) in idle_by_cause.iter_mut().enumerate() {
         let device = gpu_idx as u8;
         let mut gap_start: Option<u64> = None;
 
@@ -419,7 +418,7 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
                 let duration = s.t.saturating_sub(start);
                 if duration >= MIN_GAP_MS {
                     let cause = classify_gap(start, s.t, first_training_t, &tl.events);
-                    accumulate_cause(&mut idle_by_cause[gpu_idx], &cause, duration as f64);
+                    accumulate_cause(idle, &cause, duration as f64);
                     all_gaps.push(IdleGap {
                         device,
                         start_ms: start,
@@ -432,29 +431,29 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
         }
 
         // Trailing gap
-        if let Some(start) = gap_start {
-            if let Some(last) = tl.samples.last() {
-                let duration = last.t.saturating_sub(start);
-                if duration >= MIN_GAP_MS {
-                    let cause = classify_gap(start, last.t, first_training_t, &tl.events);
-                    accumulate_cause(&mut idle_by_cause[gpu_idx], &cause, duration as f64);
-                    all_gaps.push(IdleGap {
-                        device,
-                        start_ms: start,
-                        end_ms: last.t,
-                        duration_ms: duration,
-                        cause,
-                    });
-                }
+        if let Some(start) = gap_start
+            && let Some(last) = tl.samples.last()
+        {
+            let duration = last.t.saturating_sub(start);
+            if duration >= MIN_GAP_MS {
+                let cause = classify_gap(start, last.t, first_training_t, &tl.events);
+                accumulate_cause(idle, &cause, duration as f64);
+                all_gaps.push(IdleGap {
+                    device,
+                    start_ms: start,
+                    end_ms: last.t,
+                    duration_ms: duration,
+                    cause,
+                });
             }
         }
 
         // Compute total
-        idle_by_cause[gpu_idx].total_ms = idle_by_cause[gpu_idx].epoch_boundary_ms
-            + idle_by_cause[gpu_idx].sync_ms
-            + idle_by_cause[gpu_idx].cpu_avg_ms
-            + idle_by_cause[gpu_idx].startup_ms
-            + idle_by_cause[gpu_idx].unexplained_ms;
+        idle.total_ms = idle.epoch_boundary_ms
+            + idle.sync_ms
+            + idle.cpu_avg_ms
+            + idle.startup_ms
+            + idle.unexplained_ms;
     }
 
     // batches_per_sync: caller should set this from run config, but we can
