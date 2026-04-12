@@ -79,6 +79,13 @@ pub struct GpuWorker<M: Module> {
     pub(super) current_epoch: usize,
     /// Queued epoch plan from coordinator (set if StartEpoch arrives during run_epoch_plan).
     pub(super) pending_plan: Option<EpochPlan>,
+    /// Cumulative total batches across all GPUs at last sync.
+    /// Updated by `SetGlobalStep` from the coordinator after averaging.
+    /// Workers compute per-batch LR as `scheduler.lr(global_step + steps_since_avg)`.
+    global_step: usize,
+    /// Per-batch LR scheduler. When set, the worker adjusts the optimizer's
+    /// learning rate before each `optimizer.step()`.
+    scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
 
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.
@@ -96,6 +103,8 @@ pub struct GpuWorker<M: Module> {
     activation_peak_bytes: usize,
     /// Maximum gradient norm for clipping (None = no clipping).
     max_grad_norm: Option<f64>,
+    /// Optional system timeline for event injection.
+    timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
 }
 
 /// Channels bundle returned by [`GpuWorker::channels`] for wiring into the coordinator.
@@ -271,11 +280,14 @@ impl<M: Module> GpuWorker<M> {
             current_version: 0,
             current_epoch: 0,
             pending_plan: None,
+            global_step: 0,
+            scheduler: None,
             checkpoint_fn,
             prefetch,
             per_sample_bytes,
             activation_peak_bytes: 0,
             max_grad_norm: config.max_grad_norm,
+            timeline: config.timeline.clone(),
         })
     }
 
@@ -307,6 +319,19 @@ impl<M: Module> GpuWorker<M> {
     /// Set the learning rate on this worker's optimizer.
     pub fn set_lr(&mut self, lr: f64) {
         self.optimizer.set_lr(lr);
+    }
+
+    /// Scale the learning rate by a factor (for DDP linear scaling rule).
+    pub fn scale_lr(&mut self, factor: f64) {
+        self.optimizer.scale_lr(factor);
+    }
+
+    /// Attach a per-batch LR scheduler.
+    ///
+    /// When set, the worker computes `scheduler.lr(global_step + steps_since_avg)`
+    /// before each optimizer step, ensuring the LR tracks global training progress.
+    pub fn set_scheduler(&mut self, sched: Arc<dyn crate::nn::Scheduler>) {
+        self.scheduler = Some(sched);
     }
 
     /// A reference to the concrete model.
@@ -399,8 +424,16 @@ impl<M: Module> GpuWorker<M> {
         let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
 
         if let Some(stream) = &self.comm_stream {
-            // AllReduce on comm_stream (non-blocking on host)
+            // AllReduce on comm_stream
             comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream)?;
+            // HOST-synchronize: block until AllReduce completes. Without
+            // this, the host thread races ahead and reports timing from
+            // batches whose GPU ops are queued behind the AllReduce. The
+            // coordinator sees those phantom batches as real progress and
+            // floods SyncNow, deadlocking the GPU comm streams.
+            // No throughput loss: compute_stream already waits on
+            // copy_done, so AllReduce and compute can't overlap.
+            stream.synchronize()?;
             // Record event so compute_stream waits before next forward
             if let Some(ev) = &self.copy_done {
                 ev.record_on(stream)?;
@@ -457,6 +490,14 @@ impl<M: Module> GpuWorker<M> {
             if !params.is_empty() {
                 Tensor::clip_grad_norm_fused(&params, max_norm)?;
             }
+        }
+
+        // Per-batch LR: scheduler tracks global progress.
+        // global_step = total batches at last sync, steps_since_avg = local
+        // batches since then. The LR reflects this worker's real position
+        // in the global schedule.
+        if let Some(ref sched) = self.scheduler {
+            self.optimizer.set_lr(sched.lr(self.global_step + self.steps_since_avg));
         }
 
         // Optimizer step (GPU-local Adam, ~0.1ms fused kernel)
@@ -518,8 +559,17 @@ impl<M: Module> GpuWorker<M> {
                 self.steps_since_avg = 0;
             }
             ControlMsg::SyncNow => {
+                crate::debug!("  ddp-worker: rank {} SyncNow (step={}, epoch={})", self.rank, self.local_step, self.current_epoch);
                 self.sync_now_nccl()?;
+                crate::debug!("  ddp-worker: rank {} SyncNow done", self.rank);
                 self.steps_since_avg = 0;
+                // Bump local_step and send a timing ack so the coordinator's
+                // nccl_ack mechanism sees step_count > snapshot. Without this,
+                // a SyncNow processed in wait_for_epoch_plan (no batches to
+                // train afterward) leaves nccl_ack permanently false, blocking
+                // all future should_average() calls.
+                self.local_step += 1;
+                let _ = self.report_timing(0.0, None, 0.0);
             }
             ControlMsg::StartEpoch(plan) => {
                 self.pending_plan = Some(plan);
@@ -548,6 +598,9 @@ impl<M: Module> GpuWorker<M> {
                     }
                 }
             }
+            ControlMsg::SetGlobalStep(step) => {
+                self.global_step = step;
+            }
             ControlMsg::Checkpoint { version } => {
                 if let Some(ref f) = self.checkpoint_fn {
                     if let Err(e) = f(version, &self.model) {
@@ -561,12 +614,33 @@ impl<M: Module> GpuWorker<M> {
     }
 
     /// Send a timing report to the coordinator.
-    pub fn report_timing(&self, batch_ms: f64) -> Result<()> {
+    pub fn report_timing(&self, batch_ms: f64, param_norm: Option<f64>, batch_loss: f64) -> Result<()> {
         self.timing_tx.send(TimingMsg::Batch {
             rank: self.rank,
             batch_ms,
             step_count: self.local_step,
+            param_norm,
+            batch_loss,
         }).map_err(|_| TensorError::new("timing channel disconnected"))
+    }
+
+    /// Compute the L2 norm of all model parameters.
+    ///
+    /// Uses `Tensor::foreach_norm` for a single batched CUDA kernel instead
+    /// of per-parameter norm calls. Returns the global L2 norm (sqrt of sum
+    /// of squared per-tensor norms). Used for NCCL divergence detection.
+    fn compute_param_norm(&self) -> Result<f64> {
+        let data: Vec<Tensor> = self.param_vars.iter().map(|v| v.data()).collect();
+        if data.is_empty() {
+            return Ok(0.0);
+        }
+        let norms = Tensor::foreach_norm(&data, 2.0)?;
+        let mut total_sq = 0.0f64;
+        for n in &norms {
+            let val: f64 = n.item()?;
+            total_sq += val * val;
+        }
+        Ok(total_sq.sqrt())
     }
 
     /// Send the final parameter snapshot on the dedicated channel before exiting.
@@ -620,17 +694,34 @@ impl<M: Module> GpuWorker<M> {
     /// to prevent NCCL deadlock while waiting between epochs.
     /// Returns `Some(plan)` for the next epoch, or `None` on Shutdown/disconnect.
     pub fn wait_for_epoch_plan(&mut self) -> Result<Option<EpochPlan>> {
+        crate::debug!("  ddp-worker: rank {} waiting for plan (step={})", self.rank, self.local_step);
         loop {
             // Check if a plan was queued by dispatch_control (e.g. StartEpoch
             // arrived during Throttle handler). Must be checked each iteration,
             // not just at entry, because dispatch_control may set it mid-loop.
             if let Some(plan) = self.pending_plan.take() {
+                crate::debug!("  ddp-worker: rank {} got plan (pending) epoch={}", self.rank, plan.epoch);
                 return Ok(Some(plan));
             }
             match self.control_rx.recv() {
-                Ok(ControlMsg::StartEpoch(plan)) => return Ok(Some(plan)),
+                Ok(ControlMsg::StartEpoch(plan)) => {
+                    crate::debug!("  ddp-worker: rank {} got plan epoch={}", self.rank, plan.epoch);
+                    return Ok(Some(plan));
+                }
                 Ok(ControlMsg::Shutdown) => return Ok(None),
                 Ok(msg) => {
+                    crate::debug!("  ddp-worker: rank {} wait_for_plan got {:?}", self.rank,
+                        match &msg {
+                            ControlMsg::SyncNow => "SyncNow",
+                            ControlMsg::Throttle => "Throttle",
+                            ControlMsg::RequestParams => "RequestParams",
+                            ControlMsg::Update(_) => "Update",
+                            ControlMsg::SetGlobalStep(_) => "SetGlobalStep",
+                            ControlMsg::Checkpoint { .. } => "Checkpoint",
+                            ControlMsg::Shutdown => "Shutdown",
+                            ControlMsg::StartEpoch(_) => "StartEpoch",
+                        }
+                    );
                     if self.dispatch_control(msg)? {
                         return Ok(None); // Shutdown consumed by handler (e.g. Throttle)
                     }
@@ -718,6 +809,9 @@ impl<M: Module> GpuWorker<M> {
             false
         };
 
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::EpochStart { epoch: plan.epoch });
+        }
         let epoch_start = Instant::now();
         let mut total_loss = 0.0;
 
@@ -737,7 +831,15 @@ impl<M: Module> GpuWorker<M> {
             }
 
             // Consume prefetched batches as they become ready
+            let mut batch_done = 0usize;
             for _ in 0..num_batches {
+                // Process control messages (SyncNow, Throttle) BEFORE blocking
+                // on prefetch. Without this, a SyncNow arriving while the worker
+                // is setting up a new chunk deadlocks: the peer enters AllReduce
+                // but this worker is stuck in batch_rx.recv().
+                if self.handle_control()? {
+                    return Ok(true);
+                }
                 let prefetched = batch_rx.recv()
                     .map_err(|_| TensorError::new("prefetch channel closed"))??;
 
@@ -750,12 +852,19 @@ impl<M: Module> GpuWorker<M> {
                 }
 
                 let (loss, ms) = self.train_step(&prefetched.tensors, train_fn)?;
+                batch_done += 1;
                 total_loss += loss;
-                let _ = self.report_timing(ms);
+                let norm = if self.steps_since_avg % 10 == 0 {
+                    self.compute_param_norm().ok()
+                } else {
+                    None
+                };
+                let _ = self.report_timing(ms, norm, loss);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }
             }
+            crate::debug!("  ddp-worker: rank {} epoch {} chunk done ({} batches)", self.rank, plan.epoch, batch_done);
         } else {
             // Sync path: load one batch at a time, move to device if needed.
             // Used for CPU devices, or CUDA when VRAM is too tight for prefetch.
@@ -797,7 +906,12 @@ impl<M: Module> GpuWorker<M> {
                     crate::tensor::cuda_reset_peak_stats_idx(idx);
                 }
 
-                let _ = self.report_timing(ms);
+                let norm = if self.steps_since_avg % 10 == 0 {
+                    self.compute_param_norm().ok()
+                } else {
+                    None
+                };
+                let _ = self.report_timing(ms, norm, loss);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }
@@ -805,11 +919,14 @@ impl<M: Module> GpuWorker<M> {
         }
 
         let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
-        let _ = self.report_epoch(
-            total_loss / num_batches as f64,
-            num_batches,
-            epoch_ms,
-        );
+        let avg_loss = total_loss / num_batches as f64;
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::EpochEnd {
+                epoch: plan.epoch,
+                loss: avg_loss,
+            });
+        }
+        let _ = self.report_epoch(avg_loss, num_batches, epoch_ms);
 
         Ok(false)
     }

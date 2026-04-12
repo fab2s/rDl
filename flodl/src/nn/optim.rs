@@ -15,12 +15,18 @@ pub trait Optimizer {
     fn step(&mut self) -> Result<()>;
     /// Reset all parameter gradients to zero.
     fn zero_grad(&self);
+    /// Current learning rate (group 0 for grouped optimizers).
+    fn lr(&self) -> f64;
     /// Update the learning rate (all groups if grouped).
     fn set_lr(&mut self, lr: f64);
     /// Set learning rate for a specific parameter group (0-indexed).
     /// Falls back to `set_lr` for single-group optimizers.
     fn set_group_lr(&mut self, _group: usize, lr: f64) {
         self.set_lr(lr);
+    }
+    /// Multiply the learning rate by a factor (all groups).
+    fn scale_lr(&mut self, factor: f64) {
+        self.set_lr(self.lr() * factor);
     }
 }
 
@@ -89,6 +95,7 @@ pub struct SGD {
     params: Vec<Variable>,
     lr: f64,
     momentum: f64,
+    weight_decay: f64,
     velocity: Vec<Option<crate::tensor::Tensor>>,
     groups: Vec<GroupMeta>,
 }
@@ -102,14 +109,22 @@ impl SGD {
             params: variables,
             lr,
             momentum,
+            weight_decay: 0.0,
             velocity,
             groups: vec![],
         }
     }
 
+    /// Set L2 weight decay (default 0.0). Applied as `grad += wd * param`
+    /// before the momentum update, matching PyTorch's SGD behavior.
+    pub fn weight_decay(mut self, wd: f64) -> Self {
+        self.weight_decay = wd;
+        self
+    }
+
     /// Create a builder for SGD with per-group learning rates.
     pub fn with_groups(momentum: f64) -> SGDBuilder {
-        SGDBuilder { momentum, groups: vec![] }
+        SGDBuilder { momentum, weight_decay: 0.0, groups: vec![] }
     }
 
     /// Current learning rate (base LR, or first group's LR).
@@ -130,6 +145,7 @@ impl SGD {
 /// Builder for SGD with per-group learning rates.
 pub struct SGDBuilder {
     momentum: f64,
+    weight_decay: f64,
     groups: Vec<(Vec<Variable>, f64)>,
 }
 
@@ -138,6 +154,12 @@ impl SGDBuilder {
     pub fn group(mut self, params: &[Parameter], lr: f64) -> Self {
         let vars: Vec<Variable> = params.iter().map(|p| p.variable.clone()).collect();
         self.groups.push((vars, lr));
+        self
+    }
+
+    /// Set L2 weight decay (default 0.0).
+    pub fn weight_decay(mut self, wd: f64) -> Self {
+        self.weight_decay = wd;
         self
     }
 
@@ -159,6 +181,7 @@ impl SGDBuilder {
             params: all_params,
             lr: base_lr,
             momentum: self.momentum,
+            weight_decay: self.weight_decay,
             velocity,
             groups,
         }
@@ -166,12 +189,21 @@ impl SGDBuilder {
 }
 
 impl Optimizer for SGD {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
                 if let Some(grad) = param.grad() {
                     let lr = self.lr_for_param(i);
                     let data = param.data().detach()?;
+
+                    // L2 weight decay: grad += wd * param (PyTorch convention)
+                    let grad = if self.weight_decay > 0.0 {
+                        grad.add(&data.mul_scalar(self.weight_decay)?)?
+                    } else {
+                        grad
+                    };
+
                     if self.momentum > 0.0 {
                         let v = match self.velocity[i].take() {
                             Some(v) => {
@@ -222,6 +254,7 @@ impl Stateful for SGD {
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
         write_f64_le(w, self.lr)?;
+        write_f64_le(w, self.weight_decay)?;
         for v in &self.velocity {
             write_tensor_state(w, v.as_ref())?;
         }
@@ -243,6 +276,7 @@ impl Stateful for SGD {
             )));
         }
         self.lr = read_f64_le(r)?;
+        self.weight_decay = read_f64_le(r)?;
         for (i, param) in self.params.iter().enumerate() {
             let dev = param.data().device();
             self.velocity[i] = read_tensor_state(r, dev)?;
@@ -363,6 +397,7 @@ impl AdamBuilder {
 }
 
 impl Optimizer for Adam {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         self.adam_update(0.0)
     }
@@ -576,6 +611,7 @@ impl AdamWBuilder {
 }
 
 impl Optimizer for AdamW {
+    fn lr(&self) -> f64 { self.adam.lr }
     fn step(&mut self) -> Result<()> {
         self.adam.adam_update(self.weight_decay)
     }
@@ -725,6 +761,7 @@ impl RMSpropBuilder {
 }
 
 impl Optimizer for RMSprop {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
@@ -924,6 +961,7 @@ impl Adagrad {
 }
 
 impl Optimizer for Adagrad {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         self.step_count += 1;
         let clr = self.lr / (1.0 + (self.step_count - 1) as f64 * self.lr_decay);
@@ -989,6 +1027,7 @@ impl RAdam {
 }
 
 impl Optimizer for RAdam {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         self.step_count += 1;
         let t = self.step_count as f64;
@@ -1088,6 +1127,7 @@ impl NAdam {
 }
 
 impl Optimizer for NAdam {
+    fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
         self.step_count += 1;
         let t = self.step_count as f64;

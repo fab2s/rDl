@@ -227,6 +227,48 @@ pub trait Module {
     fn detach_state(&self) {}
 }
 
+impl Module for Box<dyn Module> {
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        (**self).forward(input)
+    }
+    fn parameters(&self) -> Vec<Parameter> {
+        (**self).parameters()
+    }
+    fn buffers(&self) -> Vec<Buffer> {
+        (**self).buffers()
+    }
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
+        (**self).sub_modules()
+    }
+    fn move_to_device(&self, device: crate::tensor::Device) {
+        (**self).move_to_device(device);
+    }
+    fn set_training(&self, training: bool) {
+        (**self).set_training(training);
+    }
+    fn trace(&self) -> Option<Variable> {
+        (**self).trace()
+    }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        (**self).as_named_input()
+    }
+    fn as_graph(&self) -> Option<&Graph> {
+        (**self).as_graph()
+    }
+    fn structural_hash(&self) -> Option<String> {
+        (**self).structural_hash()
+    }
+    fn reset(&self) {
+        (**self).reset();
+    }
+    fn detach_state(&self) {
+        (**self).detach_state();
+    }
+}
+
 /// Module that can receive additional named inputs via graph `using()`.
 pub trait NamedInputModule: Module {
     /// Forward pass with additional named inputs from tagged graph nodes.

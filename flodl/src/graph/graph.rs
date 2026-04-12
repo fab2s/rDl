@@ -396,7 +396,7 @@ impl Graph {
 
         if verbose {
             if let Ok(ref g) = graph {
-                eprintln!("{}", g.tree_summary());
+                crate::verbose!("{}", g.tree_summary());
             }
         }
 

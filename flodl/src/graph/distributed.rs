@@ -116,6 +116,7 @@ impl Graph {
             last_el_che_counts: Vec::new(),
             last_el_che_sync: None,
             max_grad_norm: None,
+            timeline: None,
         };
 
         // Broadcast params from rank 0 to all replicas
@@ -191,6 +192,18 @@ impl Graph {
     pub fn step(&self) -> Result<()> {
         let mut dist = self.distributed.borrow_mut();
         if let Some(ref mut state) = *dist {
+            // Auto-detect external forward/backward: El Che needs forward_batch()
+            // to populate batch counts. If counts are empty on the first step,
+            // the caller is using manual forward + backward. Disable El Che and
+            // fall through to standard AllReduce.
+            if state.el_che.is_some() && state.last_el_che_counts.iter().sum::<usize>() == 0 {
+                crate::verbose!(
+                    "  ddp: El Che disabled (external forward/backward detected). \
+                     Using standard AllReduce. To silence: DdpConfig::new().max_anchor(Some(0))"
+                );
+                state.el_che = None;
+            }
+
             if state.el_che.is_some() {
                 // El Che path: weighted AllReduce by actual per-device batch counts.
                 // Gradients were accumulated in forward_distributed_el_che().
@@ -244,6 +257,9 @@ impl Graph {
                     // Weighted AllReduce: scale by batch contribution, then Sum.
                     // Ranks with 0 batches (epoch-end clamping) have no gradients;
                     // zero them so AllReduce still produces the correct mean.
+                    if let Some(ref tl) = state.timeline {
+                        tl.event(crate::monitor::EventKind::SyncStart);
+                    }
                     let sync_start = std::time::Instant::now();
                     for group in &state.param_groups {
                         if group[0].grad().is_none() && counts[0] > 0 {
@@ -277,6 +293,9 @@ impl Graph {
                     }
                     state.sync_buffers()?;
                     let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
+                    if let Some(ref tl) = state.timeline {
+                        tl.event(crate::monitor::EventKind::SyncEnd { duration_ms: sync_ms });
+                    }
 
                     for opt in &mut state.optimizers {
                         opt.step()?;
@@ -296,6 +315,7 @@ impl Graph {
                         vec![compute_ms; state.devices.len()]
                     };
 
+                    let old_anchor = state.el_che.as_ref().map(|e| e.anchor());
                     let updated_counts = if let Some(ref mut el_che) = state.el_che {
                         if !wall_ms.is_empty() {
                             el_che.report_timing(&wall_ms, &counts, sync_ms);
@@ -304,6 +324,17 @@ impl Graph {
                     } else {
                         None
                     };
+                    if let (Some(tl), Some(old), Some(el_che)) =
+                        (&state.timeline, old_anchor, &state.el_che)
+                    {
+                        let new = el_che.anchor();
+                        if new != old {
+                            tl.event(crate::monitor::EventKind::AnchorChanged {
+                                from: old,
+                                to: new,
+                            });
+                        }
+                    }
 
                     state.last_timing = None;
                     state.last_el_che_sync = Some(std::time::Instant::now());
@@ -321,6 +352,10 @@ impl Graph {
                 }
             } else {
                 // Standard DDP path: per-batch scatter + AllReduce
+                if let Some(ref tl) = state.timeline {
+                    tl.event(crate::monitor::EventKind::SyncStart);
+                }
+                let ddp_sync_start = std::time::Instant::now();
                 if state.is_balanced() {
                     state.all_reduce_gradients()?;
                 } else {
@@ -328,6 +363,10 @@ impl Graph {
                     state.weighted_all_reduce_gradients(batch_size)?;
                 }
                 state.sync_buffers()?;
+                if let Some(ref tl) = state.timeline {
+                    let dur = ddp_sync_start.elapsed().as_secs_f64() * 1000.0;
+                    tl.event(crate::monitor::EventKind::SyncEnd { duration_ms: dur });
+                }
 
                 for opt in &mut state.optimizers {
                     opt.step()?;
