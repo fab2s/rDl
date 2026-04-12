@@ -1730,6 +1730,25 @@ impl Coordinator {
         snapshots: Vec<ParamSnapshot>,
         version: u64,
     ) -> Result<CpuAvgResult> {
+        // Normalize all snapshot tensors to CPU once up front. In production,
+        // worker.snapshot_params() already copies to CPU so these are no-ops.
+        // This ensures correctness when snapshot tensors are on GPU (tests,
+        // or future callers that skip the worker D2H copy).
+        let snapshots: Vec<ParamSnapshot> = snapshots.into_iter()
+            .map(|snap| Ok(ParamSnapshot {
+                rank: snap.rank,
+                params: snap.params.into_iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<_>>()?,
+                buffers: snap.buffers.into_iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<_>>()?,
+                batch_count: snap.batch_count,
+            }))
+            .collect::<Result<_>>()?;
+
+        // average_params also calls to_device(CPU) internally, but since
+        // we already normalized above, those are no-ops -- no redundant copies.
         let averaged = Self::average_params(&snapshots, version)?;
 
         // Compute ||average|| for normalization.

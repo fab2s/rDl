@@ -805,6 +805,7 @@ char* flodl_cuda_stream_synchronize(void* stream);
 char* flodl_cuda_stream_wait_event(void* stream, void* event);
 int   flodl_cuda_stream_query(void* stream);
 void  flodl_cuda_stream_set_current(void* stream);
+void* flodl_cuda_stream_get_current(int device_index);
 void  flodl_cuda_stream_restore_default(int device_index);
 void  flodl_cuda_stream_delete(void* stream);
 

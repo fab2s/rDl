@@ -1198,6 +1198,7 @@ unsafe extern "C" {
     ) -> *mut i8;
     pub fn flodl_cuda_stream_query(stream: *mut c_void) -> i32;
     pub fn flodl_cuda_stream_set_current(stream: *mut c_void);
+    pub fn flodl_cuda_stream_get_current(device_index: i32) -> *mut c_void;
     pub fn flodl_cuda_stream_restore_default(device_index: i32);
     pub fn flodl_cuda_stream_delete(stream: *mut c_void);
 

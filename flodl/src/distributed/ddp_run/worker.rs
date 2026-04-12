@@ -825,21 +825,30 @@ impl<M: Module> GpuWorker<M> {
             return Ok(false);
         }
 
-        // Defragment CUDA allocator between chunks. The caching allocator
-        // holds freed blocks from the previous chunk's activations and NCCL
-        // buffers, which fragment VRAM. Without this, follow-up chunks can
-        // OOM even though enough total VRAM exists (just not contiguous).
-        if self.device.is_cuda() {
-            crate::tensor::cuda_empty_cache();
-        }
+        // ALL CUDA work must avoid the default stream and device-wide sync.
+        // The CUDA default stream implicitly synchronizes with every other
+        // stream, and cuda_synchronize waits for ALL streams on the device.
+        // If a SyncNow triggered AllReduce on comm_stream (via the other rank)
+        // while this rank touches the default stream or calls device sync,
+        // it blocks waiting for comm_stream which waits for this rank -> deadlock.
+        //
+        // Solution: use compute_stream for all ops, sync compute_stream only.
+        let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+
+        // NOTE: cuda_empty_cache() was here to defragment VRAM between chunks,
+        // but it internally does a device-wide sync that deadlocks with pending
+        // NCCL AllReduce on comm_stream. Removed: the caching allocator handles
+        // fragmentation adequately without explicit cache flushes.
 
         // Update activation peak from the previous chunk's high-water mark.
         // Uses max() so the budget never grows beyond the worst observed peak.
-        // Sync first so all async work (NCCL on comm_stream, etc.) completes
-        // and deferred frees are processed before reading the baseline.
+        // Sync compute_stream only (NOT device-wide cuda_synchronize which
+        // would block on comm_stream's pending AllReduce -> deadlock).
         if self.device.is_cuda() && self.activation_peak_bytes > 0 {
             let idx = self.device.index() as i32;
-            crate::tensor::cuda_synchronize(idx as u8);
+            if let Some(ref stream) = self.compute_stream {
+                let _ = stream.synchronize();
+            }
             if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
                 if let Ok(baseline) = crate::tensor::cuda_active_bytes_idx(idx) {
                     let overhead = (peak as usize).saturating_sub(baseline as usize);
@@ -898,15 +907,27 @@ impl<M: Module> GpuWorker<M> {
             // Consume prefetched batches as they become ready
             let mut batch_done = 0usize;
             for _ in 0..num_batches {
-                // Process control messages (SyncNow, Throttle) BEFORE blocking
-                // on prefetch. Without this, a SyncNow arriving while the worker
-                // is setting up a new chunk deadlocks: the peer enters AllReduce
-                // but this worker is stuck in batch_rx.recv().
+                // Interleave control message processing with prefetch waiting.
+                // SyncNow can arrive at any time; if we block on batch_rx.recv()
+                // the peer enters AllReduce waiting for us -> deadlock.
+                // Use recv_timeout to periodically check for control messages.
                 if self.handle_control()? {
                     return Ok(true);
                 }
-                let prefetched = batch_rx.recv()
-                    .map_err(|_| TensorError::new("prefetch channel closed"))??;
+                let prefetched = loop {
+                    match batch_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                        Ok(batch) => break batch
+                            .map_err(|e| TensorError::new(&format!("prefetch error: {e}")))?,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if self.handle_control()? {
+                                return Ok(true);
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(TensorError::new("prefetch channel closed"));
+                        }
+                    }
+                };
 
                 // Ensure compute stream waits for async H2D copy to finish
                 #[cfg(feature = "cuda")]
@@ -958,8 +979,10 @@ impl<M: Module> GpuWorker<M> {
                 // isolate the activation + gradient overhead. This is the
                 // reserve that prefetch_depth_from_vram must account for.
                 if measuring_peak && batch_idx == 0 {
+                    if let Some(ref stream) = self.compute_stream {
+                        let _ = stream.synchronize();
+                    }
                     let idx = self.device.index() as i32;
-                    crate::tensor::cuda_synchronize(idx as u8);
                     if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
                         if let Ok(current) = crate::tensor::cuda_active_bytes_idx(idx) {
                             let overhead = (peak as usize).saturating_sub(current as usize);

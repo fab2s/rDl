@@ -147,8 +147,8 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
 
     let (final_loss, epoch_times, log_lines) = result?;
 
-    // Save training log with GPU header
-    if !log_lines.is_empty() {
+    // Save training log with GPU header and total time
+    {
         let log_path = format!("{run_dir}/training.log");
         #[cfg(feature = "cuda")]
         let header = {
@@ -164,7 +164,12 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         };
         #[cfg(not(feature = "cuda"))]
         let header = String::new();
-        let content = header + &log_lines.join("\n") + "\n";
+        let total_secs = total_ms / 1000.0;
+        let footer = format!(
+            "# total: {:.1}s ({:.0}m {:.0}s)",
+            total_secs, (total_secs / 60.0).floor(), total_secs % 60.0,
+        );
+        let content = header + &log_lines.join("\n") + "\n" + &footer + "\n";
         let _ = std::fs::write(&log_path, content);
     }
 
@@ -369,11 +374,11 @@ fn run_solo(
                     Ok(if eval_samples > 0 { total_metric / eval_samples as f64 } else { 0.0 })
                 })?;
                 model.train();
-                let line = format!("epoch {epoch}: loss={final_loss:.6}, metric={avg:.4}");
+                let line = format!("epoch {epoch}: loss={final_loss:.6}, metric={avg:.4}, time={epoch_ms:.0}ms");
                 eprintln!("    {line}");
                 log_lines.push(line);
             } else {
-                let line = format!("epoch {epoch}: loss={final_loss:.6}");
+                let line = format!("epoch {epoch}: loss={final_loss:.6}, time={epoch_ms:.0}ms");
                 eprintln!("    {line}");
                 log_lines.push(line);
             }
@@ -488,7 +493,7 @@ fn run_sync(
 
             let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
             final_loss = if batch_count > 0 { total_loss / batch_count as f64 } else { 0.0 };
-            log_lines.push(format!("epoch {epoch}: loss={final_loss:.6}"));
+            log_lines.push(format!("epoch {epoch}: loss={final_loss:.6}, time={epoch_ms:.0}ms"));
 
             graph.record_scalar("loss", final_loss);
             graph.flush(&[]);
@@ -517,7 +522,7 @@ fn run_sync(
 
             let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
             final_loss = total_loss / batches_per_epoch as f64;
-            log_lines.push(format!("epoch {epoch}: loss={final_loss:.6}"));
+            log_lines.push(format!("epoch {epoch}: loss={final_loss:.6}, time={epoch_ms:.0}ms"));
 
             graph.record_scalar("loss", final_loss);
             graph.flush(&[]);
@@ -586,7 +591,7 @@ fn run_builder(
     while let Some(metrics) = handle.next_metrics() {
         final_loss = metrics.avg_loss;
         epoch_times.push(metrics.epoch_ms);
-        let line = format!("epoch {}: loss={:.6}", metrics.epoch, metrics.avg_loss);
+        let line = format!("epoch {}: loss={:.6}, time={:.0}ms", metrics.epoch, metrics.avg_loss, metrics.epoch_ms);
         log_lines.push(line);
         monitor.log(
             metrics.epoch,

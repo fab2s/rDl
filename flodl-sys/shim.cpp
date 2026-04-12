@@ -4047,6 +4047,13 @@ extern "C" void flodl_cuda_stream_set_current(void* stream) {
         *static_cast<at::cuda::CUDAStream*>(stream));
 }
 
+extern "C" void* flodl_cuda_stream_get_current(int device_index) {
+    auto stream = at::cuda::getCurrentCUDAStream(
+        static_cast<c10::DeviceIndex>(device_index));
+    auto* heap = new at::cuda::CUDAStream(stream);
+    return static_cast<void*>(heap);
+}
+
 extern "C" void flodl_cuda_stream_restore_default(int device_index) {
     at::cuda::setCurrentCUDAStream(
         at::cuda::getDefaultCUDAStream(
@@ -4441,6 +4448,9 @@ extern "C" int flodl_cuda_stream_query(void* stream) {
     (void)stream; return 1;
 }
 extern "C" void flodl_cuda_stream_set_current(void* stream) { (void)stream; }
+extern "C" void* flodl_cuda_stream_get_current(int device_index) {
+    (void)device_index; return nullptr;
+}
 extern "C" void flodl_cuda_stream_restore_default(int device_index) {
     (void)device_index;
 }
