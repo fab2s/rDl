@@ -63,6 +63,12 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         pool_size,
     };
     let dataset = (model_def.dataset)(&dataset_cfg)?;
+    let test_dataset: Option<Arc<dyn flodl::data::BatchDataSet>> =
+        if let Some(test_fn) = model_def.test_dataset {
+            Some(test_fn(&dataset_cfg)?)
+        } else {
+            None
+        };
     let load_ms = load_start.elapsed().as_millis();
 
     // Real-data mode: batches_per_epoch == 0 means "use full dataset".
@@ -108,6 +114,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             model_def,
             *gpu_idx,
             dataset,
+            test_dataset,
             config,
             actual_batches,
             real_data,
@@ -140,10 +147,25 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
 
     let (final_loss, epoch_times, log_lines) = result?;
 
-    // Save training log
+    // Save training log with GPU header
     if !log_lines.is_empty() {
         let log_path = format!("{run_dir}/training.log");
-        let _ = std::fs::write(&log_path, log_lines.join("\n") + "\n");
+        #[cfg(feature = "cuda")]
+        let header = {
+            let mut h = String::new();
+            for dev in flodl::tensor::cuda_devices() {
+                h.push_str(&format!(
+                    "# gpu{}: {} ({}GB, sm_{}{})\n",
+                    dev.index, dev.name, dev.total_memory / (1024 * 1024 * 1024),
+                    dev.sm_major, dev.sm_minor,
+                ));
+            }
+            h
+        };
+        #[cfg(not(feature = "cuda"))]
+        let header = String::new();
+        let content = header + &log_lines.join("\n") + "\n";
+        let _ = std::fs::write(&log_path, content);
     }
 
     // Clean up CUDA state between runs. NCCL communicators and cached
@@ -247,6 +269,7 @@ fn run_solo(
     model_def: &ModelDef,
     gpu_idx: usize,
     dataset: Arc<dyn flodl::data::BatchDataSet>,
+    test_dataset: Option<Arc<dyn flodl::data::BatchDataSet>>,
     config: &RunConfig,
     batches_per_epoch: usize,
     real_data: bool,
@@ -278,6 +301,16 @@ fn run_solo(
         let n = gpu_data[0].shape()[0] as usize;
         let bs = config.batch_size;
 
+        // Preload test data for evaluation (if available).
+        let test_gpu_data = test_dataset
+            .as_ref()
+            .map(|ds| preload_full_dataset(ds.as_ref(), device))
+            .transpose()?;
+        if let Some(ref tgd) = test_gpu_data {
+            let tn = tgd[0].shape()[0] as usize;
+            eprintln!("  eval: {tn} test samples");
+        }
+
         for epoch in 0..config.epochs {
             timeline.event(flodl::monitor::EventKind::EpochStart { epoch });
             let epoch_start = Instant::now();
@@ -288,6 +321,11 @@ fn run_solo(
                 let end = (batch_start + bs).min(n);
                 if end - batch_start < bs { break; } // drop incomplete last batch
                 let batch = slice_batch(&gpu_data, batch_start, end, device)?;
+                let batch = if let Some(aug) = model_def.augment_fn {
+                    aug(&batch)?
+                } else {
+                    batch
+                };
 
                 let loss = (model_def.train_fn)(model.as_ref(), &batch)?;
                 let loss_val = loss.item()?;
@@ -311,16 +349,19 @@ fn run_solo(
                 loss: final_loss,
             });
 
-            // Eval metric (accuracy, etc.) if available
+            // Eval metric (accuracy, etc.) if available.
+            // Use held-out test data when present, otherwise fall back to training data.
             if let Some(eval_fn) = model_def.eval_fn {
                 model.eval();
+                let eval_data = test_gpu_data.as_deref().unwrap_or(&gpu_data);
+                let eval_n = eval_data[0].shape()[0] as usize;
                 let avg = flodl::autograd::no_grad(|| -> Result<f64> {
                     let mut total_metric = 0.0;
                     let mut eval_samples = 0usize;
-                    for batch_start in (0..n).step_by(bs) {
-                        let end = (batch_start + bs).min(n);
+                    for batch_start in (0..eval_n).step_by(bs) {
+                        let end = (batch_start + bs).min(eval_n);
                         if end - batch_start < bs { break; }
-                        let batch = slice_batch(&gpu_data, batch_start, end, device)?;
+                        let batch = slice_batch(eval_data, batch_start, end, device)?;
                         let metric = eval_fn(model.as_ref(), &batch)?;
                         total_metric += metric * (end - batch_start) as f64;
                         eval_samples += end - batch_start;

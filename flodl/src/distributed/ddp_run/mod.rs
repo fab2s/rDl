@@ -64,10 +64,12 @@
 mod worker;
 mod coordinator;
 mod orchestrator;
+pub mod convergence;
 
 pub use worker::*;
 pub use coordinator::*;
 pub use orchestrator::*;
+pub use convergence::{ConvergenceAction, ConvergenceGuard, DivergenceReport};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -535,11 +537,13 @@ pub enum TimingMsg {
         /// Worker's local step counter (monotonically increasing).
         step_count: usize,
         /// L2 norm of all parameters (computed periodically, not every batch).
-        /// Used by the coordinator for NCCL divergence detection.
         param_norm: Option<f64>,
-        /// Training loss for this batch. Accumulated by the coordinator
-        /// for weighted divergence detection across sync intervals.
+        /// Training loss for this batch (accumulated for monitoring).
         batch_loss: f64,
+        /// Weight-space divergence from the most recent AllReduce:
+        /// `||params_before - params_after|| / ||params_after||`.
+        /// Only set in the post-sync ack message; `None` for regular batches.
+        sync_divergence: Option<f64>,
     },
     /// Worker is about to exit. Coordinator must stop including this rank
     /// in collectives before processing any further messages.
@@ -684,6 +688,9 @@ pub struct WorkerConfig {
     pub max_grad_norm: Option<f64>,
     /// Optional system timeline for high-frequency profiling.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
+    /// Training policy (Sync/Cadence/Async). Used to gate divergence measurement:
+    /// Sync mode skips weight-space divergence (near-zero by construction).
+    pub policy: ApplyPolicy,
 }
 
 // ---------------------------------------------------------------------------

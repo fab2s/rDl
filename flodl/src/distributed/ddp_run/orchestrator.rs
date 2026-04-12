@@ -457,6 +457,7 @@ impl DdpHandle {
                 seed,
                 max_grad_norm,
                 timeline: worker_tl,
+                policy,
             };
 
             let handle = std::thread::Builder::new()
@@ -648,6 +649,7 @@ impl DdpHandle {
             seed: 42,
             max_grad_norm,
             timeline: None,
+            policy: ApplyPolicy::Sync, // single-GPU fallback: no divergence measurement
         };
 
         // Channels (unused in single-GPU mode, but needed by GpuWorker)

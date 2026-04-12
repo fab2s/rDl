@@ -45,6 +45,12 @@ pub struct ModelDef {
     pub train_fn: fn(&dyn Module, &[Tensor]) -> Result<Variable>,
     /// Optional evaluation metric (e.g. accuracy). Called after each epoch.
     pub eval_fn: Option<fn(&dyn Module, &[Tensor]) -> Result<f64>>,
+    /// Optional held-out test dataset for evaluation (e.g. CIFAR-10 test split).
+    /// When present, eval_fn runs on this instead of the training data.
+    pub test_dataset: Option<fn(&DatasetConfig) -> Result<Arc<dyn BatchDataSet>>>,
+    /// Optional per-batch augmentation (e.g. random crop + flip for CIFAR-10).
+    /// Applied to training batches only, not eval. Takes [images, labels], returns augmented.
+    pub augment_fn: Option<fn(&[Tensor]) -> Result<Vec<Tensor>>>,
     /// Create the optimizer for this model's parameters.
     pub optimizer: fn(&[Parameter], f64) -> Box<dyn Optimizer>,
     /// Optional LR scheduler factory. Args: (base_lr, total_batches, world_size).

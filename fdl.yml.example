@@ -19,8 +19,8 @@ scripts:
     run: cargo check
     docker: dev
   clippy:
-    description: Lint (including test code)
-    run: cargo clippy --tests -- -W clippy::all
+    description: Lint (including test code, workspace + ddp-bench)
+    run: cargo clippy --tests -- -W clippy::all && cd ddp-bench && cargo clippy --tests -- -W clippy::all
     docker: dev
   doc:
     description: Generate API docs

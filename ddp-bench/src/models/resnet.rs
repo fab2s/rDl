@@ -12,19 +12,25 @@ use flodl::nn::{
     BatchNorm2d, Buffer, Conv2d, Linear, Module, MultiStepLR, Parameter,
     SGD,
 };
-use flodl::tensor::{DType, Device, Result, Tensor};
+use flodl::tensor::{DType, Device, Result, Tensor, TensorOptions};
 
 use super::{DatasetConfig, ModelDef};
 use crate::config::ModelDefaults;
 
+// CIFAR-10 per-channel normalization constants (computed from training set).
+const CIFAR10_MEAN: [f32; 3] = [0.4914, 0.4822, 0.4465];
+const CIFAR10_STD: [f32; 3] = [0.2023, 0.1994, 0.2010];
+
 pub fn def() -> ModelDef {
     ModelDef {
         name: "resnet",
-        description: "ResNet-20 on CIFAR-10 (~90% acc, He et al. 2015)",
+        description: "ResNet-20 on CIFAR-10 (~91% acc, He et al. 2015)",
         build: build_model,
         dataset: make_dataset,
         train_fn: train_step,
         eval_fn: Some(eval_accuracy),
+        test_dataset: Some(make_test_dataset),
+        augment_fn: Some(augment_cifar10),
         // He et al. 2015: SGD, momentum=0.9, weight_decay=1e-4, LR=0.1
         // MultiStep at 50% and 75% of training, gamma=0.1 (published: [100,150]/200 epochs)
         optimizer: |p, lr| Box::new(SGD::new(p, lr, 0.9).weight_decay(1e-4)),
@@ -47,6 +53,11 @@ fn make_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
     Ok(Arc::new(cifar))
 }
 
+fn make_test_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
+    let cifar = crate::download::ensure_cifar10_test(&cfg.data_dir)?;
+    Ok(Arc::new(cifar))
+}
+
 fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
     let input = Variable::new(batch[0].clone(), false);
     let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
@@ -55,13 +66,51 @@ fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
 }
 
 fn eval_accuracy(model: &dyn Module, batch: &[Tensor]) -> Result<f64> {
-    let input = Variable::new(batch[0].clone(), false);
+    // Normalize test images (same constants as training augmentation).
+    let normed = cifar10_normalize(&batch[0])?;
+    let input = Variable::new(normed, false);
     let pred = model.forward(&input)?;
     let predicted = pred.data().argmax(-1, false)?;
     let labels = batch[1].to_dtype(DType::Int64)?;
     let correct: f64 = predicted.eq_tensor(&labels)?.sum()?.item()?;
     let total = labels.shape()[0] as f64;
     Ok(correct / total)
+}
+
+// ---------------------------------------------------------------------------
+// CIFAR-10 normalization and augmentation (He et al. 2015 Section 4.2)
+// ---------------------------------------------------------------------------
+
+/// Per-channel normalize: (x - mean) / std.
+fn cifar10_normalize(images: &Tensor) -> Result<Tensor> {
+    let device = images.device();
+    let mean = Tensor::from_f32(&CIFAR10_MEAN, &[1, 3, 1, 1], device)?;
+    let std = Tensor::from_f32(&CIFAR10_STD, &[1, 3, 1, 1], device)?;
+    images.sub(&mean)?.div(&std)
+}
+
+/// Standard CIFAR-10 training augmentation:
+/// 1. Per-channel normalize
+/// 2. Pad 4px (zero = mean in normalized space)
+/// 3. Random crop 32x32
+/// 4. Random horizontal flip (p=0.5)
+fn augment_cifar10(batch: &[Tensor]) -> Result<Vec<Tensor>> {
+    let images = cifar10_normalize(&batch[0])?;
+
+    // Pad 4px on each spatial side: [B,3,32,32] -> [B,3,40,40]
+    let padded = images.pad(&[4, 4, 4, 4], 0.0)?;
+
+    // Random crop offset in [0, 8] (same for whole batch -- standard GPU augmentation)
+    let cpu = TensorOptions { dtype: DType::Int64, device: Device::CPU };
+    let offsets = Tensor::randint(0, 9, &[3], cpu)?.to_i64_vec()?;
+    let dy = offsets[0];
+    let dx = offsets[1];
+    let cropped = padded.narrow(2, dy, 32)?.narrow(3, dx, 32)?;
+
+    // Random horizontal flip (p=0.5, whole batch)
+    let result = if offsets[2] % 2 == 1 { cropped.flip(&[3])? } else { cropped };
+
+    Ok(vec![result, batch[1].clone()])
 }
 
 // ---------------------------------------------------------------------------

@@ -242,6 +242,14 @@ fn run() -> flodl::tensor::Result<()> {
         modes.len(),
         gpu_count
     );
+    #[cfg(feature = "cuda")]
+    for dev in flodl::tensor::cuda_devices() {
+        eprintln!(
+            "  gpu{}: {} ({}GB, sm_{}{})",
+            dev.index, dev.name, dev.total_memory / (1024 * 1024 * 1024),
+            dev.sm_major, dev.sm_minor,
+        );
+    }
 
     let mut all_results: Vec<Vec<harness::RunResult>> = Vec::new();
 

@@ -32,6 +32,8 @@ pub fn def() -> ModelDef {
         dataset: make_dataset,
         train_fn: train_step,
         eval_fn: None, // loss is the metric
+        test_dataset: None,
+        augment_fn: None,
         // nanoGPT: Adam lr=3e-4, warmup 20% then cosine decay to 1e-5
         // (published: 10/50 epochs warmup; total is in batches)
         optimizer: |p, lr| Box::new(Adam::new(p, lr)),

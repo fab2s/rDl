@@ -56,17 +56,16 @@ const CIFAR10_TRAIN_BATCHES: [&str; 5] = [
     "data_batch_4.bin",
     "data_batch_5.bin",
 ];
+const CIFAR10_TEST_BATCH: &str = "test_batch.bin";
 
-/// Download CIFAR-10 training data (if not cached) and parse it.
-///
-/// Files are cached in `{data_dir}/cifar10/`.
-/// Returns 50,000 images `[N, 3, 32, 32]` and labels `[N]`.
-pub fn ensure_cifar10(data_dir: &Path) -> Result<Cifar10> {
+/// Ensure CIFAR-10 archive is downloaded and extracted. Returns the cache dir.
+fn ensure_cifar10_extracted(data_dir: &Path) -> Result<std::path::PathBuf> {
     let dir = data_dir.join("cifar10");
     ensure_dir(&dir)?;
 
     let all_present = CIFAR10_TRAIN_BATCHES
         .iter()
+        .chain(std::iter::once(&CIFAR10_TEST_BATCH))
         .all(|name| dir.join(name).exists());
 
     if !all_present {
@@ -79,13 +78,35 @@ pub fn ensure_cifar10(data_dir: &Path) -> Result<Cifar10> {
         let _ = fs::remove_file(&tar_path); // clean up
     }
 
-    eprintln!("  parsing CIFAR-10...");
+    Ok(dir)
+}
+
+/// Download CIFAR-10 training data (if not cached) and parse it.
+///
+/// Files are cached in `{data_dir}/cifar10/`.
+/// Returns 50,000 images `[N, 3, 32, 32]` and labels `[N]`.
+pub fn ensure_cifar10(data_dir: &Path) -> Result<Cifar10> {
+    let dir = ensure_cifar10_extracted(data_dir)?;
+
+    eprintln!("  parsing CIFAR-10 train...");
     let mut batch_data: Vec<Vec<u8>> = Vec::with_capacity(5);
     for name in &CIFAR10_TRAIN_BATCHES {
         batch_data.push(read_file(&dir.join(name))?);
     }
     let refs: Vec<&[u8]> = batch_data.iter().map(|v| v.as_slice()).collect();
     Cifar10::parse(&refs)
+}
+
+/// Download CIFAR-10 test data (if not cached) and parse it.
+///
+/// Files are cached in `{data_dir}/cifar10/`.
+/// Returns 10,000 images `[N, 3, 32, 32]` and labels `[N]`.
+pub fn ensure_cifar10_test(data_dir: &Path) -> Result<Cifar10> {
+    let dir = ensure_cifar10_extracted(data_dir)?;
+
+    eprintln!("  parsing CIFAR-10 test...");
+    let test_data = read_file(&dir.join(CIFAR10_TEST_BATCH))?;
+    Cifar10::parse(&[&test_data])
 }
 
 /// Extract CIFAR-10 batch files from the tar.gz archive.

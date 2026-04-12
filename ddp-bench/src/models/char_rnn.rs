@@ -29,6 +29,8 @@ pub fn def() -> ModelDef {
         dataset: make_dataset,
         train_fn: train_step,
         eval_fn: None, // loss is the metric
+        test_dataset: None,
+        augment_fn: None,
         // Karpathy char-rnn: RMSprop lr=2e-3
         optimizer: |p, lr| Box::new(RMSprop::new(p, lr)),
         scheduler: None,

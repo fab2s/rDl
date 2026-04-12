@@ -105,6 +105,11 @@ pub struct GpuWorker<M: Module> {
     max_grad_norm: Option<f64>,
     /// Optional system timeline for event injection.
     timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
+
+    /// Scratch buffers for pre-sync parameter snapshot (weight-space divergence).
+    /// Allocated once at worker creation. `None` when policy == Sync (divergence
+    /// is near-zero by construction, no point measuring) or no NCCL comm.
+    pre_sync_scratch: Option<Vec<Tensor>>,
 }
 
 /// Channels bundle returned by [`GpuWorker::channels`] for wiring into the coordinator.
@@ -255,6 +260,17 @@ impl<M: Module> GpuWorker<M> {
             (None, 0)
         };
 
+        // Allocate scratch buffers for weight-space divergence measurement.
+        // Skip for Sync mode (AllReduce every batch, divergence near-zero).
+        let pre_sync_scratch = if nccl_comm.is_some() && config.policy != super::ApplyPolicy::Sync {
+            let scratch: Result<Vec<Tensor>> = param_vars.iter()
+                .map(|v| Tensor::zeros_like(&v.data()))
+                .collect();
+            scratch.ok()
+        } else {
+            None
+        };
+
         Ok(GpuWorker {
             model,
             optimizer: Box::new(optimizer),
@@ -288,6 +304,7 @@ impl<M: Module> GpuWorker<M> {
             activation_peak_bytes: 0,
             max_grad_norm: config.max_grad_norm,
             timeline: config.timeline.clone(),
+            pre_sync_scratch,
         })
     }
 
@@ -413,37 +430,78 @@ impl<M: Module> GpuWorker<M> {
     /// All ranks must process SyncNow concurrently for the collective to complete.
     /// Runs on `comm_stream` and records `copy_done` so the compute stream waits
     /// before the next forward.
-    fn sync_now_nccl(&self) -> Result<()> {
+    ///
+    /// Returns the weight-space divergence for this rank: `||pre - post|| / ||post||`.
+    /// `None` when scratch buffers are absent (Sync mode or no NCCL comm).
+    fn sync_now_nccl(&self) -> Result<Option<f64>> {
         let comm = match &self.nccl_comm {
             Some(c) => c,
-            None => return Ok(()), // No NCCL comm (CPU backend or single-GPU): no-op
+            None => return Ok(None),
         };
 
-        // Collect param data tensors (raw storage, no grad graph)
         let param_tensors: Vec<_> = self.param_vars.iter().map(|v| v.data()).collect();
         let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
 
+        // Snapshot pre-sync params into scratch buffers for divergence measurement.
+        if let Some(ref scratch) = self.pre_sync_scratch {
+            let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
+            for (dst, src) in scratch.iter().zip(&param_tensors) {
+                dst.copy_(src, true)?; // non-blocking on comm_stream
+            }
+        }
+
         if let Some(stream) = &self.comm_stream {
-            // AllReduce on comm_stream
+            // AllReduce on comm_stream (in-place averaging)
             comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream)?;
-            // HOST-synchronize: block until AllReduce completes. Without
-            // this, the host thread races ahead and reports timing from
-            // batches whose GPU ops are queued behind the AllReduce. The
-            // coordinator sees those phantom batches as real progress and
-            // floods SyncNow, deadlocking the GPU comm streams.
-            // No throughput loss: compute_stream already waits on
-            // copy_done, so AllReduce and compute can't overlap.
+            // HOST-synchronize: block until AllReduce completes.
             stream.synchronize()?;
+
+            // Compute weight-space divergence: ||pre - post|| / ||post||
+            let divergence = if let Some(ref scratch) = self.pre_sync_scratch {
+                // scratch = pre (from copy above). Compute diff in-place:
+                // scratch[i] += (-1) * param_tensors[i]  ->  scratch[i] = pre[i] - post[i]
+                Tensor::foreach_add_list_(scratch, &param_tensors, -1.0)?;
+
+                let diff_norms = Tensor::foreach_norm(scratch, 2.0)?;
+                let post_norms = Tensor::foreach_norm(&param_tensors, 2.0)?;
+
+                let mut diff_sq = 0.0f64;
+                for n in &diff_norms {
+                    let v: f64 = n.item()?;
+                    diff_sq += v * v;
+                }
+                let mut post_sq = 0.0f64;
+                for n in &post_norms {
+                    let v: f64 = n.item()?;
+                    post_sq += v * v;
+                }
+
+                let post_norm = post_sq.sqrt();
+                let div = if post_norm > 1e-10 {
+                    diff_sq.sqrt() / post_norm
+                } else {
+                    0.0
+                };
+
+                crate::verbose!(
+                    "  ddp-worker: rank {} sync divergence={:.6} (||delta||={:.4}, ||post||={:.4})",
+                    self.rank, div, diff_sq.sqrt(), post_norm,
+                );
+                Some(div)
+            } else {
+                None
+            };
+
             // Record event so compute_stream waits before next forward
             if let Some(ev) = &self.copy_done {
                 ev.record_on(stream)?;
             }
-        } else {
-            // CPU fallback (should not happen for NCCL backend, but handle gracefully)
-            comm.all_reduce(&param_refs, ReduceOp::Avg)?;
-        }
 
-        Ok(())
+            Ok(divergence)
+        } else {
+            comm.all_reduce(&param_refs, ReduceOp::Avg)?;
+            Ok(None)
+        }
     }
 
     /// Wait for any pending parameter copy to complete on the compute stream.
@@ -560,7 +618,7 @@ impl<M: Module> GpuWorker<M> {
             }
             ControlMsg::SyncNow => {
                 crate::debug!("  ddp-worker: rank {} SyncNow (step={}, epoch={})", self.rank, self.local_step, self.current_epoch);
-                self.sync_now_nccl()?;
+                let divergence = self.sync_now_nccl()?;
                 crate::debug!("  ddp-worker: rank {} SyncNow done", self.rank);
                 self.steps_since_avg = 0;
                 // Bump local_step and send a timing ack so the coordinator's
@@ -569,7 +627,7 @@ impl<M: Module> GpuWorker<M> {
                 // train afterward) leaves nccl_ack permanently false, blocking
                 // all future should_average() calls.
                 self.local_step += 1;
-                let _ = self.report_timing(0.0, None, 0.0);
+                let _ = self.report_timing(0.0, None, 0.0, divergence);
             }
             ControlMsg::StartEpoch(plan) => {
                 self.pending_plan = Some(plan);
@@ -614,13 +672,20 @@ impl<M: Module> GpuWorker<M> {
     }
 
     /// Send a timing report to the coordinator.
-    pub fn report_timing(&self, batch_ms: f64, param_norm: Option<f64>, batch_loss: f64) -> Result<()> {
+    pub fn report_timing(
+        &self,
+        batch_ms: f64,
+        param_norm: Option<f64>,
+        batch_loss: f64,
+        sync_divergence: Option<f64>,
+    ) -> Result<()> {
         self.timing_tx.send(TimingMsg::Batch {
             rank: self.rank,
             batch_ms,
             step_count: self.local_step,
             param_norm,
             batch_loss,
+            sync_divergence,
         }).map_err(|_| TensorError::new("timing channel disconnected"))
     }
 
@@ -859,7 +924,7 @@ impl<M: Module> GpuWorker<M> {
                 } else {
                     None
                 };
-                let _ = self.report_timing(ms, norm, loss);
+                let _ = self.report_timing(ms, norm, loss, None);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }
@@ -911,7 +976,7 @@ impl<M: Module> GpuWorker<M> {
                 } else {
                     None
                 };
-                let _ = self.report_timing(ms, norm, loss);
+                let _ = self.report_timing(ms, norm, loss, None);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }

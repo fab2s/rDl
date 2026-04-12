@@ -22,6 +22,8 @@ pub fn def() -> ModelDef {
         dataset: make_dataset,
         train_fn: train_step,
         eval_fn: Some(eval_accuracy),
+        test_dataset: None,
+        augment_fn: None,
         optimizer: |p, lr| Box::new(Adam::new(p, lr)),
         scheduler: None,
         defaults: ModelDefaults {

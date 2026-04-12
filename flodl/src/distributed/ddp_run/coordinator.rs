@@ -56,9 +56,9 @@ enum CpuAvgState {
 /// Result from the CPU averaging compute thread.
 struct CpuAvgResult {
     averaged: AveragedParams,
-    /// Relative divergence across replicas (for anchor correction).
+    /// Weight-space divergence report (for convergence guard).
     /// None if all norms are zero.
-    divergence: Option<f64>,
+    divergence: Option<super::convergence::DivergenceReport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,11 +191,6 @@ pub struct Coordinator {
     /// can compute per-batch LR as `scheduler.lr(global_step + local_offset)`.
     pub(super) global_step: usize,
 
-    // Divergence monitoring (optional guardrail on top of ElChe)
-    divergence_threshold: f64,
-    /// When false, divergence detection is entirely disabled.
-    /// ElChe's overhead auto-tune handles cadence on its own.
-    divergence_guard: bool,
     /// Has ElChe been calibrated (first timing report received)?
     calibrated: bool,
 
@@ -276,19 +271,17 @@ pub struct Coordinator {
     /// Absolute ceiling on max_overshoot (safety valve, applied after auto-tune).
     overshoot_ceiling: usize,
 
-    // NCCL divergence detection (per-sync-interval accumulators, reset in finish_averaging_nccl)
-    /// Per-rank cumulative loss since last sync. Weighted by batch count
-    /// when compared: avg = loss_accum[r] / loss_count[r].
+    // Divergence monitoring (per-sync-interval, reset after averaging)
+    /// Per-rank cumulative loss since last sync (monitoring/logging only,
+    /// not used for cadence decisions).
     loss_accum: Vec<f64>,
     /// Per-rank batch count contributing to loss_accum since last sync.
     loss_count: Vec<usize>,
-    /// Per-rank latest parameter L2 norm from this sync interval.
-    /// Snapshot (not accumulated) -- shows pre-sync model state.
-    interval_param_norm: Vec<f64>,
-    /// Ring buffer of divergence values from recent sync intervals.
-    /// Used for trend detection: only act on sustained rising patterns,
-    /// never on single measurements.
-    divergence_history: std::collections::VecDeque<f64>,
+    /// Per-rank weight-space divergence from the most recent AllReduce.
+    /// Set via `sync_divergence` in TimingMsg ack. Reset after averaging.
+    nccl_sync_divergence: Vec<Option<f64>>,
+    /// Unified convergence guard: owns ring buffer and mode-specific logic.
+    convergence_guard: super::convergence::ConvergenceGuard,
 
     // Timeline profiling
     /// Optional high-frequency system timeline for event injection.
@@ -462,8 +455,6 @@ impl CoordinatorBuilder {
             version: 0,
             steps_since_avg: vec![0; self.world_size],
             global_step: 0,
-            divergence_threshold: self.divergence_threshold,
-            divergence_guard: self.divergence_guard,
             calibrated: false,
             active_count: self.world_size,
             wall_ms_accum: vec![0.0; self.world_size],
@@ -494,8 +485,12 @@ impl CoordinatorBuilder {
             overshoot_ceiling: self.overshoot_ceiling,
             loss_accum: vec![0.0; self.world_size],
             loss_count: vec![0; self.world_size],
-            interval_param_norm: vec![0.0; self.world_size],
-            divergence_history: std::collections::VecDeque::with_capacity(6),
+            nccl_sync_divergence: vec![None; self.world_size],
+            convergence_guard: super::convergence::ConvergenceGuard::new(
+                self.policy,
+                self.divergence_guard,
+                self.divergence_threshold,
+            ),
             timeline: self.timeline,
             nccl_sync_start: None,
             last_step_count: vec![0; self.world_size],
@@ -959,21 +954,21 @@ impl Coordinator {
     /// [`Self::drain_timing_blocking`].
     fn process_timing_msg(&mut self, msg: TimingMsg) {
         match msg {
-            TimingMsg::Batch { rank, batch_ms, step_count, param_norm, batch_loss } => {
+            TimingMsg::Batch { rank, batch_ms, step_count, param_norm, batch_loss, sync_divergence } => {
                 self.steps_since_avg[rank] = self.steps_since_avg[rank].saturating_add(1);
                 self.wall_ms_accum[rank] += batch_ms;
                 self.last_step_count[rank] = self.last_step_count[rank].max(step_count);
                 self.last_batch_ms[rank] = batch_ms;
-                // Accumulate loss for weighted divergence detection.
-                // SyncNow acks send batch_loss=0.0 -- skip those.
+                // Accumulate loss for monitoring (not used for cadence decisions).
                 if batch_loss > 0.0 {
                     self.loss_accum[rank] += batch_loss;
                     self.loss_count[rank] += 1;
                 }
-                // Track parameter norm snapshot for divergence detection.
-                if let Some(norm) = param_norm {
-                    self.interval_param_norm[rank] = norm;
+                // Capture weight-space divergence from post-sync ack.
+                if let Some(div) = sync_divergence {
+                    self.nccl_sync_divergence[rank] = Some(div);
                 }
+                let _ = param_norm; // retained in TimingMsg for monitoring
                 // Ack NCCL sync when the worker's step_count exceeds the
                 // snapshot at trigger time (proves the worker processed the
                 // SyncNow and completed the AllReduce before this batch).
@@ -1256,12 +1251,9 @@ impl Coordinator {
     /// NCCL workers block in AllReduce so no new batches arrive during the
     /// collective; zeroing is correct.
     ///
-    /// Divergence detection uses two trailing signals (gated on policy != Sync):
-    /// - **Param norm** (primary): L2 norm reported every 10 batches via TimingMsg.
-    ///   Sum-deviation formula, matching the CPU path. Stricter signal.
-    /// - **Loss** (backup): avg_loss from MetricsMsg at chunk/epoch boundaries.
-    ///   Max-deviation formula, effectively 2x less sensitive. Catches routing
-    ///   divergence (e.g. MoE gates) where norms track close but behavior diverges.
+    /// Weight-space divergence guard feeds into cadence control via
+    /// [`ConvergenceGuard`]. The guard is mode-aware: Sync skips entirely,
+    /// Cadence/Async use trend detection on `||pre-post|| / ||post||`.
     pub(super) fn finish_averaging_nccl(&mut self) {
         let old_anchor = self.el_che.anchor();
         if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
@@ -1272,28 +1264,43 @@ impl Coordinator {
             }
         }
 
-        // NCCL divergence trend check (skip in Sync mode -- near-zero by construction).
-        // Returns true when divergence is trending up over several intervals.
-        // This is a soft guardrail: it only suppresses anchor/overshoot growth,
-        // never shrinks them. The overhead auto-tune handles cadence; divergence
-        // just prevents it from getting too loose when replicas are drifting.
-        let trending_up = if self.divergence_guard && self.policy != ApplyPolicy::Sync {
-            self.check_nccl_divergence()
-        } else {
-            false
+        // Feed weight-space divergence (from previous sync's acks) to the guard.
+        // Invariant: should_average() requires all nccl_ack == true before next
+        // trigger, so all nccl_sync_divergence[rank] are populated by now.
+        let report = super::convergence::DivergenceReport {
+            deltas: self.nccl_sync_divergence.iter()
+                .map(|d| d.unwrap_or(0.0))
+                .collect(),
+            pre_norms: None,
+            post_norm: None,
         };
+        let action = self.convergence_guard.report(&report);
 
         self.version += 1;
         self.avg_count += 1;
 
-        // Auto-tune max_overshoot: hold on rising divergence, grow on stability.
-        // Never shrink -- that's too aggressive and kills convergence.
-        if self.overshoot_auto && !trending_up {
-            let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
-            self.max_overshoot = (self.max_overshoot + 1).min(cap);
+        // Apply convergence action. Overshoot is an Async-only concept.
+        match action {
+            super::convergence::ConvergenceAction::Stable => {
+                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
+                    let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
+                    self.max_overshoot = (self.max_overshoot + 1).min(cap);
+                }
+            }
+            super::convergence::ConvergenceAction::SuppressGrowth => {
+                // Hold current anchor and overshoot, don't grow.
+            }
+            super::convergence::ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.nudge_anchor_down(factor);
+                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
+                    self.max_overshoot = self.overshoot_initial;
+                }
+            }
         }
         // Absolute ceiling (safety valve, applied after all auto-tune logic).
-        self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
+        if self.policy == ApplyPolicy::Async {
+            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
+        }
 
         // Timeline: sync duration and anchor changes
         if let Some(ref tl) = self.timeline {
@@ -1334,17 +1341,15 @@ impl Coordinator {
         for t in &mut self.throttled {
             *t = false;
         }
-        // Reset per-interval divergence accumulators. Each sync interval
-        // starts with a clean slate so divergence is measured relative to
-        // the last AllReduce, not accumulated across the entire run.
+        // Reset per-interval accumulators.
         for l in &mut self.loss_accum {
             *l = 0.0;
         }
         for c in &mut self.loss_count {
             *c = 0;
         }
-        for n in &mut self.interval_param_norm {
-            *n = 0.0;
+        for d in &mut self.nccl_sync_divergence {
+            *d = None;
         }
 
         // Re-dispatch to ranks that are idle (no in-flight chunks in any pool)
@@ -1361,76 +1366,7 @@ impl Coordinator {
         }
     }
 
-    /// Check NCCL divergence using per-sync-interval accumulators.
-    ///
-    /// Returns true if divergence was detected and anchor was nudged down.
-    /// Called from `finish_averaging_nccl()` (gated on policy != Sync).
-    ///
-    /// Trend-based divergence detection over recent sync intervals.
-    ///
-    /// Computes a divergence score for the current interval (weighted avg
-    /// loss across ranks), pushes it to a ring buffer, then checks whether
-    /// the trend is rising. Only acts on sustained patterns -- single
-    /// measurements are noise, especially at tight cadence (anchor=1).
-    ///
-    /// Returns true when divergence is trending up, which suppresses
-    /// anchor/overshoot growth in the caller. **Never shrinks** the anchor
-    /// directly -- that's too aggressive and can kill convergence.
-    ///
-    /// Accumulators are reset after each averaging in finish_averaging_nccl().
-    fn check_nccl_divergence(&mut self) -> bool {
-        // Compute this interval's divergence score from weighted avg loss.
-        // Require minimum 10 batches per rank for statistical significance.
-        let min_batches = 10;
-        let divergence = if self.loss_count.iter().all(|&c| c >= min_batches) {
-            let avg_losses: Vec<f64> = self.loss_accum.iter()
-                .zip(&self.loss_count)
-                .map(|(&sum, &count)| sum / count as f64)
-                .collect();
-            let global_mean: f64 = avg_losses.iter().sum::<f64>()
-                / self.world_size as f64;
-            // Near-zero loss = converged. Relative divergence is noise.
-            if global_mean < 1e-4 {
-                0.0
-            } else {
-                avg_losses.iter()
-                    .map(|l| (l - global_mean).abs())
-                    .fold(0.0_f64, f64::max) / global_mean
-            }
-        } else {
-            // Not enough data this interval -- record 0 (no signal).
-            0.0
-        };
-
-        // Push to ring buffer (keep last 5 intervals).
-        if self.divergence_history.len() >= 5 {
-            self.divergence_history.pop_front();
-        }
-        self.divergence_history.push_back(divergence);
-
-        // Need at least 3 intervals to detect a trend.
-        if self.divergence_history.len() < 3 {
-            return false;
-        }
-
-        // Check if divergence is trending up: each of the last 3 values
-        // is higher than its predecessor. This filters out single spikes
-        // and noise -- only sustained drift suppresses growth.
-        let len = self.divergence_history.len();
-        let recent = &self.divergence_history;
-        let rising = recent[len - 1] > recent[len - 2]
-            && recent[len - 2] > recent[len - 3]
-            && recent[len - 1] > self.divergence_threshold;
-
-        if rising {
-            crate::verbose!(
-                "  ddp: NCCL divergence trending up | history={:.4?} | suppressing growth",
-                Vec::from(self.divergence_history.clone()),
-            );
-        }
-
-        rising
-    }
+    // check_nccl_divergence removed: replaced by ConvergenceGuard in finish_averaging_nccl.
 
     /// Common tail for CPU averaging: report snapshot counters to ElChe,
     /// apply divergence correction, subtract snapshots from current counters
@@ -1440,7 +1376,7 @@ impl Coordinator {
         avg_ms: f64,
         steps_snapshot: &[usize],
         wall_ms_snapshot: &[f64],
-        divergence: Option<f64>,
+        divergence_report: Option<super::convergence::DivergenceReport>,
     ) {
         self.last_avg_ms = avg_ms;
         let old_anchor = self.el_che.anchor();
@@ -1455,32 +1391,34 @@ impl Coordinator {
             }
         }
 
-        // Divergence correction: if replicas drifted apart, nudge ElChe's
-        // anchor down (tighter sync). One-directional pressure only; ElChe's
-        // overhead auto-tune handles loosening.
-        let diverged = if let Some(div) = divergence {
-            if div > self.divergence_threshold {
-                self.el_che.nudge_anchor_down(0.5);
-                crate::verbose!(
-                    "  ddp: divergence {div:.4} > {:.4}, anchor {} -> {}",
-                    self.divergence_threshold, old_anchor, self.el_che.anchor()
-                );
-                true
-            } else {
-                false
-            }
+        // Feed divergence to the unified convergence guard.
+        let action = if let Some(report) = divergence_report.as_ref() {
+            self.convergence_guard.report(report)
         } else {
-            false
+            super::convergence::ConvergenceAction::Stable
         };
 
-        // Auto-tune max_overshoot: shrink on divergence, grow on stability.
-        if self.overshoot_auto {
-            if diverged {
-                self.max_overshoot = self.overshoot_initial;
-            } else {
-                let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
-                self.max_overshoot = (self.max_overshoot + 1).min(cap);
+        match action {
+            super::convergence::ConvergenceAction::Stable => {
+                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
+                    let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
+                    self.max_overshoot = (self.max_overshoot + 1).min(cap);
+                }
             }
+            super::convergence::ConvergenceAction::SuppressGrowth => {}
+            super::convergence::ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.nudge_anchor_down(factor);
+                crate::verbose!(
+                    "  ddp: weight-space divergence nudge, anchor {} -> {}",
+                    old_anchor, self.el_che.anchor()
+                );
+                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
+                    self.max_overshoot = self.overshoot_initial;
+                }
+            }
+        }
+        if self.policy == ApplyPolicy::Async {
+            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
         }
 
         self.version += 1;
@@ -1794,24 +1732,39 @@ impl Coordinator {
     ) -> Result<CpuAvgResult> {
         let averaged = Self::average_params(&snapshots, version)?;
 
-        // Compute per-rank parameter L2 norm for divergence monitoring.
-        let mut norms = Vec::with_capacity(snapshots.len());
-        for snap in &snapshots {
-            let mut total_norm_sq = 0.0f64;
-            for p in &snap.params {
-                let n: f64 = p.norm()?.item()?;
-                total_norm_sq += n * n;
-            }
-            norms.push(total_norm_sq.sqrt());
+        // Compute ||average|| for normalization.
+        let mut avg_norm_sq = 0.0f64;
+        for p in &averaged.params {
+            let n: f64 = p.norm()?.item()?;
+            avg_norm_sq += n * n;
         }
+        let avg_norm = avg_norm_sq.sqrt();
 
-        let mean_norm: f64 = norms.iter().sum::<f64>() / norms.len() as f64;
-        let divergence = if mean_norm < 1e-10 {
-            None // all zeros, no meaningful divergence
+        let divergence = if avg_norm < 1e-10 {
+            None
         } else {
-            Some(norms.iter()
-                .map(|n| (n - mean_norm).abs())
-                .sum::<f64>() / mean_norm)
+            // Compute per-rank: ||snapshot - average|| / ||average||
+            // and per-rank pre-sync norm: ||snapshot||.
+            let mut deltas = Vec::with_capacity(snapshots.len());
+            let mut pre_norms = Vec::with_capacity(snapshots.len());
+            for snap in &snapshots {
+                let mut diff_sq = 0.0f64;
+                let mut pre_sq = 0.0f64;
+                for (sp, ap) in snap.params.iter().zip(&averaged.params) {
+                    let diff = sp.sub(ap)?;
+                    let dn: f64 = diff.norm()?.item()?;
+                    diff_sq += dn * dn;
+                    let pn: f64 = sp.norm()?.item()?;
+                    pre_sq += pn * pn;
+                }
+                deltas.push(diff_sq.sqrt() / avg_norm);
+                pre_norms.push(pre_sq.sqrt());
+            }
+            Some(super::convergence::DivergenceReport {
+                deltas,
+                pre_norms: Some(pre_norms),
+                post_norm: Some(avg_norm),
+            })
         };
 
         Ok(CpuAvgResult { averaged, divergence })
@@ -2549,13 +2502,13 @@ mod tests {
         assert_eq!(coord.steps_since_avg[0], 0);
         assert_eq!(coord.wall_ms_accum[0], 0.0);
 
-        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1 });
+        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1, sync_divergence: None });
         assert_eq!(coord.steps_since_avg[0], 1);
         assert!((coord.wall_ms_accum[0] - 10.0).abs() < 1e-9);
         assert!((coord.last_batch_ms[0] - 10.0).abs() < 1e-9);
 
         // Second message accumulates.
-        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 15.0, step_count: 2, param_norm: None, batch_loss: 0.1 });
+        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 15.0, step_count: 2, param_norm: None, batch_loss: 0.1, sync_divergence: None });
         assert_eq!(coord.steps_since_avg[0], 2);
         assert!((coord.wall_ms_accum[0] - 25.0).abs() < 1e-9);
         assert!((coord.last_batch_ms[0] - 15.0).abs() < 1e-9);
@@ -2752,27 +2705,26 @@ mod tests {
     // NCCL divergence detection (trend-based, gentle guardrail)
     // -----------------------------------------------------------------------
 
-    /// Helper: simulate one averaging interval with given loss accumulators.
-    fn run_interval(coord: &mut Coordinator, loss0: f64, count0: usize, loss1: f64, count1: usize) {
-        coord.loss_accum = vec![loss0, loss1];
-        coord.loss_count = vec![count0, count1];
+    /// Helper: simulate one averaging interval with given weight-space divergence.
+    fn run_interval_with_divergence(coord: &mut Coordinator, div0: f64, div1: f64) {
+        coord.nccl_sync_divergence = vec![Some(div0), Some(div1)];
         coord.wall_ms_accum = vec![100.0, 200.0];
-        coord.steps_since_avg = vec![count0, count1];
+        coord.steps_since_avg = vec![10, 10];
         coord.finish_averaging_nccl();
     }
 
     #[test]
     fn divergence_trend_suppresses_overshoot_growth() {
-        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Async, 1000);
         let overshoot_before = coord.max_overshoot;
 
-        // 3 intervals with rising divergence. avg_loss diverges more each time.
-        // Interval 1: rank0=0.10 rank1=0.11 -> div ~0.05
-        run_interval(&mut coord, 2.0, 20, 2.2, 20);
-        // Interval 2: rank0=0.10 rank1=0.13 -> div ~0.13
-        run_interval(&mut coord, 2.0, 20, 2.6, 20);
-        // Interval 3: rank0=0.10 rank1=0.16 -> div ~0.23
-        run_interval(&mut coord, 2.0, 20, 3.2, 20);
+        // 3 intervals with rising weight-space divergence.
+        // Interval 1: max_relative_delta = 0.05
+        run_interval_with_divergence(&mut coord, 0.03, 0.05);
+        // Interval 2: max_relative_delta = 0.13
+        run_interval_with_divergence(&mut coord, 0.08, 0.13);
+        // Interval 3: max_relative_delta = 0.23
+        run_interval_with_divergence(&mut coord, 0.15, 0.23);
 
         // Rising trend detected -> 3rd interval suppresses growth.
         // Overshoot should have grown for intervals 1-2 (no trend yet)
@@ -2785,12 +2737,12 @@ mod tests {
 
     #[test]
     fn divergence_no_trend_allows_overshoot_growth() {
-        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Async, 1000);
         let overshoot_before = coord.max_overshoot;
 
         // 3 intervals with flat low divergence (no trend).
         for _ in 0..3 {
-            run_interval(&mut coord, 2.0, 20, 2.02, 20); // ~1% divergence
+            run_interval_with_divergence(&mut coord, 0.005, 0.005);
         }
 
         let cap = (coord.total_samples / coord.batch_size.max(1) / 50).clamp(3, 10);
@@ -2801,11 +2753,11 @@ mod tests {
 
     #[test]
     fn divergence_single_spike_does_not_suppress() {
-        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Async, 1000);
         let overshoot_before = coord.max_overshoot;
 
         // Single high-divergence interval (no trend, need 3 for rising).
-        run_interval(&mut coord, 2.0, 20, 10.0, 20); // huge divergence
+        run_interval_with_divergence(&mut coord, 0.5, 0.8);
 
         assert!(coord.max_overshoot > overshoot_before,
             "single measurement should not suppress growth");
@@ -2817,10 +2769,10 @@ mod tests {
         coord.el_che.report_timing(&[100.0, 200.0], &[10, 10], 5.0);
         let anchor_before = coord.el_che.anchor();
 
-        // 5 intervals with rising divergence.
+        // 5 intervals with rising weight-space divergence.
         for i in 0..5 {
-            let spread = 0.5 + i as f64 * 0.3; // rising
-            run_interval(&mut coord, 2.0, 20, 2.0 + spread, 20);
+            let div = 0.05 + i as f64 * 0.03; // rising
+            run_interval_with_divergence(&mut coord, div * 0.8, div);
         }
 
         // Anchor must NEVER decrease from divergence detection.
@@ -2836,7 +2788,7 @@ mod tests {
         let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
         coord.loss_accum = vec![5.0, 3.0];
         coord.loss_count = vec![100, 50];
-        coord.interval_param_norm = vec![10.0, 12.0];
+        coord.nccl_sync_divergence = vec![Some(0.05), Some(0.03)];
         coord.wall_ms_accum = vec![100.0, 200.0];
         coord.steps_since_avg = vec![100, 50];
 
@@ -2844,7 +2796,8 @@ mod tests {
 
         assert_eq!(coord.loss_accum, vec![0.0, 0.0]);
         assert_eq!(coord.loss_count, vec![0, 0]);
-        assert_eq!(coord.interval_param_norm, vec![0.0, 0.0]);
+        // nccl_sync_divergence is reset after averaging.
+        assert_eq!(coord.nccl_sync_divergence, vec![None, None]);
     }
 
     #[test]
@@ -2852,16 +2805,16 @@ mod tests {
         let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
 
         for _ in 0..8 {
-            run_interval(&mut coord, 2.0, 20, 2.1, 20);
+            run_interval_with_divergence(&mut coord, 0.03, 0.05);
         }
 
-        assert!(coord.divergence_history.len() <= 5,
-            "history should be capped at 5, got {}", coord.divergence_history.len());
+        assert!(coord.convergence_guard.history().len() <= 5,
+            "history should be capped at 5, got {}", coord.convergence_guard.history().len());
     }
 
     #[test]
     fn divergence_overshoot_ceiling_caps() {
-        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Async, 1000);
         coord.overshoot_ceiling = 3;
         coord.max_overshoot = 5;
 
@@ -2880,21 +2833,20 @@ mod tests {
         assert_eq!(coord.loss_count[0], 0);
 
         coord.process_timing_msg(TimingMsg::Batch {
-            rank: 0, batch_ms: 10.0, step_count: 1, param_norm: Some(5.5), batch_loss: 0.3,
+            rank: 0, batch_ms: 10.0, step_count: 1, param_norm: Some(5.5), batch_loss: 0.3, sync_divergence: None,
         });
         assert!((coord.loss_accum[0] - 0.3).abs() < 1e-9);
         assert_eq!(coord.loss_count[0], 1);
-        assert!((coord.interval_param_norm[0] - 5.5).abs() < 1e-9);
 
         coord.process_timing_msg(TimingMsg::Batch {
-            rank: 0, batch_ms: 10.0, step_count: 2, param_norm: None, batch_loss: 0.2,
+            rank: 0, batch_ms: 10.0, step_count: 2, param_norm: None, batch_loss: 0.2, sync_divergence: None,
         });
         assert!((coord.loss_accum[0] - 0.5).abs() < 1e-9);
         assert_eq!(coord.loss_count[0], 2);
 
         // SyncNow ack (batch_loss=0.0) is skipped.
         coord.process_timing_msg(TimingMsg::Batch {
-            rank: 0, batch_ms: 0.0, step_count: 3, param_norm: None, batch_loss: 0.0,
+            rank: 0, batch_ms: 0.0, step_count: 3, param_norm: None, batch_loss: 0.0, sync_divergence: None,
         });
         assert_eq!(coord.loss_count[0], 2); // unchanged
 

@@ -23,6 +23,8 @@ pub fn def() -> ModelDef {
         dataset: make_dataset,
         train_fn: train_step,
         eval_fn: None, // loss is the metric
+        test_dataset: None,
+        augment_fn: None,
         optimizer: |p, lr| Box::new(Adam::new(p, lr)),
         scheduler: None,
         defaults: ModelDefaults {
