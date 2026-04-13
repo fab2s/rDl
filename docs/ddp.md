@@ -160,6 +160,28 @@ When distributed, `set_data_loader()` creates per-device backends:
 | `overhead_target(f64)` | 0.10 | AllReduce overhead ceiling as fraction of compute |
 | `max_anchor(Option<usize>)` | None (auto) | `None` = auto, `Some(0)` = disable El Che, `Some(n)` = fixed cap |
 | `max_grad_norm(f64)` | None | Per-rank gradient clipping before AllReduce. Clips accumulated gradients on all ranks (including replicas the caller cannot reach). Uses fused C++ kernel. |
+| `timeline(Arc<Timeline>)` | None | Attach a [`Timeline`](https://docs.rs/flodl/latest/flodl/monitor/struct.Timeline.html) so the DDP runtime injects sync/epoch/anchor events into the profiler stream. |
+
+### Graph DDP — LR scheduling
+
+A scheduler attached on the Graph DDP path drives every replica's
+optimizer LR through `Graph::step()`:
+
+| Method | Description |
+|--------|-------------|
+| `Graph::set_scheduler(Arc<dyn Scheduler>)` | Attach a per-batch scheduler. `step()` updates LR to `scheduler.lr(training_step) * lr_scale` before applying gradients. |
+| `Graph::set_lr_scale(f64)` | Linear-scaling multiplier (Goyal et al., 2017). Default `1.0`. Has no effect without a scheduler — bake the scaling into the optimizer's base LR instead. |
+| `Graph::training_step()` | Current step counter (increments once per `step()` call). |
+
+```rust
+use std::sync::Arc;
+use flodl::nn::MultiStepLR;
+
+let sched: Arc<dyn flodl::nn::Scheduler> =
+    Arc::new(MultiStepLR::new(0.1, &[100, 150], 0.1));
+graph.set_scheduler(sched);
+graph.set_lr_scale(world_size as f64);   // optional linear scaling
+```
 
 ### Manual DDP: Ddp::wrap()
 
@@ -316,6 +338,11 @@ let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
 | `.checkpoint_every(usize)` | No | None | Checkpoint interval (averaging events or epochs) |
 | `.checkpoint_fn(Fn)` | No | None | Checkpoint callback on rank 0 |
 | `.epoch_fn(Fn)` | No | None | Per-epoch callback inside each worker thread |
+| `.scheduler(factory)` | No | None | Per-worker LR scheduler factory closure. Each rank instantiates its own scheduler. Pairs with `.lr_scale_ratio()` for linear scaling. |
+| `.lr_scale_ratio(f64)` | No | 0.0 | Auto LR scaling factor for the linear scaling rule (Goyal et al., 2017). Effective `lr_scale = 1 + ratio * (world_size - 1)`. Set to `1.0` for full linear scaling, `0.0` (default) to disable. |
+| `.no_divergence_guard()` | No | (guard on) | Disable the convergence guard entirely. Useful during calibration runs when divergence trend logging adds more noise than signal. |
+| `.max_overshoot(usize)` | No | (auto-tuned) | Async-only: cap how many extra batches the fastest rank may run past the slowest before the next averaging event. Bounds the worst case explicitly when the auto-tuner is too permissive. |
+| `.timeline(Arc<Timeline>)` | No | None | Attach a `monitor::Timeline` so the DDP runtime injects `EpochStart/End`, `SyncStart/End`, `CpuAvgStart/End`, `AnchorChanged`, `Throttle` events into the profiler stream. |
 
 ### DdpRunConfig
 
@@ -326,6 +353,10 @@ Advanced config via `DdpRunConfig` (passed through the builder methods above):
 | `partition_ratios` | None | Fixed per-rank data splits (e.g. `[0.7, 0.3]`). Disables auto-rebalancing. |
 | `snapshot_timeout_secs` | 5 | CPU averaging timeout before soft-abort |
 | `progressive_dispatch` | Auto | When true, coordinator streams small chunks to workers instead of full epoch partitions. Auto enables for Cadence/Async policies. |
+| `no_divergence_guard` | false | Disable the convergence guard. Builder shortcut: `.no_divergence_guard()`. |
+| `max_overshoot` | None (auto) | Async-only overshoot cap. Builder shortcut: `.max_overshoot(N)`. |
+| `lr_scale_ratio` | 0.0 | Linear LR scaling ratio. Builder shortcut: `.lr_scale_ratio(F)`. |
+| `timeline` | None | `Arc<Timeline>` for profiler event injection. Builder shortcut: `.timeline(tl)`. |
 
 ### ApplyPolicy
 
@@ -717,6 +748,234 @@ sync (~8% accuracy) is worse than CPU async (~23%), while NCCL achieves
 has been fixed, but the root cause remains under investigation. The CPU
 backend is included in the codebase for completeness and will be fixed in a
 future release.
+
+---
+
+## Worked Example: ResNet-20 on CIFAR-10, A/B testable
+
+The
+[`ddp-bench/src/models/resnet_graph.rs`](https://github.com/fab2s/floDl/blob/main/ddp-bench/src/models/resnet_graph.rs)
++ [`harness.rs`](https://github.com/fab2s/floDl/blob/main/ddp-bench/src/harness.rs)
+pair is the canonical end-to-end DDP recipe in the repo. It wires together
+every moving part — model factory, train function, optimizer, scheduler,
+`Timeline`, `Monitor`, `record_scalar`, both Graph and Builder modes —
+behind a single CLI (`fdl ddp-bench --model resnet-graph --mode <mode>`)
+so the same code runs in 8 backend × policy combinations without a
+rewrite.
+
+This section walks through the wiring. Use it as a template when
+porting a real workload.
+
+### 1. Model factory + train step
+
+The model is built from a closure that takes a `Device` and returns a
+`Box<dyn Module>`. The same closure is reused by every rank and every
+A/B run — no shared state, no clones of GPU tensors.
+
+```rust
+fn build_model(device: Device) -> Result<Box<dyn Module>> {
+    let d = device;
+    let model = FlowBuilder::from(conv3x3(3, 16, 1, d)?)
+        .through(BatchNorm2d::on_device(16, d)?)
+        .through(ReLU)
+        // 3 BasicBlocks at 16ch
+        .also(res_main(16, 16, 1, d)?).through(ReLU)
+        .also(res_main(16, 16, 1, d)?).through(ReLU)
+        .also(res_main(16, 16, 1, d)?).through(ReLU)
+        // 32ch — first block downsamples (1x1 skip via also_with)
+        .also_with(downsample(16, 32, 2, d)?, res_main(16, 32, 2, d)?).through(ReLU)
+        .also(res_main(32, 32, 1, d)?).through(ReLU)
+        .also(res_main(32, 32, 1, d)?).through(ReLU)
+        // 64ch
+        .also_with(downsample(32, 64, 2, d)?, res_main(32, 64, 2, d)?).through(ReLU)
+        .also(res_main(64, 64, 1, d)?).through(ReLU)
+        .also(res_main(64, 64, 1, d)?).through(ReLU)
+        // Head
+        .through(AdaptiveAvgPool2d::new([1, 1]))
+        .through(Flatten::default())
+        .through(Linear::on_device(64, 10, d)?)
+        .tag("logits")           // observable from the monitor
+        .build()?;
+    Ok(Box::new(model))
+}
+
+fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+    let input  = Variable::new(batch[0].clone(), false);
+    let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
+    let pred   = model.forward(&input)?;
+
+    // Per-batch training accuracy, aggregated across all DDP ranks.
+    let predicted = pred.data().argmax(-1, false)?;
+    let correct: f64 = predicted.eq_tensor(&target.data())?.sum()?.item()?;
+    let total = target.data().shape()[0] as f64;
+    flodl::record_scalar("train_acc", correct / total);
+
+    flodl::cross_entropy_loss(&pred, &target)
+}
+```
+
+`flodl::record_scalar("train_acc", ...)` works in both Graph and Builder
+modes — the framework routes it to the right aggregator.
+
+### 2. Builder mode (thread-per-GPU) — A/B testable
+
+Wire `Timeline` + `Monitor` + per-worker scheduler factory + `record_scalar`
+in one chain. Switching between Sync / Cadence / Async × NCCL / CPU is
+literally two `.policy(...).backend(...)` lines.
+
+```rust
+let timeline = Timeline::new(100);   // 100ms poll interval
+timeline.start();
+
+let mut builder = Ddp::builder(
+        build_model,                                   // model factory
+        |params: &[Parameter]| SGD::new(params, 0.1, 0.9).weight_decay(1e-4),
+        train_step,                                    // train fn
+    )
+    .dataset(dataset.clone())
+    .batch_size(64)
+    .num_epochs(200)
+    .policy(ApplyPolicy::Cadence)                      // <-- A
+    .backend(AverageBackend::Nccl)                     // <-- B
+    .max_grad_norm(5.0)
+    .lr_scale_ratio(1.0)                               // linear scaling rule
+    .timeline(Arc::clone(&timeline));                  // profiler events
+
+// Per-worker scheduler factory: each rank instantiates its own copy.
+let total_steps = dataset.len() / 64 * 200;
+builder = builder.scheduler(move |world_size| {
+    Arc::from(MultiStepLR::new(
+        0.1, &[total_steps / 2, total_steps * 3 / 4], 0.1,
+    )) as Arc<dyn flodl::nn::Scheduler>
+});
+
+let handle = builder.run()?;
+
+// Wire the live monitor (HTML dashboard + SSE).
+// Monitor::new takes the total number of epochs (used for ETA + progress bars).
+let mut monitor = Monitor::new(200);
+handle.setup_monitor(&mut monitor);
+
+// Stream per-epoch metrics as they land
+while let Some(m) = handle.next_metrics() {
+    flodl::msg!(
+        "epoch {} | loss={:.4} | acc={:.3} | {:.0}ms",
+        m.epoch, m.avg_loss,
+        m.scalars.get("train_acc").copied().unwrap_or(0.0),
+        m.epoch_ms,
+    );
+    monitor.log(m.epoch, Duration::from_millis(m.epoch_ms as u64), &m);
+}
+
+let state: TrainedState = handle.join()?;   // averaged params + buffers
+timeline.stop();
+timeline.save_html("runs/resnet-graph/cadence-nccl/timeline.html")?;
+```
+
+To produce a clean A/B comparison, capture `base()` as a closure factory:
+
+```rust
+let base = || {
+    Ddp::builder(build_model, opt_factory.clone(), train_step)
+        .dataset(dataset.clone())
+        .batch_size(64)
+        .num_epochs(5)                              // smoke run
+        .max_grad_norm(5.0)
+        .lr_scale_ratio(1.0)
+        .timeline(Arc::clone(&timeline))            // shared profiler
+};
+
+// Three runs, one knob change each
+let a = base().policy(ApplyPolicy::Async)  .backend(AverageBackend::Nccl).run()?.join()?;
+let b = base().policy(ApplyPolicy::Cadence).backend(AverageBackend::Nccl).run()?.join()?;
+let c = base().policy(ApplyPolicy::Sync)   .backend(AverageBackend::Nccl).run()?.join()?;
+```
+
+Same data, same seed, same model factory — only the policy/backend pair
+differs. Compare the three saved timelines and per-epoch metrics to pick
+a winner.
+
+### 3. Graph mode (sync) — same wiring, fewer pieces
+
+`Ddp::setup_with` + `DdpConfig::new().timeline(...)` gives the Graph DDP
+path the same A/B-testable surface, with the user-owned training loop:
+
+```rust
+let graph = build_model(Device::CUDA(0))?;
+let graph = graph.as_graph().expect("Graph required");
+
+Ddp::setup_with(
+    graph,
+    move |dev| build_model(dev),
+    move |params: &[Parameter]| SGD::new(params, 0.1, 0.9).weight_decay(1e-4),
+    DdpConfig::new()
+        .timeline(Arc::clone(&timeline)),            // event injection
+)?;
+
+// Attach the same scheduler used in builder mode
+let total_steps = dataset.len() / 64 * 200;
+let sched: Arc<dyn flodl::nn::Scheduler> =
+    Arc::from(MultiStepLR::new(0.1, &[total_steps / 2, total_steps * 3 / 4], 0.1));
+graph.set_scheduler(sched);
+graph.set_lr_scale(graph.world_size() as f64);      // linear scaling
+
+let mut monitor = Monitor::new(200);   // total_epochs
+monitor.watch(graph);
+
+for epoch in 0..200 {
+    let t0 = Instant::now();
+    for batch in load_epoch(&dataset, 64) {
+        let loss = train_step(graph, &batch)?;
+        loss.backward()?;
+        graph.step()?;                              // AllReduce + opt + zero_grad + LR
+    }
+    monitor.log(epoch, t0.elapsed(), graph);
+}
+```
+
+The cross-mode parity test (`graph_tests.rs`) guarantees that this loop
+and the builder loop above produce the same LR schedule for the same
+`MultiStepLR`, so A/B comparisons across modes are meaningful.
+
+### 4. What you get for free
+
+- **Live HTML dashboard** at `monitor.serve()`: per-rank loss curves,
+  GPU utilization, VRAM, anchor/throughput evolution.
+- **`timeline.save_html(...)`**: post-hoc swimlane view of CPU/GPU
+  utilization, sync events, anchor changes, idle gaps.
+- **`record_scalar("k", v)`**: any per-batch scalar shows up in the
+  dashboard, the JSON archive, and `EpochMetrics::scalars`.
+- **`flodl::msg!` / `verbose!` / `debug!` / `trace!`**: gated logging
+  controlled by `fdl -v / -vv / -vvv / --quiet` or
+  `FLODL_VERBOSITY=verbose`. Same code, three verbosity levels for
+  development vs CI vs production.
+
+### 5. Drive it from `fdl.yaml`
+
+The
+[`ddp-bench/fdl.yml.example`](https://github.com/fab2s/floDl/blob/main/ddp-bench/fdl.yml.example)
+turns the matrix into named jobs:
+
+```yaml
+jobs:
+  validate:
+    description: Check convergence against structured baselines
+    options: { model: all, mode: all, validate: true,
+               baseline: baselines/structured.json }
+  nccl-cadence:
+    description: NCCL cadence for all models
+    options: { model: all, mode: nccl-cadence }
+```
+
+```bash
+fdl ddp-bench validate            # full sweep
+fdl ddp-bench nccl-cadence -v     # one mode, verbose
+```
+
+Every run drops `training.log`, `timeline.{json,csv,html}`, and
+`metrics.json` under `runs/<model>/<mode>/`. The reporter
+(`fdl ddp-bench --report runs/report.md`) collates them into a
+Markdown convergence table.
 
 ---
 
