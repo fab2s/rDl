@@ -3256,3 +3256,99 @@ fn test_dispatch_skips_aggregated_epochs() {
         "slow GPU should be on epoch 2+, got epoch {}",
         h.coord.rank_epoch[1]);
 }
+
+// ---------------------------------------------------------------------------
+// LR scheduling on the worker
+// ---------------------------------------------------------------------------
+//
+// These tests guard the per-batch LR pipeline: scheduler.lr(step) * lr_scale
+// must reach the optimizer on every batch. The original bugs (2026-04-13)
+// were that scale_lr was silently overwritten when a scheduler was attached
+// (so DDP linear scaling never took effect) and that the scheduler step
+// counter could be inflated by NCCL ack messages (so MultiStepLR fired
+// ~6 epochs early on heterogeneous DDP).
+
+/// Trivial constant-LR scheduler used to assert `worker.lr_scale` is applied
+/// multiplicatively on top of scheduler output.
+struct ConstLr(f64);
+impl crate::nn::Scheduler for ConstLr {
+    fn lr(&self, _step: usize) -> f64 { self.0 }
+}
+
+/// Linearly increasing LR (lr = step * slope), so the test can also verify
+/// that the scheduler is queried with the correct training step.
+struct LinearLr { slope: f64 }
+impl crate::nn::Scheduler for LinearLr {
+    fn lr(&self, step: usize) -> f64 { step as f64 * self.slope }
+}
+
+#[test]
+fn test_worker_scheduler_drives_optimizer_lr() {
+    let (mut worker, _ch) = make_test_worker();
+    worker.set_lr(0.0); // start at 0 so we can detect the scheduler writing in
+
+    worker.set_scheduler(Arc::new(ConstLr(0.05)));
+
+    let opts = test_opts();
+    let batch = vec![
+        Tensor::randn(&[4, 4], opts).unwrap(),
+        Tensor::randn(&[4, 2], opts).unwrap(),
+    ];
+    worker.train_step(&batch, &mse_train).unwrap();
+
+    // Scheduler returned 0.05; with lr_scale=1.0 (default) optimizer sees 0.05.
+    assert!((worker.current_lr() - 0.05).abs() < 1e-9,
+        "expected optimizer LR 0.05, got {}", worker.current_lr());
+}
+
+#[test]
+fn test_worker_lr_scale_multiplies_scheduler_output() {
+    // The bug this guards: orchestrator used to call worker.scale_lr(2.0) at
+    // startup, but the scheduler's per-batch set_lr immediately overwrote
+    // it -- so DDP linear scaling never reached the optimizer when a
+    // scheduler was attached. Fix: orchestrator now calls set_lr_scale and
+    // train_step does set_lr(sched.lr(step) * lr_scale).
+    let (mut worker, _ch) = make_test_worker();
+    worker.set_scheduler(Arc::new(ConstLr(0.05)));
+    worker.set_lr_scale(2.0);
+
+    let opts = test_opts();
+    let batch = vec![
+        Tensor::randn(&[4, 4], opts).unwrap(),
+        Tensor::randn(&[4, 2], opts).unwrap(),
+    ];
+    worker.train_step(&batch, &mse_train).unwrap();
+
+    // 0.05 * 2.0 = 0.10
+    assert!((worker.current_lr() - 0.10).abs() < 1e-9,
+        "expected optimizer LR 0.10 (sched 0.05 * scale 2.0), got {}",
+        worker.current_lr());
+}
+
+#[test]
+fn test_worker_scheduler_step_advances_with_global_progress() {
+    // train_step computes set_lr(sched.lr(global_step + steps_since_avg)).
+    // After 3 batches (no sync), step argument should be 3.
+    let (mut worker, _ch) = make_test_worker();
+    worker.set_scheduler(Arc::new(LinearLr { slope: 0.01 }));
+
+    let opts = test_opts();
+    let batch = vec![
+        Tensor::randn(&[4, 4], opts).unwrap(),
+        Tensor::randn(&[4, 2], opts).unwrap(),
+    ];
+
+    worker.train_step(&batch, &mse_train).unwrap();
+    // Before batch 1, scheduler was queried at step 0 -> lr = 0.0.
+    assert!((worker.current_lr() - 0.0).abs() < 1e-9);
+
+    worker.train_step(&batch, &mse_train).unwrap();
+    // Before batch 2, scheduler queried at step 1 -> lr = 0.01.
+    assert!((worker.current_lr() - 0.01).abs() < 1e-9,
+        "step 1: got {}", worker.current_lr());
+
+    worker.train_step(&batch, &mse_train).unwrap();
+    // Before batch 3, scheduler queried at step 2 -> lr = 0.02.
+    assert!((worker.current_lr() - 0.02).abs() < 1e-9,
+        "step 2: got {}", worker.current_lr());
+}

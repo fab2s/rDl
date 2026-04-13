@@ -344,6 +344,13 @@ impl<M: Module> GpuWorker<M> {
         self.optimizer.set_lr(lr);
     }
 
+    /// Current learning rate on this worker's optimizer. Reflects the most
+    /// recent value written by either [`Self::set_lr`], the attached
+    /// scheduler (in `train_step`), or [`Self::scale_lr`].
+    pub fn current_lr(&self) -> f64 {
+        self.optimizer.lr()
+    }
+
     /// Scale the learning rate by a factor (for DDP linear scaling rule).
     ///
     /// Applies the scaling to the optimizer immediately. Has no effect on

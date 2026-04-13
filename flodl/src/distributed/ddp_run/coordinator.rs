@@ -2887,4 +2887,66 @@ mod tests {
 
         assert_eq!(coord.loss_count[1], 0); // rank 1 independent
     }
+
+    // -----------------------------------------------------------------------
+    // SyncAck handling (regression guard: do not inflate steps_since_avg)
+    // -----------------------------------------------------------------------
+
+    /// SyncAck must NOT increment steps_since_avg, otherwise every NCCL sync
+    /// inflates global_step by one batch per rank and the LR scheduler fires
+    /// early. Real bug found 2026-04-13: with ~27 syncs/epoch * 2 ranks the
+    /// inflation was 6.9% and a MultiStepLR milestone at total/2 fired at
+    /// epoch 94 instead of 100.
+    #[test]
+    fn sync_ack_does_not_inflate_steps_since_avg() {
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+
+        // Simulate 10 real batches on each rank.
+        for step in 1..=10 {
+            for rank in 0..2 {
+                coord.process_timing_msg(TimingMsg::Batch {
+                    rank, batch_ms: 5.0, step_count: step,
+                    param_norm: None, batch_loss: 0.1, sync_divergence: None,
+                });
+            }
+        }
+        assert_eq!(coord.steps_since_avg, vec![10, 10]);
+        let wall_before: Vec<f64> = coord.wall_ms_accum.clone();
+
+        // Inject a SyncAck for each rank (post-NCCL ack).
+        for rank in 0..2 {
+            coord.process_timing_msg(TimingMsg::SyncAck {
+                rank, step_count: 11, divergence: Some(0.01),
+            });
+        }
+
+        // The killer assertion: SyncAck must leave steps_since_avg untouched.
+        assert_eq!(coord.steps_since_avg, vec![10, 10],
+            "SyncAck must not be counted as a real batch");
+        // Wall-time accumulator also untouched (it's per-batch wall time).
+        assert_eq!(coord.wall_ms_accum, wall_before);
+        // But last_step_count must reflect the post-sync step.
+        assert_eq!(coord.last_step_count, vec![11, 11]);
+        // Divergence captured.
+        assert_eq!(coord.nccl_sync_divergence[0], Some(0.01));
+        assert_eq!(coord.nccl_sync_divergence[1], Some(0.01));
+    }
+
+    /// SyncAck must satisfy nccl_ack so the next averaging cycle isn't blocked.
+    #[test]
+    fn sync_ack_satisfies_nccl_ack() {
+        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
+        // Snapshot the step counters at sync trigger time (rank0=5, rank1=5).
+        coord.nccl_sync_step = vec![5, 5];
+        coord.nccl_ack = vec![false, false];
+
+        // Worker reports SyncAck with step_count=6 (one past snapshot).
+        for rank in 0..2 {
+            coord.process_timing_msg(TimingMsg::SyncAck {
+                rank, step_count: 6, divergence: None,
+            });
+        }
+        assert_eq!(coord.nccl_ack, vec![true, true],
+            "SyncAck with step_count > snapshot must flip nccl_ack");
+    }
 }
