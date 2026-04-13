@@ -167,7 +167,7 @@ Maps 1:1 to `DdpConfig` and `DdpRunConfig`.
 | anchor | auto/int | auto | Initial slow-GPU batches between syncs |
 | max_anchor | int | 200 | Gradient staleness ceiling |
 | overhead_target | float | 0.10 | AllReduce overhead fraction target |
-| divergence_threshold | float | 0.05 | Param norm drift trigger (Async only) |
+| divergence_threshold | float | 0.05 | Param norm drift trigger for the trend guard (Cadence and Async; Sync is a no-op by construction) |
 | max_batch_diff | int/null | null | Max batch lead fast over slow. null=unlimited, 0=lockstep |
 | speed_hint | object | null | `{slow_rank: int, ratio: float}`, optional warm-start |
 | partition_ratios | list/null | null | Explicit e.g. [0.7, 0.3], disables auto-balance |
