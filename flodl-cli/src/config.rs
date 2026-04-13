@@ -359,3 +359,53 @@ fn merge_output(base: &Option<OutputConfig>, over: &Option<OutputConfig>) -> Out
         monitor: merge_field!(base, over, monitor),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Resolve the project root (where fdl.yml / fdl.yml.example live) starting
+    /// from CARGO_MANIFEST_DIR. The CLI crate sits one level down.
+    fn project_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("flodl-cli parent must be project root")
+            .to_path_buf()
+    }
+
+    fn load_example() -> ProjectConfig {
+        let path = project_root().join("fdl.yml.example");
+        assert!(
+            path.is_file(),
+            "fdl.yml.example missing at {} -- the CLI depends on it as the canonical config template",
+            path.display()
+        );
+        load_project(&path).expect("fdl.yml.example must parse as a valid ProjectConfig")
+    }
+
+    /// Regression guard: fdl.yml.example must keep a working `doc` script.
+    /// The fdl.doc pipeline (api-ref for the port skill, rustdoc warning
+    /// enforcement in CI) depends on this entry existing and producing output.
+    #[test]
+    fn fdl_yml_example_has_doc_script() {
+        let cfg = load_example();
+        let doc = cfg.scripts.get("doc").unwrap_or_else(|| {
+            panic!("fdl.yml.example is missing a `doc` script; the rustdoc pipeline \
+                    depends on `fdl doc` being defined")
+        });
+        let cmd = doc.command();
+        assert!(!cmd.trim().is_empty(),
+            "fdl.yml.example `doc` script has an empty `run:` command");
+        assert!(cmd.contains("cargo doc"),
+            "fdl.yml.example `doc` script must invoke `cargo doc`, got: {cmd}");
+        // Must assert some output was produced -- otherwise rustdoc can
+        // silently succeed without writing anything useful (e.g. when the
+        // target crate fails to resolve). Keeping the exact check liberal:
+        // any mention of target/doc as a produced artifact counts.
+        assert!(
+            cmd.contains("target/doc"),
+            "fdl.yml.example `doc` script must verify output was produced \
+             (expected a `test -f target/doc/...` check), got: {cmd}"
+        );
+    }
+}

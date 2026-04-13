@@ -23,8 +23,8 @@ scripts:
     run: cargo clippy --tests -- -W clippy::all && cd ddp-bench && cargo clippy --tests -- -W clippy::all
     docker: dev
   doc:
-    description: Generate API docs
-    run: cargo doc --no-deps --document-private-items
+    description: Generate API docs (strict, fails on warnings)
+    run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
     docker: dev
   shell:
     description: Interactive shell in dev container
