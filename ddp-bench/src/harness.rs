@@ -476,6 +476,20 @@ fn run_sync(
         DdpConfig::new().timeline(Arc::clone(timeline)),
     )?;
 
+    // Attach the model's LR scheduler so sync mode anneals like solo/builder.
+    // Without this, the Graph trains at constant LR for the whole run.
+    let solo_batches = if real_data {
+        dataset.len() / config.batch_size
+    } else {
+        batches_per_epoch
+    };
+    if let Some(sf) = model_def.scheduler {
+        let total_steps = solo_batches * config.epochs;
+        let world = graph.world_size();
+        let sched: Box<dyn flodl::nn::Scheduler> = sf(config.lr, total_steps, world);
+        graph.set_scheduler(Arc::from(sched));
+    }
+
     monitor.watch(graph);
 
     let mut epoch_times = Vec::with_capacity(config.epochs);

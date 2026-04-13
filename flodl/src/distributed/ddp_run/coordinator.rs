@@ -979,6 +979,22 @@ impl Coordinator {
                     self.nccl_ack[rank] = true;
                 }
             }
+            TimingMsg::SyncAck { rank, step_count, divergence } => {
+                // Post-SyncNow ack: update step count for nccl_ack + capture
+                // divergence, but do NOT increment steps_since_avg. Treating
+                // this as a batch inflates global_step by one per sync per
+                // rank, firing LR schedulers early.
+                self.last_step_count[rank] = self.last_step_count[rank].max(step_count);
+                if let Some(div) = divergence {
+                    self.nccl_sync_divergence[rank] = Some(div);
+                }
+                if rank < self.nccl_ack.len()
+                    && !self.nccl_ack[rank]
+                    && step_count > self.nccl_sync_step[rank]
+                {
+                    self.nccl_ack[rank] = true;
+                }
+            }
             TimingMsg::Exiting { .. } => {
                 self.active_count = self.active_count.saturating_sub(1);
             }

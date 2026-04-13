@@ -545,6 +545,22 @@ pub enum TimingMsg {
         /// Only set in the post-sync ack message; `None` for regular batches.
         sync_divergence: Option<f64>,
     },
+    /// Post-SyncNow acknowledgment: proves the worker completed the NCCL
+    /// AllReduce, without being counted as a real training batch.
+    ///
+    /// Satisfies the coordinator's `nccl_ack` check (`step_count >
+    /// nccl_sync_step`) without inflating `steps_since_avg`. Using
+    /// [`TimingMsg::Batch`] here would add a phantom batch per sync per
+    /// rank, inflating `global_step` and firing the LR scheduler early.
+    SyncAck {
+        /// Which GPU sent this.
+        rank: usize,
+        /// Worker's local step counter after the sync.
+        step_count: usize,
+        /// Weight-space divergence from the AllReduce:
+        /// `||params_before - params_after|| / ||params_after||`.
+        divergence: Option<f64>,
+    },
     /// Worker is about to exit. Coordinator must stop including this rank
     /// in collectives before processing any further messages.
     Exiting {

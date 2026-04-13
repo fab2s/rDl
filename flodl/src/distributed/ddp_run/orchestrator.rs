@@ -489,8 +489,18 @@ impl DdpHandle {
                         )?;
 
                         // Apply linear LR scaling for DDP.
+                        //
+                        // With a scheduler attached, we store the factor so
+                        // it can be applied multiplicatively to the
+                        // scheduler's output every batch. Without a
+                        // scheduler, we scale the optimizer's LR once at
+                        // startup and leave it alone.
                         if lr_scale > 1.0 {
-                            worker.scale_lr(lr_scale);
+                            if scheduler_w.is_some() {
+                                worker.set_lr_scale(lr_scale);
+                            } else {
+                                worker.scale_lr(lr_scale);
+                            }
                         }
 
                         // Attach per-batch LR scheduler (global step tracking).

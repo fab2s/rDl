@@ -181,6 +181,48 @@ impl Graph {
         }
     }
 
+    /// Attach a per-batch LR scheduler.
+    ///
+    /// When set, `step()` updates every optimizer's learning rate to
+    /// `scheduler.lr(training_step) * lr_scale` before the optimizer step.
+    /// The internal `training_step` counter increments once per `step()`
+    /// call and is independent of the recurrent-state `step_count`.
+    ///
+    /// Works for both single-GPU and distributed graphs.
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// let sched: Arc<dyn Scheduler> = Arc::new(MultiStepLR::new(0.1, &[100, 150], 0.1));
+    /// graph.set_scheduler(sched);
+    /// ```
+    pub fn set_scheduler(&self, scheduler: std::sync::Arc<dyn crate::nn::Scheduler>) {
+        *self.scheduler.borrow_mut() = Some(scheduler);
+    }
+
+    /// Set the DDP linear-scaling factor (Goyal et al., 2017) applied to the
+    /// attached scheduler's output every batch. Defaults to 1.0 (no scaling).
+    ///
+    /// Has no effect if no scheduler is attached; bake the scaling into the
+    /// optimizer's base LR instead for that case.
+    pub fn set_lr_scale(&self, scale: f64) {
+        self.lr_scale.set(scale);
+    }
+
+    /// Current training step (increments once per `step()` call). Used by the
+    /// attached scheduler, if any.
+    pub fn training_step(&self) -> usize {
+        self.training_step.get()
+    }
+
+    /// Compute the scheduled LR for the current training step, if a
+    /// scheduler is attached. Returns `None` when no scheduler is set so
+    /// the caller can leave the optimizer LR alone.
+    fn scheduled_lr(&self) -> Option<f64> {
+        let sched = self.scheduler.borrow();
+        sched.as_ref()
+            .map(|s| s.lr(self.training_step.get()) * self.lr_scale.get())
+    }
+
     /// Perform one training step.
     ///
     /// When distributed: AllReduce gradients (weighted if auto-balanced),
@@ -189,6 +231,11 @@ impl Graph {
     ///
     /// This is the single call that replaces `opt.step(); opt.zero_grad();`
     /// and makes multi-GPU training transparent.
+    ///
+    /// When a scheduler is attached via [`Self::set_scheduler`], every
+    /// optimizer's LR is updated from `scheduler.lr(training_step) *
+    /// lr_scale` before the step, and `training_step` increments by one
+    /// after.
     pub fn step(&self) -> Result<()> {
         let mut dist = self.distributed.borrow_mut();
         if let Some(ref mut state) = *dist {
@@ -297,6 +344,11 @@ impl Graph {
                         tl.event(crate::monitor::EventKind::SyncEnd { duration_ms: sync_ms });
                     }
 
+                    if let Some(lr) = self.scheduled_lr() {
+                        for opt in &mut state.optimizers {
+                            opt.set_lr(lr);
+                        }
+                    }
                     for opt in &mut state.optimizers {
                         opt.step()?;
                     }
@@ -368,6 +420,11 @@ impl Graph {
                     tl.event(crate::monitor::EventKind::SyncEnd { duration_ms: dur });
                 }
 
+                if let Some(lr) = self.scheduled_lr() {
+                    for opt in &mut state.optimizers {
+                        opt.set_lr(lr);
+                    }
+                }
                 for opt in &mut state.optimizers {
                     opt.step()?;
                 }
@@ -380,12 +437,17 @@ impl Graph {
             }
         } else {
             // Single GPU
+            let scheduled = self.scheduled_lr();
             let mut opt = self.optimizer.borrow_mut();
             if let Some(ref mut optimizer) = *opt {
+                if let Some(lr) = scheduled {
+                    optimizer.set_lr(lr);
+                }
                 optimizer.step()?;
                 optimizer.zero_grad();
             }
         }
+        self.training_step.set(self.training_step.get() + 1);
         Ok(())
     }
 

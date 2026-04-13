@@ -86,6 +86,11 @@ pub struct GpuWorker<M: Module> {
     /// Per-batch LR scheduler. When set, the worker adjusts the optimizer's
     /// learning rate before each `optimizer.step()`.
     scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
+    /// DDP linear-scaling factor (Goyal et al., 2017). Applied multiplicatively
+    /// to the scheduler's output each batch, so schedulers see the scaling too.
+    /// When no scheduler is attached, the scaling is baked into the optimizer
+    /// once at startup via [`Self::scale_lr`]. Default: 1.0 (no scaling).
+    lr_scale: f64,
 
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.
@@ -298,6 +303,7 @@ impl<M: Module> GpuWorker<M> {
             pending_plan: None,
             global_step: 0,
             scheduler: None,
+            lr_scale: 1.0,
             checkpoint_fn,
             prefetch,
             per_sample_bytes,
@@ -339,14 +345,27 @@ impl<M: Module> GpuWorker<M> {
     }
 
     /// Scale the learning rate by a factor (for DDP linear scaling rule).
+    ///
+    /// Applies the scaling to the optimizer immediately. Has no effect on
+    /// subsequent schedulers: use [`Self::set_lr_scale`] for a factor that
+    /// persists across scheduler updates.
     pub fn scale_lr(&mut self, factor: f64) {
         self.optimizer.scale_lr(factor);
     }
 
+    /// Set the DDP linear-scaling factor without touching the optimizer's
+    /// current LR. Applied multiplicatively to the attached scheduler's
+    /// output on every batch, so the scaling survives per-batch LR updates.
+    pub fn set_lr_scale(&mut self, scale: f64) {
+        self.lr_scale = scale;
+    }
+
     /// Attach a per-batch LR scheduler.
     ///
-    /// When set, the worker computes `scheduler.lr(global_step + steps_since_avg)`
-    /// before each optimizer step, ensuring the LR tracks global training progress.
+    /// When set, the worker computes
+    /// `scheduler.lr(global_step + steps_since_avg) * lr_scale` before each
+    /// optimizer step, ensuring the LR tracks global training progress and
+    /// honors the DDP linear-scaling rule.
     pub fn set_scheduler(&mut self, sched: Arc<dyn crate::nn::Scheduler>) {
         self.scheduler = Some(sched);
     }
@@ -553,9 +572,11 @@ impl<M: Module> GpuWorker<M> {
         // Per-batch LR: scheduler tracks global progress.
         // global_step = total batches at last sync, steps_since_avg = local
         // batches since then. The LR reflects this worker's real position
-        // in the global schedule.
+        // in the global schedule, multiplied by the DDP linear-scaling factor
+        // (1.0 when lr_scale_ratio == 0 or world_size == 1).
         if let Some(ref sched) = self.scheduler {
-            self.optimizer.set_lr(sched.lr(self.global_step + self.steps_since_avg));
+            let base = sched.lr(self.global_step + self.steps_since_avg);
+            self.optimizer.set_lr(base * self.lr_scale);
         }
 
         // Optimizer step (GPU-local Adam, ~0.1ms fused kernel)
@@ -621,13 +642,22 @@ impl<M: Module> GpuWorker<M> {
                 let divergence = self.sync_now_nccl()?;
                 crate::debug!("  ddp-worker: rank {} SyncNow done", self.rank);
                 self.steps_since_avg = 0;
-                // Bump local_step and send a timing ack so the coordinator's
-                // nccl_ack mechanism sees step_count > snapshot. Without this,
-                // a SyncNow processed in wait_for_epoch_plan (no batches to
-                // train afterward) leaves nccl_ack permanently false, blocking
-                // all future should_average() calls.
+                // Bump local_step and send a dedicated SyncAck so the
+                // coordinator's nccl_ack mechanism sees step_count > snapshot.
+                // Without this, a SyncNow processed in wait_for_epoch_plan
+                // (no batches to train afterward) leaves nccl_ack permanently
+                // false, blocking all future should_average() calls.
+                //
+                // SyncAck is used instead of TimingMsg::Batch so the
+                // coordinator doesn't count this as a real batch -- that would
+                // inflate steps_since_avg (and thus global_step) by one per
+                // sync per rank, firing the LR scheduler early.
                 self.local_step += 1;
-                let _ = self.report_timing(0.0, None, 0.0, divergence);
+                let _ = self.timing_tx.send(TimingMsg::SyncAck {
+                    rank: self.rank,
+                    step_count: self.local_step,
+                    divergence,
+                });
             }
             ControlMsg::StartEpoch(plan) => {
                 self.pending_plan = Some(plan);
