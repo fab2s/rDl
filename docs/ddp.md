@@ -16,7 +16,7 @@ Graph-based models where you want transparent scaling.
 
 **DDP Builder** -- works with any `Module`. Thread-per-GPU with Local SGD.
 3 policies x 2 backends = 6 configs, swappable in one line for A/B testing.
-NCCL backend recommended; CPU backend has a known bug (see Strategy Guide).
+Both NCCL and CPU backends are production-ready.
 Best for non-Graph modules or when you need maximum configurability.
 
 ### Which one to use
@@ -229,16 +229,16 @@ After each sync, `report_timing(wall_ms, sync_ms)` is called:
 
 **Speed discovery:**
 - Each rank's `ms_per_batch` is computed as `wall_ms[rank] / batch_count[rank]`
-- EMA-smoothed with error-adaptive alpha: large corrections (>20% off) use
-  alpha=0.5 for fast catch-up; small jitter (<5%) uses alpha=0.1 or is
-  ignored entirely (dead-zone hysteresis)
+- EMA-smoothed with error-adaptive alpha: `alpha = clamp(prediction_error, 0.1, 0.8)`.
+  Large corrections use high alpha for fast catch-up; small jitter uses low alpha
+  for stability
 - Speed ratios derived from relative ms_per_batch values (slowest = 1.0)
 
 **Anchor auto-tuning:**
 - `overhead_ratio = sync_ms / (wall_ms - sync_ms)` measures what fraction
   of compute time was spent in AllReduce
-- If overhead > target: increase anchor by `max(2, 1.5x)` (aggressive,
-  because overhead is wasted GPU time)
+- If overhead > target: increase anchor by `ceil(anchor * overhead / target)`
+  (proportional to the excess, because overhead is wasted GPU time)
 - If overhead < target/2: decrease anchor by 1 (gradual, because lower
   anchor means fresher gradients)
 - Anchor is clamped to `[1, max_anchor]`
@@ -339,7 +339,7 @@ let ddp = Ddp::builder(model_factory, optim_factory, train_fn)
 | `.checkpoint_fn(Fn)` | No | None | Checkpoint callback on rank 0 |
 | `.epoch_fn(Fn)` | No | None | Per-epoch callback inside each worker thread |
 | `.scheduler(factory)` | No | None | Per-worker LR scheduler factory closure. Each rank instantiates its own scheduler. Pairs with `.lr_scale_ratio()` for linear scaling. |
-| `.lr_scale_ratio(f64)` | No | 0.0 | Auto LR scaling factor for the linear scaling rule (Goyal et al., 2017). Effective `lr_scale = 1 + ratio * (world_size - 1)`. Set to `1.0` for full linear scaling, `0.0` (default) to disable. |
+| `.lr_scale_ratio(f64)` | No | 1.0 | Auto LR scaling factor for the linear scaling rule (Goyal et al., 2017). Effective `lr_scale = 1 + ratio * (world_size - 1)`. `1.0` (default) for full linear scaling, `0.0` to disable. |
 | `.no_divergence_guard()` | No | (guard on) | Disable the convergence guard entirely. Useful during calibration runs when divergence trend logging adds more noise than signal. |
 | `.max_overshoot(usize)` | No | (auto-tuned) | Async-only: cap how many extra batches the fastest rank may run past the slowest before the next averaging event. Bounds the worst case explicitly when the auto-tuner is too permissive. |
 | `.timeline(Arc<Timeline>)` | No | None | Attach a `monitor::Timeline` so the DDP runtime injects `EpochStart/End`, `SyncStart/End`, `CpuAvgStart/End`, `AnchorChanged`, `Throttle` events into the profiler stream. |
@@ -355,7 +355,7 @@ Advanced config via `DdpRunConfig` (passed through the builder methods above):
 | `progressive_dispatch` | Auto | When true, coordinator streams small chunks to workers instead of full epoch partitions. Auto enables for Cadence/Async policies. |
 | `no_divergence_guard` | false | Disable the convergence guard. Builder shortcut: `.no_divergence_guard()`. |
 | `max_overshoot` | None (auto) | Async-only overshoot cap. Builder shortcut: `.max_overshoot(N)`. |
-| `lr_scale_ratio` | 0.0 | Linear LR scaling ratio. Builder shortcut: `.lr_scale_ratio(F)`. |
+| `lr_scale_ratio` | 1.0 | Linear LR scaling ratio. Builder shortcut: `.lr_scale_ratio(F)`. |
 | `timeline` | None | `Arc<Timeline>` for profiler event injection. Builder shortcut: `.timeline(tl)`. |
 
 ### ApplyPolicy
@@ -470,6 +470,48 @@ The callback runs on every GPU thread independently. Use it for:
 - Dynamic loss weights that change per epoch
 - Logging epoch transitions
 
+**`GpuWorker` methods available in callbacks:**
+
+| Method | Description |
+|--------|-------------|
+| `rank()` | This worker's rank (0-based) |
+| `device()` | CUDA device for this rank |
+| `local_step()` | Batches processed by this rank so far |
+| `current_version()` | Latest averaging version applied |
+| `current_epoch()` | Current epoch number |
+| `current_lr()` | Current learning rate |
+| `set_lr(f64)` | Set learning rate directly |
+| `scale_lr(f64)` | Multiply current LR by a factor |
+| `set_lr_scale(f64)` | Set the linear scaling multiplier |
+| `set_scheduler(Arc<dyn Scheduler>)` | Replace the LR scheduler |
+| `model()` | Reference to the rank-local model |
+
+### Convergence guard
+
+The builder includes a weight-space divergence guard that monitors
+parameter drift between sync points. After each averaging event, it
+measures `||params_before - params_after|| / ||params_after||` per
+parameter group, producing a `DivergenceReport`.
+
+The guard maintains a ring buffer of the last 5 divergence values
+and watches for trends:
+
+- **`Stable`**: divergence within threshold, no action needed
+- **`SuppressGrowth`**: 3 consecutive rising values detected, hold
+  current cadence (don't increase anchor)
+- **`NudgeDown`**: divergence exceeds threshold with growth trend,
+  reduce anchor to sync more frequently
+
+```rust
+// Configure the guard (default: enabled with auto threshold)
+.divergence_threshold(0.05)   // custom threshold
+.no_divergence_guard()        // disable entirely
+```
+
+The guard interacts with El Che's cadence: when it detects instability,
+it prevents the anchor from increasing and can actively reduce it,
+keeping replicas within the basin of constructive averaging.
+
 ### CPU averaging state machine
 
 The CPU backend operates as a non-blocking 3-phase state machine:
@@ -529,8 +571,6 @@ loop {
             metrics.epoch_ms,
         );
     }
-    if ddp.is_finished() { break; }
-    std::thread::sleep(std::time::Duration::from_millis(100));
 }
 let state = ddp.join()?;
 ```
@@ -541,13 +581,12 @@ let state = ddp.join()?;
 |-------|------|-------------|
 | `epoch` | `usize` | Epoch number (0-based) |
 | `avg_loss` | `f64` | Loss averaged across all ranks |
-| `batches_processed` | `usize` | Total batches across all ranks |
 | `epoch_ms` | `f64` | Wall time for the epoch (slowest rank) |
-| `samples_processed` | `usize` | Total samples across all ranks |
-| `per_rank_loss` | `Vec<f64>` | Per-rank average loss |
-| `per_rank_time_ms` | `Vec<f64>` | Per-rank wall time |
-| `per_rank_scalars` | `Vec<HashMap<String, f64>>` | Per-rank custom scalars |
 | `scalars` | `HashMap<String, f64>` | Aggregated custom scalars (averaged across ranks) |
+| `per_rank` | `Vec<HashMap<String, f64>>` | Per-rank custom scalars |
+| `per_rank_throughput` | `Vec<f64>` | Per-rank batches per second |
+| `per_rank_batch_share` | `Vec<f64>` | Fraction of total batches handled per rank |
+| `device_indices` | `Vec<u8>` | CUDA device index for each rank |
 
 ### Monitor integration
 
@@ -577,6 +616,18 @@ monitor.finish();
 architecture SVG, and training configuration (policy, backend, world size)
 to the monitor. The dashboard shows per-GPU tabs, throughput charts, and
 batch share distribution automatically.
+
+### DdpHandle methods
+
+| Method | Description |
+|--------|-------------|
+| `next_metrics()` | Block until next epoch completes, returns `Some(EpochMetrics)` or `None` when done |
+| `poll_metrics()` | Non-blocking: returns all completed epoch metrics since last poll |
+| `join()` | Wait for training to finish, returns `TrainedState` |
+| `world_size()` | Number of GPU workers |
+| `devices()` | CUDA devices used by each rank |
+| `architecture_svg()` | Graph architecture SVG (if model is a Graph) |
+| `setup_monitor(&self, &mut Monitor)` | Wire into live dashboard |
 
 ### TrainedState
 
@@ -696,9 +747,8 @@ K (how many batches between averaging). The backend determines the
 transport (GPU-to-GPU DMA vs CPU round-trip). The mathematical operation
 is the same: weighted average of parameters.
 
-The three NCCL combinations are validated and recommended. Same model,
-same data, same seed. Change one knob, compare loss curves. (CPU backend
-has a known bug; do not use for training.)
+All six combinations (3 policies x 2 backends) are validated. Same model,
+same data, same seed. Change one knob, compare loss curves.
 
 ### Quick A/B test
 

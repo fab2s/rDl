@@ -27,6 +27,9 @@ pub fn def() -> ModelDef {
         augment_fn: None,
         optimizer: |p, lr| Box::new(Adam::new(p, lr)),
         scheduler: None,
+        reference: "MNIST reconstruction, eval=MSE ([PyTorch AE tutorial](https://pytorch.org/tutorials/beginner/introyt/autoencoders_intro.html))",
+        eval_higher_is_better: false,
+        published_eval: None,
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset

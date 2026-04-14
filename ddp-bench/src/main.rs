@@ -157,24 +157,37 @@ fn run() -> flodl::tensor::Result<()> {
 
         // Load and analyze
         let mut analyses: Vec<analyze::RunAnalysis> = Vec::new();
+        let mut gpu_info: Vec<String> = Vec::new();
         for (model, mode) in &filtered {
-            let path = std::path::Path::new(&output)
-                .join(model)
-                .join(mode)
-                .join("timeline.json");
-            match analyze::load_timeline(&path) {
-                Ok(tl) => {
-                    let mut a = analyze::analyze(model, mode, &tl);
-                    // Set batches_per_sync from model defaults
-                    if let Some(m) = models::find_model(model) {
-                        let total_batches = m.defaults.batches_per_epoch
-                            * epochs.unwrap_or(m.defaults.epochs);
-                        analyze::set_batches_per_sync(&mut a, total_batches);
-                    }
-                    analyses.push(a);
+            let run_dir = std::path::Path::new(&output).join(model).join(mode);
+            let log_path = run_dir.join("training.log");
+            let tl_path = run_dir.join("timeline.json");
+
+            // Parse training log (required -- source of truth for loss/eval).
+            let log = match analyze::parse_training_log(&log_path) {
+                Ok(log) => log,
+                Err(e) => {
+                    eprintln!("  skip {model}/{mode}: {e}");
+                    continue;
                 }
-                Err(e) => eprintln!("  skip {model}/{mode}: {e}"),
+            };
+
+            // Capture GPU info from the first log that has it.
+            if gpu_info.is_empty() && !log.gpu_info.is_empty() {
+                gpu_info.clone_from(&log.gpu_info);
             }
+
+            // Timeline is optional (provides GPU utilization, idle, sync data).
+            let mut a = if let Ok(tl) = analyze::load_timeline(&tl_path) {
+                analyze::analyze(model, mode, &tl)
+            } else {
+                analyze::empty_analysis(model, mode)
+            };
+
+            // Apply training log data (overrides timeline-derived loss/epochs).
+            analyze::apply_training_log(&mut a, &log);
+
+            analyses.push(a);
         }
 
         // Group by model
@@ -188,7 +201,19 @@ fn run() -> flodl::tensor::Result<()> {
             }
         }
 
-        let md = report::generate_report(&groups);
+        // Collect all known mode names for missing-run detection.
+        let all_modes: Vec<String> = config::DdpMode::all_names()
+            .iter().map(|s| s.to_string()).collect();
+
+        let refs: std::collections::HashMap<String, report::ModelRef> =
+            models::model_references().into_iter()
+                .map(|(k, note, eval, hib)| (k.to_string(), report::ModelRef {
+                    note: note.to_string(),
+                    published_eval: eval,
+                    higher_is_better: hib,
+                }))
+                .collect();
+        let md = report::generate_report(&groups, &refs, &gpu_info, &all_modes);
         if let Some(ref path) = report_file {
             std::fs::write(path, &md)
                 .map_err(|e| flodl::tensor::TensorError::new(&format!("cannot write {path}: {e}")))?;
@@ -297,14 +322,7 @@ fn run() -> flodl::tensor::Result<()> {
             }
         }
 
-        if !model_results.is_empty() {
-            report::print_comparison(&model_results);
-        }
         all_results.push(model_results);
-    }
-
-    if all_results.len() > 1 {
-        report::print_matrix(&all_results);
     }
 
     // Flatten results for baseline operations

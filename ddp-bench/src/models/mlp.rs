@@ -27,6 +27,9 @@ pub fn def() -> ModelDef {
         augment_fn: None,
         optimizer: |p, lr| Box::new(Adam::new(p, lr)),
         scheduler: None,
+        reference: "MNIST ~97-98% acc ([PyTorch tutorial](https://pytorch.org/tutorials/beginner/basics/quickstart_tutorial.html))",
+        eval_higher_is_better: true,
+        published_eval: Some(0.975),
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset

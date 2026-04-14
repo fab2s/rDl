@@ -34,6 +34,9 @@ pub fn def() -> ModelDef {
         // Karpathy char-rnn: RMSprop lr=2e-3
         optimizer: |p, lr| Box::new(RMSprop::new(p, lr)),
         scheduler: None,
+        reference: "Shakespeare CE loss ~1.5, eval=val loss ([Karpathy 2015](https://karpathy.github.io/2015/05/21/rnn-effectiveness/))",
+        eval_higher_is_better: false,
+        published_eval: Some(1.5),
         defaults: ModelDefaults {
             epochs: 50,
             batches_per_epoch: 0, // full dataset

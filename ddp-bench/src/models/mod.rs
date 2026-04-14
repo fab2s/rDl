@@ -58,6 +58,13 @@ pub struct ModelDef {
     pub scheduler: Option<fn(f64, usize, usize) -> Box<dyn Scheduler>>,
     /// Default configuration.
     pub defaults: ModelDefaults,
+    /// Published reference note (shown under report tables for context).
+    pub reference: &'static str,
+    /// Published eval target (e.g. 0.9125 for 91.25% accuracy).
+    /// Used to compute delta in report tables.
+    pub published_eval: Option<f64>,
+    /// True if higher eval is better (accuracy). False for loss-like metrics.
+    pub eval_higher_is_better: bool,
 }
 
 /// All registered benchmark models.
@@ -77,6 +84,13 @@ pub fn all_models() -> Vec<ModelDef> {
 /// Find a model by name.
 pub fn find_model(name: &str) -> Option<ModelDef> {
     all_models().into_iter().find(|m| m.name == name)
+}
+
+/// Reference notes and published eval targets by model name.
+pub fn model_references() -> Vec<(&'static str, &'static str, Option<f64>, bool)> {
+    all_models().into_iter()
+        .map(|m| (m.name, m.reference, m.published_eval, m.eval_higher_is_better))
+        .collect()
 }
 
 /// All model names.

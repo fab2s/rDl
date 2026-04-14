@@ -26,6 +26,9 @@ pub fn def() -> ModelDef {
         augment_fn: None,
         optimizer: |p, lr| Box::new(Adam::new(p, lr)),
         scheduler: None,
+        reference: "MNIST ~92% acc (linear baseline)",
+        eval_higher_is_better: true,
+        published_eval: Some(0.92),
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset

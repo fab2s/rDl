@@ -31,6 +31,9 @@ pub fn def() -> ModelDef {
         scheduler: Some(|lr, total, _world_size| {
             Box::new(MultiStepLR::new(lr, &[total / 2, total * 3 / 4], 0.1))
         }),
+        reference: "CIFAR-10 91.25% acc, Graph builder ([He et al. 2015](https://arxiv.org/abs/1512.03385), Table 6)",
+        eval_higher_is_better: true,
+        published_eval: Some(0.9125),
         defaults: ModelDefaults {
             epochs: 200,
             batches_per_epoch: 0,

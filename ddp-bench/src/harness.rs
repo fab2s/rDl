@@ -30,9 +30,6 @@ pub struct RunResult {
     pub model_name: String,
     pub mode: String,
     pub final_loss: f64,
-    pub epoch_times_ms: Vec<f64>,
-    pub total_ms: f64,
-    pub timeline_summary: flodl::monitor::TimelineSummary,
     /// Training config for baseline generation.
     pub epochs: usize,
     pub batches_per_epoch: usize,
@@ -152,7 +149,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     let _ = timeline.save_html(&format!("{run_dir}/timeline.html"));
     monitor.finish();
 
-    let (final_loss, epoch_times, log_lines) = result?;
+    let (final_loss, _epoch_times, log_lines) = result?;
 
     // Save training log with GPU header and total time
     {
@@ -211,9 +208,6 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         model_name: model_def.name.to_string(),
         mode: mode_str,
         final_loss,
-        epoch_times_ms: epoch_times,
-        total_ms,
-        timeline_summary: summary,
         epochs: config.epochs,
         batches_per_epoch: actual_batches,
         batch_size: config.batch_size,
@@ -502,6 +496,7 @@ fn run_sync(
         let bs = config.batch_size;
 
         for epoch in 0..config.epochs {
+            timeline.event(flodl::monitor::EventKind::EpochStart { epoch });
             let epoch_start = Instant::now();
             let mut total_loss = 0.0;
             let mut batch_count = 0;
@@ -510,6 +505,11 @@ fn run_sync(
                 let end = (batch_start + bs).min(n);
                 if end - batch_start < bs { break; }
                 let batch = slice_batch(&gpu_data, batch_start, end, device)?;
+                let batch = if let Some(aug) = model_def.augment_fn {
+                    aug(&batch)?
+                } else {
+                    batch
+                };
 
                 let loss = (model_def.train_fn)(graph, &batch)?;
                 let loss_val = loss.item()?;
@@ -523,6 +523,10 @@ fn run_sync(
 
             let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
             final_loss = if batch_count > 0 { total_loss / batch_count as f64 } else { 0.0 };
+            timeline.event(flodl::monitor::EventKind::EpochEnd {
+                epoch,
+                loss: final_loss,
+            });
             let scalars = drain_epoch_scalars();
             let mut line = format!("epoch {epoch}: loss={final_loss:.6}");
             line.push_str(&format_scalars(&scalars));
@@ -543,6 +547,7 @@ fn run_sync(
         let pool_len = gpu_pool.len();
 
         for epoch in 0..config.epochs {
+            timeline.event(flodl::monitor::EventKind::EpochStart { epoch });
             let epoch_start = Instant::now();
             let mut total_loss = 0.0;
 
@@ -560,6 +565,10 @@ fn run_sync(
 
             let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
             final_loss = total_loss / batches_per_epoch as f64;
+            timeline.event(flodl::monitor::EventKind::EpochEnd {
+                epoch,
+                loss: final_loss,
+            });
             let scalars = drain_epoch_scalars();
             let mut line = format!("epoch {epoch}: loss={final_loss:.6}");
             line.push_str(&format_scalars(&scalars));

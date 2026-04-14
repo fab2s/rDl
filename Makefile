@@ -19,7 +19,7 @@ docs-rs:
 	$(COMPOSE) run --rm docs-rs bash -c "\
 		rustup install nightly 2>&1 | tail -1 && \
 		cargo +nightly rustdoc --lib \
-			--no-default-features \
+			--no-default-features --features rng \
 			--config 'build.rustflags=[\"--cfg\", \"docsrs\"]' \
 			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]' \
 			-Zrustdoc-scrape-examples"

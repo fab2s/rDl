@@ -60,8 +60,10 @@ not a commitment; only moving one to In Progress is.
 - **JEPA exploration**, with BYOL or MoCo as a stepping stone. The
   EMA target encoder + two-tower training infra needed for I-JEPA /
   V-JEPA is also what BYOL needs, so it's a natural progression.
-- **Zero-dispatch training**: CUDA Graph capture for the full
-  train-step plus double-buffered data prefetch. See
+- **Zero-dispatch training**: full train-step CUDA Graph capture
+  (forward + backward + optimizer as one replay) plus double-buffered
+  static I/O tensors. Resident and streaming DataLoader modes already
+  ship; this is the Graph integration layer on top. See
   [docs/design/resident-training.md](docs/design/resident-training.md).
 - **Graph serialization**: save/load graph topology, ONNX import/export.
 - **Model parallelism**: tensor / pipeline parallelism for models that

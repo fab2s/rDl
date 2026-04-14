@@ -1,6 +1,6 @@
-//! Post-hoc timeline analysis: reads `runs/<model>/<mode>/timeline.json`,
-//! detects GPU idle gaps, correlates with sync/epoch events, and produces
-//! structured analysis data for report generation.
+//! Post-hoc run analysis: reads `training.log` for convergence data (loss,
+//! eval, epoch timing) and optionally `timeline.json` for GPU utilization,
+//! idle gap detection, and sync/ElChe instrumentation.
 
 use std::path::Path;
 
@@ -108,9 +108,12 @@ pub struct VramStats {
 pub struct EpochData {
     #[allow(dead_code)]
     pub epoch: usize,
-    /// Loss at end of this epoch (from the last EpochEnd event for this epoch).
+    /// Loss at end of this epoch.
     pub loss: f64,
-    /// Wall-clock span for this epoch (first start to last end, ms).
+    /// Eval metric (accuracy, perplexity, etc.) if available.
+    #[allow(dead_code)]
+    pub eval: Option<f64>,
+    /// Wall-clock span for this epoch (ms).
     #[allow(dead_code)]
     pub wall_ms: f64,
 }
@@ -124,6 +127,8 @@ pub struct RunAnalysis {
     #[allow(dead_code)]
     pub n_epochs: usize,
     pub final_loss: f64,
+    /// Final eval metric (from `final eval=X.XXXX` or last per-epoch eval).
+    pub final_eval: Option<f64>,
     /// Per-epoch convergence trajectory.
     pub epoch_data: Vec<EpochData>,
     /// Per-GPU active percentage.
@@ -135,8 +140,6 @@ pub struct RunAnalysis {
     /// Total sync time (ms).
     #[allow(dead_code)]
     pub total_sync_ms: f64,
-    /// Average number of batches between syncs (total_batches / sync_count).
-    pub batches_per_sync: f64,
     /// CPU averaging count and average.
     pub cpu_avg_count: usize,
     pub avg_cpu_avg_ms: f64,
@@ -374,7 +377,7 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
             }
         };
 
-        epoch_data.push(EpochData { epoch: ep, loss, wall_ms });
+        epoch_data.push(EpochData { epoch: ep, loss, eval: None, wall_ms });
     }
 
     // Epoch overlap: sum of overlapping time between consecutive epoch spans
@@ -386,13 +389,6 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
             epoch_overlap_ms += (prev_end - next_start) as f64;
         }
     }
-
-    // Estimate total batches from epoch events for batches-per-sync
-    // Each epoch has total_samples / batch_size batches. We estimate from
-    // the total run: n_epochs worth of batches across all ranks.
-    // For now, use sync_count directly since we know the total from the run config.
-    // batches_per_sync is computed externally where batch counts are known.
-    // Here we store the raw sync_intervals for the report to use.
 
     // Idle gap detection per GPU
     let mut all_gaps: Vec<IdleGap> = Vec::new();
@@ -456,22 +452,18 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
             + idle.unexplained_ms;
     }
 
-    // batches_per_sync: caller should set this from run config, but we can
-    // approximate from sync intervals if needed. Default to 0 (unknown).
-    let batches_per_sync = 0.0;
-
     RunAnalysis {
         model: model.to_string(),
         mode: mode.to_string(),
         total_ms,
         n_epochs,
         final_loss,
+        final_eval: None,
         epoch_data,
         gpu_active_pct,
         sync_count,
         avg_sync_ms: if sync_count > 0 { sync_total_ms / sync_count as f64 } else { 0.0 },
         total_sync_ms: sync_total_ms,
-        batches_per_sync,
         cpu_avg_count,
         avg_cpu_avg_ms: if cpu_avg_count > 0 { cpu_avg_total_ms / cpu_avg_count as f64 } else { 0.0 },
         anchor_changes,
@@ -484,10 +476,30 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
     }
 }
 
-/// Post-process: set batches_per_sync from known batch counts.
-pub fn set_batches_per_sync(analysis: &mut RunAnalysis, total_batches: usize) {
-    if analysis.sync_count > 0 {
-        analysis.batches_per_sync = total_batches as f64 / analysis.sync_count as f64;
+/// Create a minimal RunAnalysis with no timeline data.
+/// Training log data is applied afterwards via `apply_training_log`.
+pub fn empty_analysis(model: &str, mode: &str) -> RunAnalysis {
+    RunAnalysis {
+        model: model.to_string(),
+        mode: mode.to_string(),
+        total_ms: 0,
+        n_epochs: 0,
+        final_loss: 0.0,
+        final_eval: None,
+        epoch_data: Vec::new(),
+        gpu_active_pct: Vec::new(),
+        sync_count: 0,
+        avg_sync_ms: 0.0,
+        total_sync_ms: 0.0,
+        cpu_avg_count: 0,
+        avg_cpu_avg_ms: 0.0,
+        anchor_changes: 0,
+        throttle_count: 0,
+        idle_gaps: Vec::new(),
+        idle_by_cause: Vec::new(),
+        vram_stats: Vec::new(),
+        epoch_overlap_ms: 0.0,
+        sync_intervals: Vec::new(),
     }
 }
 
@@ -545,11 +557,139 @@ fn accumulate_cause(by_cause: &mut IdleByCause, cause: &IdleCause, ms: f64) {
 }
 
 // ---------------------------------------------------------------------------
+// Training log parser
+// ---------------------------------------------------------------------------
+
+/// Parsed training log data.
+pub struct TrainingLog {
+    pub epochs: Vec<LogEpoch>,
+    /// Standalone `final eval=X.XXXX` line (modes that eval once after training).
+    pub final_eval: Option<f64>,
+    /// Total wall time from `# total:` footer (ms).
+    pub total_ms: Option<f64>,
+    /// GPU header lines (e.g. `gpu0: NVIDIA GeForce RTX 5060 Ti (15GB, sm_120)`).
+    pub gpu_info: Vec<String>,
+}
+
+/// One epoch line from the training log.
+pub struct LogEpoch {
+    pub epoch: usize,
+    pub loss: f64,
+    pub eval: Option<f64>,
+    pub time_ms: f64,
+}
+
+/// Parse a `training.log` file.
+///
+/// Format:
+/// ```text
+/// # gpu0: ...
+/// epoch 0: loss=0.311125, eval=0.9732, time=2.2s
+/// epoch 1: loss=0.131376, time=2.3s
+/// final eval=0.9732
+/// # total: 12.7s (0m 13s)
+/// ```
+pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+
+    let mut epochs = Vec::new();
+    let mut final_eval = None;
+    let mut total_ms = None;
+    let mut gpu_info = Vec::new();
+
+    for line in data.lines() {
+        let line = line.trim();
+
+        // # gpu0: NVIDIA GeForce RTX 5060 Ti (15GB, sm_120)
+        if let Some(rest) = line.strip_prefix("# gpu") {
+            if rest.contains(':') {
+                gpu_info.push(format!("gpu{rest}"));
+            }
+            continue;
+        }
+
+        // epoch N: loss=X.XXXXXX[, eval=X.XXXX][, train_acc=X.XXXX], time=X.Xs
+        if let Some(rest) = line.strip_prefix("epoch ") {
+            if let Some((epoch_str, kv_part)) = rest.split_once(": ") {
+                let epoch: usize = epoch_str.parse().unwrap_or(0);
+                let mut loss = 0.0;
+                let mut eval = None;
+                let mut time_ms = 0.0;
+
+                for kv in kv_part.split(", ") {
+                    if let Some(v) = kv.strip_prefix("loss=") {
+                        loss = v.parse().unwrap_or(0.0);
+                    } else if let Some(v) = kv.strip_prefix("eval=")
+                        .or_else(|| kv.strip_prefix("metric="))
+                    {
+                        eval = Some(v.parse().unwrap_or(0.0));
+                    } else if let Some(v) = kv.strip_prefix("time=") {
+                        if let Some(ms) = v.strip_suffix("ms") {
+                            time_ms = ms.parse::<f64>().unwrap_or(0.0);
+                        } else if let Some(secs) = v.strip_suffix('s') {
+                            time_ms = secs.parse::<f64>().unwrap_or(0.0) * 1000.0;
+                        }
+                    }
+                }
+
+                epochs.push(LogEpoch { epoch, loss, eval, time_ms });
+            }
+        }
+        // final eval=X.XXXX
+        else if let Some(v) = line.strip_prefix("final eval=") {
+            final_eval = Some(v.parse().unwrap_or(0.0));
+        }
+        // # total: 12.7s (0m 13s)
+        else if let Some(rest) = line.strip_prefix("# total: ")
+            && let Some(secs_str) = rest.split('s').next()
+        {
+            total_ms = secs_str.trim().parse::<f64>().ok().map(|s| s * 1000.0);
+        }
+    }
+
+    Ok(TrainingLog { epochs, final_eval, total_ms, gpu_info })
+}
+
+/// Apply training log data to a RunAnalysis, overriding timeline-derived
+/// loss/eval/epoch data with the authoritative log values.
+pub fn apply_training_log(analysis: &mut RunAnalysis, log: &TrainingLog) {
+    if log.epochs.is_empty() {
+        return;
+    }
+
+    // Override epoch data
+    analysis.epoch_data = log.epochs.iter().map(|e| EpochData {
+        epoch: e.epoch,
+        loss: e.loss,
+        eval: e.eval,
+        wall_ms: e.time_ms,
+    }).collect();
+    analysis.n_epochs = analysis.epoch_data.len();
+
+    // Final loss from last epoch
+    analysis.final_loss = log.epochs.last().map(|e| e.loss).unwrap_or(0.0);
+
+    // Final eval: standalone line wins, otherwise last per-epoch eval
+    analysis.final_eval = log.final_eval.or_else(|| {
+        log.epochs.iter().rev().find_map(|e| e.eval)
+    });
+
+    // Total time from log footer (if timeline had no samples)
+    if analysis.total_ms == 0
+        && let Some(ms) = log.total_ms
+    {
+        analysis.total_ms = ms as u64;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
 
 /// Discover available runs in the output directory.
 /// Returns (model, mode) pairs sorted by model then mode.
+/// A run is valid if it has a `training.log` (required for loss data).
 pub fn discover_runs(output_dir: &str) -> Vec<(String, String)> {
     let mut runs = Vec::new();
     let base = Path::new(output_dir);
@@ -565,8 +705,8 @@ pub fn discover_runs(output_dir: &str) -> Vec<(String, String)> {
             let model = model_entry.file_name().to_string_lossy().to_string();
             if let Ok(modes) = std::fs::read_dir(model_entry.path()) {
                 for mode_entry in modes.flatten() {
-                    let timeline_path = mode_entry.path().join("timeline.json");
-                    if timeline_path.exists() {
+                    let log_path = mode_entry.path().join("training.log");
+                    if log_path.exists() {
                         let mode = mode_entry.file_name().to_string_lossy().to_string();
                         runs.push((model.clone(), mode));
                     }

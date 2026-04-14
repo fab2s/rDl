@@ -6,6 +6,16 @@ use std::fmt::Write;
 use crate::analyze::RunAnalysis;
 use crate::harness::RunResult;
 
+/// Published reference data for a model.
+pub struct ModelRef {
+    /// Human-readable note with links.
+    pub note: String,
+    /// Published eval target (e.g. 0.9125 for 91.25% accuracy).
+    pub published_eval: Option<f64>,
+    /// True if higher eval is better (accuracy). False for loss-like metrics.
+    pub higher_is_better: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Baselines
 // ---------------------------------------------------------------------------
@@ -134,74 +144,32 @@ fn parse_baselines(json: &str) -> Result<Vec<Baseline>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Comparison tables
-// ---------------------------------------------------------------------------
-
-/// Print a comparison table for a set of results (typically one model, all modes).
-pub fn print_comparison(results: &[RunResult]) {
-    if results.is_empty() {
-        return;
-    }
-
-    let model = &results[0].model_name;
-    let n_epochs = results[0].epoch_times_ms.len();
-
-    eprintln!("\n=== {} ({} epochs) ===\n", model, n_epochs);
-    eprintln!(
-        "  {:<20} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8}",
-        "mode", "loss", "epoch_ms", "total_s", "syncs", "avg_sync", "idle%_0", "idle%_1",
-    );
-    eprintln!("  {}", "-".repeat(96));
-
-    for r in results {
-        let median_epoch = if r.epoch_times_ms.is_empty() {
-            0.0
-        } else {
-            let mut sorted = r.epoch_times_ms.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            sorted[sorted.len() / 2]
-        };
-
-        let s = &r.timeline_summary;
-        let idle0 = s.gpu_idle_pct.first().copied().unwrap_or(0.0);
-        let idle1 = s.gpu_idle_pct.get(1).copied().unwrap_or(0.0);
-
-        eprintln!(
-            "  {:<20} {:>10.6} {:>9.0}ms {:>9.1}s {:>10} {:>9.1}ms {:>7.1}% {:>7.1}%",
-            r.mode,
-            r.final_loss,
-            median_epoch,
-            r.total_ms / 1000.0,
-            s.sync_count,
-            s.avg_sync_ms,
-            idle0,
-            idle1,
-        );
-    }
-    eprintln!();
-}
-
-/// Print a summary across all models.
-pub fn print_matrix(all_results: &[Vec<RunResult>]) {
-    eprintln!("\n=== Summary Matrix ===\n");
-    for group in all_results {
-        if group.is_empty() {
-            continue;
-        }
-        print_comparison(group);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Post-hoc report from timeline analysis
 // ---------------------------------------------------------------------------
 
 /// Generate a markdown report from analyzed runs.
-/// `analyses` is grouped by model: Vec<(model, Vec<RunAnalysis>)>.
-pub fn generate_report(groups: &[(String, Vec<RunAnalysis>)]) -> String {
+/// `groups` is by model: Vec<(model, Vec<RunAnalysis>)>.
+/// `references` maps model name to published reference data.
+/// `gpu_info` is the hardware description from training logs.
+/// `all_modes` is every known DDP mode name (for missing-run detection).
+pub fn generate_report(
+    groups: &[(String, Vec<RunAnalysis>)],
+    references: &HashMap<String, ModelRef>,
+    gpu_info: &[String],
+    all_modes: &[String],
+) -> String {
     let mut md = String::with_capacity(16_000);
 
     md.push_str("# DDP Benchmark Report\n\n");
+
+    // Hardware
+    if !gpu_info.is_empty() {
+        md.push_str("## Hardware\n\n");
+        for g in gpu_info {
+            let _ = writeln!(md, "- {g}");
+        }
+        md.push('\n');
+    }
 
     // Setup
     let n_models = groups.len();
@@ -210,15 +178,35 @@ pub fn generate_report(groups: &[(String, Vec<RunAnalysis>)]) -> String {
     let _ = writeln!(md, "- **Modes**: {n_modes}");
 
     // Speed ratio from solo runs
-    if let Some(ratio) = speed_ratio(groups) {
-        let _ = writeln!(md, "- **GPU speed ratio**: {ratio:.2}x (solo-0 / solo-1)");
-    }
+    write_speed_ratio(&mut md, groups);
     md.push('\n');
+
+    // Methodology note
+    md.push_str("## Notes\n\n");
+    md.push_str("DDP modes are expected to show slightly lower eval than solo on small models with few epochs. \
+Distributed training converges slower in early epochs due to gradient averaging across devices with \
+different data views, and ElChe (cadence/async) modes need calibration time to find the optimal sync \
+interval, which further penalizes short runs. On longer training (200 epochs), every DDP mode \
+surpasses solo convergence while completing faster -- the whole point of multi-GPU training.\n\n");
+
+    // Missing runs
+    write_missing_runs(&mut md, groups, all_modes);
 
     // Per-model comparison
     md.push_str("## Per-Model Results\n\n");
+    md.push_str("GPU0/GPU1 = compute utilization % (not load). Idle = total time with <5% utilization.\n\n");
     for (model, runs) in groups {
-        write_model_table(&mut md, model, runs);
+        write_model_table(&mut md, model, runs, references.get(model));
+    }
+
+    // Best mode per model
+    md.push_str("## Best Mode per Model\n\n");
+    write_best_mode(&mut md, groups, references);
+
+    // Convergence quality using eval (vs solo-0)
+    if groups.iter().any(|(_, runs)| runs.iter().any(|r| r.final_eval.is_some())) {
+        md.push_str("## Eval Quality (vs solo-0)\n\n");
+        write_eval_ratio_table(&mut md, groups);
     }
 
     // Convergence quality matrix (loss ratio vs solo-0)
@@ -231,9 +219,9 @@ pub fn generate_report(groups: &[(String, Vec<RunAnalysis>)]) -> String {
         write_epoch_trajectory(&mut md, groups);
     }
 
-    // Speedup vs sync
+    // Speedup vs solo-0
     if groups.iter().any(|(_, runs)| runs.len() > 1) {
-        md.push_str("## Speedup vs Sync\n\n");
+        md.push_str("## Speedup vs solo-0\n\n");
         write_speedup_table(&mut md, groups);
     }
 
@@ -269,31 +257,50 @@ pub fn generate_report(groups: &[(String, Vec<RunAnalysis>)]) -> String {
     md
 }
 
-fn speed_ratio(groups: &[(String, Vec<RunAnalysis>)]) -> Option<f64> {
-    let mut ratios = Vec::new();
-    for (_, runs) in groups {
+fn write_speed_ratio(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
+    let mut entries = Vec::new();
+    for (model, runs) in groups {
         let s0 = runs.iter().find(|r| r.mode == "solo-0");
         let s1 = runs.iter().find(|r| r.mode == "solo-1");
         if let (Some(a), Some(b)) = (s0, s1)
             && a.total_ms > 0
         {
-            ratios.push(b.total_ms as f64 / a.total_ms as f64);
+            entries.push((model.as_str(), a.total_ms, b.total_ms));
         }
     }
-    if ratios.is_empty() {
-        return None;
+    if entries.is_empty() {
+        return;
     }
-    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    Some(ratios[ratios.len() / 2])
+    let _ = writeln!(md, "- **GPU speed ratio** (solo-1 / solo-0 wall time):");
+    for (model, s0, s1) in &entries {
+        let _ = writeln!(md, "  - {model}: {:.2}x ({:.0}s vs {:.0}s)",
+            *s1 as f64 / *s0 as f64, *s0 as f64 / 1000.0, *s1 as f64 / 1000.0);
+    }
 }
 
-fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysis]) {
+fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysis], mref: Option<&ModelRef>) {
     if runs.is_empty() {
         return;
     }
+    let has_eval = runs.iter().any(|r| r.final_eval.is_some());
+    let pub_eval = mref.and_then(|r| r.published_eval);
+    let has_delta = has_eval && pub_eval.is_some();
+
     let _ = writeln!(md, "### {model}\n");
-    md.push_str("| Mode | Loss | Total (s) | Syncs | Avg Sync (ms) | Bat/Sync | GPU0 | GPU1 | Idle (s) |\n");
-    md.push_str("|------|------|-----------|-------|--------------|----------|------|------|----------|\n");
+    if let Some(r) = mref {
+        let _ = writeln!(md, "> Published: {}\n", r.note);
+    }
+
+    // Header
+    let _ = write!(md, "| Mode | Loss |");
+    if has_eval { md.push_str(" Eval |"); }
+    if has_delta { md.push_str(" vs Ref |"); }
+    md.push_str(" Total (s) | Syncs | Avg Sync (ms) | GPU0 | GPU1 | Idle (s) |\n");
+
+    let _ = write!(md, "|------|------|");
+    if has_eval { md.push_str("------|"); }
+    if has_delta { md.push_str("--------|"); }
+    md.push_str("-----------|-------|--------------|------|------|----------|\n");
 
     for r in runs {
         let a0 = r.gpu_active_pct.first().copied().unwrap_or(0.0);
@@ -302,21 +309,35 @@ fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysis]) {
             .map(|c| c.total_ms)
             .sum::<f64>() / 1000.0;
 
-        let bps = if r.batches_per_sync > 0.0 {
-            format!("{:.1}", r.batches_per_sync)
-        } else {
-            "-".to_string()
-        };
+        let _ = write!(md, "| {} | {:.6} |", r.mode, r.final_loss);
+
+        if has_eval {
+            match r.final_eval {
+                Some(v) => { let _ = write!(md, " {:.4} |", v); }
+                None => md.push_str(" - |"),
+            }
+        }
+
+        if has_delta {
+            match (r.final_eval, pub_eval) {
+                (Some(actual), Some(target)) => {
+                    let diff = actual - target;
+                    if diff.abs() < 0.00005 {
+                        md.push_str(" 0 |");
+                    } else {
+                        let _ = write!(md, " {:+.4} |", diff);
+                    }
+                }
+                _ => md.push_str(" - |"),
+            }
+        }
 
         let _ = writeln!(
             md,
-            "| {} | {:.6} | {:.1} | {} | {:.1} | {} | {:.0}% | {:.0}% | {:.1} |",
-            r.mode,
-            r.final_loss,
+            " {:.1} | {} | {:.1} | {:.0}% | {:.0}% | {:.1} |",
             r.total_ms as f64 / 1000.0,
             r.sync_count,
             r.avg_sync_ms,
-            bps,
             a0,
             a1,
             total_idle_s,
@@ -353,16 +374,17 @@ fn write_loss_ratio_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]
     md.push('\n');
 
     for (model, runs) in groups {
-        let solo_loss = runs.iter()
-            .find(|r| r.mode == "solo-0")
-            .map(|r| r.final_loss)
-            .unwrap_or(0.0);
+        let solo0 = runs.iter().find(|r| r.mode == "solo-0");
+        let solo_loss = solo0.map(|r| r.final_loss).unwrap_or(0.0);
+        let canon_epochs = solo0.map(|r| r.n_epochs).unwrap_or(0);
 
         let _ = write!(md, "| {model} |");
         for m in &all_modes {
             if m == "solo-0" { continue; }
             if let Some(r) = runs.iter().find(|r| r.mode == *m) {
-                if solo_loss.abs() > 1e-10 {
+                if r.n_epochs != canon_epochs {
+                    md.push_str(" - |");
+                } else if solo_loss.abs() > 1e-10 {
                     let ratio = r.final_loss / solo_loss;
                     let _ = write!(md, " {:.2}x |", ratio);
                 } else if r.final_loss.abs() < 1e-10 {
@@ -379,30 +401,231 @@ fn write_loss_ratio_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]
     md.push('\n');
 }
 
+/// Missing runs: model/mode combos not present in the data.
+fn write_missing_runs(md: &mut String, groups: &[(String, Vec<RunAnalysis>)], all_modes: &[String]) {
+    let mut missing: Vec<String> = Vec::new();
+    for (model, runs) in groups {
+        let canon_epochs = runs.iter()
+            .find(|r| r.mode == "solo-0")
+            .map(|r| r.n_epochs)
+            .unwrap_or(0);
+
+        for mode in all_modes {
+            if let Some(r) = runs.iter().find(|r| r.mode == *mode) {
+                if r.n_epochs != canon_epochs {
+                    missing.push(format!(
+                        "{model}/{mode} ({} epochs, expected {canon_epochs})", r.n_epochs,
+                    ));
+                }
+            } else {
+                missing.push(format!("{model}/{mode}"));
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        md.push_str("## Incomplete Runs\n\n");
+        for m in &missing {
+            let _ = writeln!(md, "- {m}");
+        }
+        md.push('\n');
+    }
+}
+
+/// Best mode per model: which mode achieves the best eval, and which is fastest
+/// while staying within 2% of solo-0 eval.
+fn write_best_mode(md: &mut String, groups: &[(String, Vec<RunAnalysis>)], references: &HashMap<String, ModelRef>) {
+    let has_eval = groups.iter().any(|(_, runs)| runs.iter().any(|r| r.final_eval.is_some()));
+
+    if has_eval {
+        md.push_str("| Model | Best Eval | Mode | Fastest (within 2% of solo-0) | Mode |\n");
+        md.push_str("|-------|-----------|------|-------------------------------|------|\n");
+    } else {
+        md.push_str("| Model | Best Loss | Mode | Fastest | Mode |\n");
+        md.push_str("|-------|-----------|------|---------|------|\n");
+    }
+
+    for (model, runs) in groups {
+        let solo0 = runs.iter().find(|r| r.mode == "solo-0");
+        let canon_epochs = solo0.map(|r| r.n_epochs).unwrap_or(0);
+
+        // Filter to runs that completed the full epoch count.
+        let full_runs: Vec<&RunAnalysis> = runs.iter()
+            .filter(|r| r.n_epochs == canon_epochs)
+            .collect();
+
+        if full_runs.is_empty() {
+            let _ = writeln!(md, "| {model} | - | - | - | - |");
+            continue;
+        }
+
+        if has_eval {
+            let higher_is_better = references.get(model)
+                .map(|r| r.higher_is_better)
+                .unwrap_or(true);
+
+            let best = full_runs.iter()
+                .filter(|r| r.final_eval.is_some())
+                .max_by(|a, b| {
+                    let va = a.final_eval.unwrap_or(0.0);
+                    let vb = b.final_eval.unwrap_or(0.0);
+                    if higher_is_better {
+                        va.partial_cmp(&vb).unwrap()
+                    } else {
+                        vb.partial_cmp(&va).unwrap()
+                    }
+                });
+
+            let (best_eval, best_mode) = match best {
+                Some(r) => (format!("{:.4}", r.final_eval.unwrap_or(0.0)), r.mode.as_str()),
+                None => ("-".to_string(), "-"),
+            };
+
+            // Fastest within 2% of solo-0 eval.
+            let solo_eval = solo0.and_then(|r| r.final_eval);
+            let fastest = solo_eval.and_then(|se| {
+                let threshold = if higher_is_better { se * 0.98 } else { se * 1.02 };
+                full_runs.iter()
+                    .filter(|r| !r.mode.starts_with("solo"))
+                    .filter(|r| {
+                        r.final_eval.map(|v| {
+                            if higher_is_better { v >= threshold } else { v <= threshold }
+                        }).unwrap_or(false)
+                    })
+                    .min_by_key(|r| r.total_ms)
+            });
+
+            let (fast_time, fast_mode) = match fastest {
+                Some(r) => (format!("{:.1}s", r.total_ms as f64 / 1000.0), r.mode.as_str()),
+                None => ("-".to_string(), "-"),
+            };
+
+            let _ = writeln!(md, "| {model} | {best_eval} | {best_mode} | {fast_time} | {fast_mode} |");
+        } else {
+            // Best loss (lowest)
+            let best = full_runs.iter()
+                .min_by(|a, b| a.final_loss.partial_cmp(&b.final_loss).unwrap());
+            let (best_loss, best_mode) = match best {
+                Some(r) => (format!("{:.6}", r.final_loss), r.mode.as_str()),
+                None => ("-".to_string(), "-"),
+            };
+
+            // Fastest DDP mode
+            let fastest = full_runs.iter()
+                .filter(|r| !r.mode.starts_with("solo"))
+                .min_by_key(|r| r.total_ms);
+            let (fast_time, fast_mode) = match fastest {
+                Some(r) => (format!("{:.1}s", r.total_ms as f64 / 1000.0), r.mode.as_str()),
+                None => ("-".to_string(), "-"),
+            };
+
+            let _ = writeln!(md, "| {model} | {best_loss} | {best_mode} | {fast_time} | {fast_mode} |");
+        }
+    }
+    md.push('\n');
+}
+
+/// Eval quality table: eval difference vs solo-0 per model/mode.
+fn write_eval_ratio_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
+    // Collect all mode names across all groups
+    let mut all_modes: Vec<String> = Vec::new();
+    for (_, runs) in groups {
+        for r in runs {
+            if !all_modes.contains(&r.mode) {
+                all_modes.push(r.mode.clone());
+            }
+        }
+    }
+
+    // Header
+    md.push_str("| Model |");
+    for m in &all_modes {
+        if m == "solo-0" { continue; }
+        let _ = write!(md, " {} |", m);
+    }
+    md.push('\n');
+
+    md.push_str("|-------|");
+    for m in &all_modes {
+        if m == "solo-0" { continue; }
+        let _ = write!(md, "{}|", "-".repeat(m.len() + 2));
+    }
+    md.push('\n');
+
+    for (model, runs) in groups {
+        let solo0 = runs.iter().find(|r| r.mode == "solo-0");
+        let solo_eval = solo0.and_then(|r| r.final_eval);
+        let canon_epochs = solo0.map(|r| r.n_epochs).unwrap_or(0);
+
+        let _ = write!(md, "| {model} |");
+        for m in &all_modes {
+            if m == "solo-0" { continue; }
+            if let Some(r) = runs.iter().find(|r| r.mode == *m) {
+                if r.n_epochs != canon_epochs {
+                    md.push_str(" - |");
+                } else if let (Some(actual), Some(base)) = (r.final_eval, solo_eval) {
+                    let diff = actual - base;
+                    if diff.abs() < 0.00005 {
+                        md.push_str(" 0 |");
+                    } else {
+                        let _ = write!(md, " {:+.4} |", diff);
+                    }
+                } else {
+                    md.push_str(" - |");
+                }
+            } else {
+                md.push_str(" - |");
+            }
+        }
+        md.push('\n');
+    }
+    md.push('\n');
+}
+
+/// Maximum epoch columns before switching to sampled display.
+const MAX_TRAJECTORY_COLS: usize = 20;
+
 /// Per-epoch loss trajectory for each model/mode.
+/// For models with many epochs, samples at regular intervals.
 fn write_epoch_trajectory(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
     for (model, runs) in groups {
         let n_epochs = runs.iter().map(|r| r.epoch_data.len()).max().unwrap_or(0);
         if n_epochs < 2 { continue; }
 
-        let _ = writeln!(md, "### {model}\n");
+        // Pick which epoch indices to show.
+        let indices: Vec<usize> = if n_epochs <= MAX_TRAJECTORY_COLS {
+            (0..n_epochs).collect()
+        } else {
+            // Sample: always include first, last, and evenly spaced in between.
+            let step = (n_epochs - 1) as f64 / (MAX_TRAJECTORY_COLS - 1) as f64;
+            (0..MAX_TRAJECTORY_COLS)
+                .map(|i| (i as f64 * step).round() as usize)
+                .collect()
+        };
 
-        // Header: Mode | E0 | E1 | ... | EN
+        let sampled = indices.len() < n_epochs;
+        if sampled {
+            let _ = writeln!(md, "### {model} (sampled, {n_epochs} epochs)\n");
+        } else {
+            let _ = writeln!(md, "### {model}\n");
+        }
+
+        // Header
         let _ = write!(md, "| Mode |");
-        for ep in 0..n_epochs {
+        for &ep in &indices {
             let _ = write!(md, " E{ep} |");
         }
         md.push('\n');
 
         let _ = write!(md, "|------|");
-        for _ in 0..n_epochs {
+        for _ in &indices {
             md.push_str("------|");
         }
         md.push('\n');
 
         for r in runs {
             let _ = write!(md, "| {} |", r.mode);
-            for ep in 0..n_epochs {
+            for &ep in &indices {
                 if let Some(ed) = r.epoch_data.get(ep) {
                     let _ = write!(md, " {:.4} |", ed.loss);
                 } else {
@@ -425,30 +648,29 @@ fn write_speedup_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
 
     md.push_str("| Model |");
     for m in &modes {
-        if *m == "sync" { continue; }
+        if *m == "solo-0" { continue; }
         let _ = write!(md, " {m} |");
     }
     md.push('\n');
 
     md.push_str("|-------|");
     for m in &modes {
-        if *m == "sync" { continue; }
+        if *m == "solo-0" { continue; }
         let _ = write!(md, "{}|", "-".repeat(m.len() + 2));
     }
     md.push('\n');
 
     for (model, runs) in groups {
-        let sync_ms = runs.iter()
-            .find(|r| r.mode == "sync")
-            .map(|r| r.total_ms as f64)
-            .unwrap_or(0.0);
+        let solo0 = runs.iter().find(|r| r.mode == "solo-0");
+        let solo0_ms = solo0.map(|r| r.total_ms as f64).unwrap_or(0.0);
+        let canon_epochs = solo0.map(|r| r.n_epochs).unwrap_or(0);
 
         let _ = write!(md, "| {model} |");
         for m in &modes {
-            if *m == "sync" { continue; }
+            if *m == "solo-0" { continue; }
             if let Some(r) = runs.iter().find(|r| r.mode == *m) {
-                if sync_ms > 0.0 && r.total_ms > 0 {
-                    let _ = write!(md, " {:.1}x |", sync_ms / r.total_ms as f64);
+                if solo0_ms > 0.0 && r.total_ms > 0 && r.n_epochs == canon_epochs {
+                    let _ = write!(md, " {:.1}x |", solo0_ms / r.total_ms as f64);
                 } else {
                     md.push_str(" - |");
                 }
@@ -558,8 +780,8 @@ fn write_idle_breakdown(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) 
 }
 
 fn write_elche_details(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
-    md.push_str("| Model | Mode | Anchors | Throttles | Syncs | Bat/Sync | Avg Sync (ms) | Sync Interval P50/P95 (ms) | CPU Avgs | Avg CPU (ms) |\n");
-    md.push_str("|-------|------|---------|-----------|-------|----------|--------------|---------------------------|---------|-------------|\n");
+    md.push_str("| Model | Mode | Anchors | Throttles | Syncs | Avg Sync (ms) | Sync Interval P50/P95 (ms) | CPU Avgs | Avg CPU (ms) |\n");
+    md.push_str("|-------|------|---------|-----------|-------|--------------|---------------------------|---------|-------------|\n");
 
     for (model, runs) in groups {
         for r in runs {
@@ -567,12 +789,6 @@ fn write_elche_details(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
             if r.mode.starts_with("solo") || r.sync_count == 0 {
                 continue;
             }
-
-            let bps = if r.batches_per_sync > 0.0 {
-                format!("{:.1}", r.batches_per_sync)
-            } else {
-                "-".to_string()
-            };
 
             // Sync interval percentiles
             let interval_str = if r.sync_intervals.len() >= 2 {
@@ -588,13 +804,12 @@ fn write_elche_details(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
 
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.1} |",
+                "| {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.1} |",
                 model,
                 r.mode,
                 r.anchor_changes,
                 r.throttle_count,
                 r.sync_count,
-                bps,
                 r.avg_sync_ms,
                 interval_str,
                 r.cpu_avg_count,

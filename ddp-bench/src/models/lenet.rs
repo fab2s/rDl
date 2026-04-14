@@ -27,6 +27,9 @@ pub fn def() -> ModelDef {
         augment_fn: None,
         optimizer: |p, lr| Box::new(Adam::new(p, lr)),
         scheduler: None,
+        reference: "MNIST ~99% acc ([LeCun 1998](http://yann.lecun.com/exdb/publis/pdf/lecun-98.pdf))",
+        eval_higher_is_better: true,
+        published_eval: Some(0.99),
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset
