@@ -31,7 +31,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full per-version detail.
 
 ## In progress
 
-- **[started] fdl maturity pass**: `flodl-args` crate + `--fdl-schema`
+- **[started] fdl maturity pass**: `FdlArgs` derive (flodl-cli lib + flodl-cli-macros) + `--fdl-schema`
   contract + multi-env overlay. Landed first because it unblocks both
   Phase 12 (needs `fdl.cloud.yml`) and ddp-bench expansion (needs
   schema-driven help). See

@@ -6,19 +6,10 @@
 //! Works both inside a floDl project and standalone. When standalone, libtorch
 //! is managed under `~/.flodl/` (override with `$FLODL_HOME`).
 
-mod api_ref;
-mod completions;
-mod config;
-pub mod context;
-mod diagnose;
-mod init;
-mod libtorch;
-mod run;
-mod schema_cache;
-mod setup;
-mod skill;
-mod style;
-mod util;
+use flodl_cli::{
+    api_ref, completions, config, context, diagnose, init, libtorch, run,
+    schema_cache, setup, skill, util,
+};
 
 use std::env;
 use std::process::ExitCode;

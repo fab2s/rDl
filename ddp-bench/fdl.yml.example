@@ -64,7 +64,8 @@ schema:
       description: Show available models and modes, then exit
     report:
       type: path
-      description: Analyze runs and write a markdown report
+      description: Analyze saved runs and write a markdown report (skips training). Use "-" for stdout.
+      default: runs/report.md
 
 # Default LRs per model (for reference):
 #   linear=0.001  mlp=0.001  convnet=0.001  lstm=0.001

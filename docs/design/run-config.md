@@ -701,7 +701,19 @@ $ fdl ddp-bench --baseline <TAB>
 
 ---
 
-## 3. The `flodl-args` crate: one struct, everything derived
+## 3. The `FdlArgs` derive — one struct, everything derived
+
+> **Consolidation note (2026-04-17):** An earlier revision of this doc
+> proposed a separate `flodl-args` crate, initially clap-backed. After
+> shipping the clap-backed MVP and attempting ddp-bench migration, the
+> clap attribute vocabulary (`default_value` vs `default_missing_value`,
+> `num_args = 0..=1`) leaked through to user code and clashed with the
+> "option are optional, only their value can have a default" principle
+> below. We consolidated into **flodl-cli as a lib+bin** (exposes the
+> runtime) + **flodl-cli-macros** as the proc-macro crate (one extra
+> crate is unavoidable — Rust language rule). Clap was dropped entirely;
+> flodl-cli owns the argv parser + schema emission. The `#[option]` /
+> `#[arg]` split proposed below is what the derive actually uses.
 
 ### Goal
 
