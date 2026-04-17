@@ -392,9 +392,57 @@ fn try_copy_example(example: &Path, target: &Path) -> bool {
 
 /// Load a project config from a specific path.
 pub fn load_project(path: &Path) -> Result<ProjectConfig, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-    parse(&content, path)
+    load_project_with_env(path, None)
+}
+
+/// Load a project config with an optional environment overlay.
+///
+/// When `env` is `Some`, looks for a sibling `fdl.<env>.{yml,yaml,json}` next
+/// to `base_path` and deep-merges it over the base before deserialization.
+/// Missing overlay files are a hard error — the user asked for this env, so
+/// silently ignoring it would be worse than a clear message.
+pub fn load_project_with_env(
+    base_path: &Path,
+    env: Option<&str>,
+) -> Result<ProjectConfig, String> {
+    let merged = load_merged_value(base_path, env)?;
+    serde_yaml::from_value::<ProjectConfig>(merged)
+        .map_err(|e| format!("{}: {}", base_path.display(), e))
+}
+
+/// Load the raw merged [`serde_yaml::Value`] for a config + optional env
+/// overlay. Exposed so callers like `fdl config show` can inspect the
+/// resolved view before it is deserialized into a strongly-typed struct.
+pub fn load_merged_value(
+    base_path: &Path,
+    env: Option<&str>,
+) -> Result<serde_yaml::Value, String> {
+    let mut layers = Vec::with_capacity(2);
+    layers.push(crate::overlay::load_value(base_path)?);
+    if let Some(name) = env {
+        match crate::overlay::find_env_file(base_path, name) {
+            Some(p) => layers.push(crate::overlay::load_value(&p)?),
+            None => {
+                return Err(format!(
+                    "environment `{name}` not found (expected fdl.{name}.yml next to {})",
+                    base_path.display()
+                ));
+            }
+        }
+    }
+    Ok(crate::overlay::merge_layers(layers))
+}
+
+/// Source path list for a base config + env overlay, in merge order. Used
+/// by `fdl config show` to annotate which layer a value came from.
+pub fn config_layer_sources(base_path: &Path, env: Option<&str>) -> Vec<PathBuf> {
+    let mut out = vec![base_path.to_path_buf()];
+    if let Some(name) = env {
+        if let Some(p) = crate::overlay::find_env_file(base_path, name) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// Load a command config from a sub-directory.
@@ -402,41 +450,59 @@ pub fn load_project(path: &Path) -> Result<ProjectConfig, String> {
 /// Applies the same `.example`/`.dist` fallback as [`find_config`]. If a
 /// `schema:` block is present, validates it before returning.
 pub fn load_command(dir: &Path) -> Result<CommandConfig, String> {
-    let mut cfg: CommandConfig = {
-        let mut found = None;
-        for name in CONFIG_NAMES {
-            let path = dir.join(name);
-            if path.is_file() {
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-                found = Some(parse(&content, &path)?);
-                break;
-            }
+    load_command_with_env(dir, None)
+}
+
+/// Load a sub-command config with an optional environment overlay.
+///
+/// Applies the same `.example`/`.dist` fallback as [`find_config`] to locate
+/// the base file, then deep-merges a sibling `fdl.<env>.yml` overlay if one
+/// exists. A *missing* overlay is silently accepted here (different from
+/// [`load_project_with_env`]) — envs declared at the project root don't
+/// have to exist for every sub-command.
+pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandConfig, String> {
+    // Resolve the base config path (with .example fallback, same as before).
+    let mut base_path: Option<PathBuf> = None;
+    for name in CONFIG_NAMES {
+        let path = dir.join(name);
+        if path.is_file() {
+            base_path = Some(path);
+            break;
         }
-        if found.is_none() {
-            for name in CONFIG_NAMES {
-                for suffix in EXAMPLE_SUFFIXES {
-                    let example = dir.join(format!("{name}{suffix}"));
-                    if example.is_file() {
-                        let target = dir.join(name);
-                        let src = if try_copy_example(&example, &target) {
-                            target
-                        } else {
-                            example
-                        };
-                        let content = std::fs::read_to_string(&src)
-                            .map_err(|e| format!("cannot read {}: {}", src.display(), e))?;
-                        found = Some(parse(&content, &src)?);
-                        break;
-                    }
-                }
-                if found.is_some() {
+    }
+    if base_path.is_none() {
+        for name in CONFIG_NAMES {
+            for suffix in EXAMPLE_SUFFIXES {
+                let example = dir.join(format!("{name}{suffix}"));
+                if example.is_file() {
+                    let target = dir.join(name);
+                    let src = if try_copy_example(&example, &target) {
+                        target
+                    } else {
+                        example
+                    };
+                    base_path = Some(src);
                     break;
                 }
             }
+            if base_path.is_some() {
+                break;
+            }
         }
-        found.ok_or_else(|| format!("no fdl.yml found in {}", dir.display()))?
-    };
+    }
+    let base_path = base_path
+        .ok_or_else(|| format!("no fdl.yml found in {}", dir.display()))?;
+
+    // Layered load: base + optional sibling env overlay.
+    let mut layers = vec![crate::overlay::load_value(&base_path)?];
+    if let Some(name) = env {
+        if let Some(p) = crate::overlay::find_env_file(&base_path, name) {
+            layers.push(crate::overlay::load_value(&p)?);
+        }
+    }
+    let merged = crate::overlay::merge_layers(layers);
+    let mut cfg: CommandConfig = serde_yaml::from_value(merged)
+        .map_err(|e| format!("{}: {}", base_path.display(), e))?;
 
     if let Some(schema) = &cfg.schema {
         validate_schema(schema)
@@ -479,18 +545,6 @@ pub fn command_name(path: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
-fn parse<T: serde::de::DeserializeOwned>(content: &str, path: &Path) -> Result<T, String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("yaml");
-    match ext {
-        "json" => {
-            serde_json::from_str(content).map_err(|e| format!("{}: {}", path.display(), e))
-        }
-        _ => serde_yaml::from_str(content).map_err(|e| format!("{}: {}", path.display(), e)),
-    }
-}
 
 // ── Merge ───────────────────────────────────────────────────────────────
 

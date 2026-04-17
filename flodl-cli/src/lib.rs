@@ -41,6 +41,7 @@ pub mod context;
 pub mod diagnose;
 pub mod init;
 pub mod libtorch;
+pub mod overlay;
 pub mod run;
 pub mod schema_cache;
 pub mod setup;
@@ -52,6 +53,11 @@ pub mod util;
 
 /// Parse argv into `T`, intercepting `--fdl-schema` and `--help`.
 pub use args::parse_or_schema;
+
+/// Slice-based variant of [`parse_or_schema`] — parses from an explicit
+/// `&[String]` rather than `std::env::args()`. Used by the `fdl` driver to
+/// dispatch per-sub-command arg tails.
+pub use args::parse_or_schema_from;
 
 /// Trait implemented by `#[derive(FdlArgs)]` structs. Binary authors do
 /// not typically implement this manually — the derive emits it.

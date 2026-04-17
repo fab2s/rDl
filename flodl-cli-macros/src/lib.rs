@@ -847,10 +847,12 @@ fn arg_extraction(f: &FieldSpec, idx: usize) -> TokenStream2 {
 }
 
 fn build_help_expr(fields: &[FieldSpec], description: Option<&str>, struct_name: &str) -> TokenStream2 {
-    let prog_tag = struct_name.to_string();
+    // Prefer the doc-comment description as the banner; fall back to the
+    // struct ident only when no description is present. The struct name is
+    // an implementation detail that users shouldn't see in `--help`.
     let header = match description {
-        Some(d) => format!("{prog_tag}: {d}\n\n"),
-        None => format!("{prog_tag}\n\n"),
+        Some(d) => format!("{d}\n\n"),
+        None => format!("{struct_name}\n\n"),
     };
 
     let mut opt_lines: Vec<String> = Vec::new();

@@ -319,8 +319,10 @@ independently implementable; together they make the scale-up story
 (laptop -> workstation -> cluster -> cloud) a matter of editing YAML
 rather than rewriting code.
 
-**Status**: approved design direction, not yet implemented. Capture
-before the details drift.
+**Status**: shipped. Derive, `--fdl-schema` contract, ddp-bench and
+flodl-cli migration, and multi-env overlay are all in tree as of
+2026-04-17. The text below is retained as the canonical reference for
+how the layer is meant to behave.
 
 ## 1. Multi-environment fdl.yaml inheritance
 
@@ -944,6 +946,11 @@ dependency in the binary beyond this one adapter call.
 
 Steps 1-3 are pure win with no new crate to maintain. Steps 4-6 are
 the ergonomic endgame. Step 7 is the scale-up story.
+
+**2026-04-17 status:** Steps 1-7 are all implemented. Source-annotated
+`fdl config show` is limited to layer-file headers (not per-line
+provenance); richer annotation, `inherit-from:`, env-var single-key
+overrides, and the explicit `--env` flag remain future-work polish.
 
 ---
 

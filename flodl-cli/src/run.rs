@@ -570,6 +570,7 @@ pub fn print_project_help(
     project: &config::ProjectConfig,
     project_root: &Path,
     builtins: &[(&str, &str)],
+    active_env: Option<&str>,
 ) {
     if let Some(desc) = &project.description {
         eprintln!("{} {}", style::bold("fdl"), desc);
@@ -639,11 +640,37 @@ pub fn print_project_help(
         for cmd_path in &project.commands {
             let short = config::command_name(cmd_path);
             let cmd_dir = project_root.join(cmd_path);
-            let desc = config::load_command(&cmd_dir)
+            let desc = config::load_command_with_env(&cmd_dir, active_env)
                 .ok()
                 .and_then(|c| c.description)
                 .unwrap_or_else(|| "(sub-command)".into());
             eprintln!("    {}  {desc}", style::green(&format!("{:<18}", short)));
+        }
+    }
+
+    // Available environments (sibling fdl.<env>.yml files at project root).
+    if let Some(base_config) = config::find_config(project_root) {
+        let envs = crate::overlay::list_envs(&base_config);
+        if !envs.is_empty() {
+            eprintln!();
+            eprintln!("{}:", style::yellow("Environments"));
+            for e in &envs {
+                let active_marker = if Some(e.as_str()) == active_env {
+                    style::green(" (active)")
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "    {}  Overlay from fdl.{}.yml{active_marker}",
+                    style::green(&format!("{:<18}", e)),
+                    e
+                );
+            }
+            eprintln!();
+            eprintln!(
+                "Use {} to run a command with an environment overlay.",
+                style::dim("fdl <env> <command>")
+            );
         }
     }
 

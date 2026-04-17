@@ -47,6 +47,15 @@ pub trait FdlArgsTrait: Sized {
 /// - Otherwise: parse via `T::try_parse_from`.
 pub fn parse_or_schema<T: FdlArgsTrait>() -> T {
     let argv: Vec<String> = std::env::args().collect();
+    parse_or_schema_from::<T>(&argv)
+}
+
+/// Slice-based variant of [`parse_or_schema`]. The first element is the
+/// program name (displayed in help text), the rest are arguments.
+///
+/// Used by the `fdl` driver itself when dispatching to sub-commands: each
+/// sub-command parses its own `args[2..]` tail without re-reading `env::args`.
+pub fn parse_or_schema_from<T: FdlArgsTrait>(argv: &[String]) -> T {
     if argv.iter().any(|a| a == "--fdl-schema") {
         let schema = T::schema();
         let json = serde_json::to_string_pretty(&schema)
@@ -58,7 +67,7 @@ pub fn parse_or_schema<T: FdlArgsTrait>() -> T {
         println!("{}", T::render_help());
         std::process::exit(0);
     }
-    match T::try_parse_from(&argv) {
+    match T::try_parse_from(argv) {
         Ok(t) => t,
         Err(msg) => {
             eprintln!("{msg}");
