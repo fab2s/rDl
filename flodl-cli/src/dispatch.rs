@@ -1,17 +1,24 @@
-//! Pure classifier for the `Path`-kind step of `dispatch_config`.
+//! Pure command-graph dispatch.
 //!
-//! The main loop in `main.rs::dispatch_config` walks an arbitrarily
-//! nested `commands:` graph. The `Path` arm has the most branches:
-//! descend into a child fdl.yml, render `--help`, refresh the schema
-//! cache, or forward the tail to the child's entry. [`classify_path_step`]
-//! inspects the load result + tail and returns a [`PathOutcome`] variant
-//! describing *which* of those four paths applies. All impure actions
-//! (printing help, spawning processes) stay in the caller, so this
-//! function is straight-line and unit-testable against tempdir fixtures.
+//! [`walk_commands`] is the outer walker: it chases an arbitrarily nested
+//! `commands:` graph starting from a top-level name + tail, and returns a
+//! [`WalkOutcome`] describing what the caller should do (run a script,
+//! spawn an entry, print help, error out, ...). The walker performs no
+//! IO of its own: no process spawning, no stdout writes, no cwd reads.
+//!
+//! [`classify_path_step`] is the inner classifier used by `walk_commands`
+//! for the `Path` arm: loads the child fdl.yml and inspects the tail to
+//! decide whether to descend, render help, refresh the schema cache, or
+//! forward to the entry.
+//!
+//! Keeping all impure actions (printing, spawning) in the caller makes
+//! both functions straight-line and unit-testable against tempdir
+//! fixtures.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, CommandConfig, CommandSpec};
+use crate::config::{self, CommandConfig, CommandKind, CommandSpec};
 
 /// What a single `Path`-kind step resolved to. Every variant holds the
 /// loaded `child` config when applicable, so the caller doesn't re-load.
@@ -84,6 +91,175 @@ pub fn classify_path_step(
     PathOutcome::Exec {
         child: Box::new(child_cfg),
         child_dir,
+    }
+}
+
+// ── Outer walker ────────────────────────────────────────────────────────
+
+/// What the outer walker resolved a user invocation to. The caller owns
+/// every impure action (spawning, printing, exit code); the walker just
+/// returns the terminal state.
+pub enum WalkOutcome {
+    /// Top-level or nested `Run` — caller runs the inline script.
+    RunScript {
+        command: String,
+        docker: Option<String>,
+        cwd: PathBuf,
+    },
+    /// Path-or-Preset terminal → caller invokes the child's entry. For
+    /// a Preset, `preset` is the preset name inside the enclosing
+    /// `commands:` block; for a Path-Exec it is `None`.
+    ExecCommand {
+        config: Box<CommandConfig>,
+        preset: Option<String>,
+        tail: Vec<String>,
+        cmd_dir: PathBuf,
+    },
+    /// Path terminal with `--refresh-schema` in the tail.
+    RefreshSchema {
+        config: Box<CommandConfig>,
+        cmd_dir: PathBuf,
+        cmd_name: String,
+    },
+    /// Path terminal with `--help` / `-h` in the tail.
+    PrintCommandHelp {
+        config: Box<CommandConfig>,
+        name: String,
+    },
+    /// Preset terminal with `--help` / `-h` in the tail.
+    PrintPresetHelp {
+        config: Box<CommandConfig>,
+        parent_label: String,
+        preset_name: String,
+    },
+    /// The top-level or descended-into name doesn't exist in the current
+    /// `commands:` map. Caller prints the project-help banner.
+    UnknownCommand { name: String },
+    /// A Preset-kind command at the top level has nothing to reuse an
+    /// `entry:` from. Caller prints a pointer to the fix.
+    PresetAtTopLevel { name: String },
+    /// Structural error: spec declares both `run:` and `path:`, or a
+    /// child fdl.yml failed to load / parse. String is the diagnostic.
+    Error(String),
+}
+
+/// Walk the command graph from a top-level name and produce a
+/// [`WalkOutcome`]. Every transition is pure: the walker never spawns a
+/// process, prints to stdout, or reads the process cwd. Inputs carry all
+/// the context needed.
+///
+/// - `cmd_name`: the top-level token the user typed (`fdl <cmd_name> ...`).
+/// - `tail`: positional args following `cmd_name` (typically `&args[2..]`).
+/// - `top_commands`: the root `commands:` block (usually
+///   `&project.commands`).
+/// - `project_root`: the directory containing the base `fdl.yml`; acts
+///   as the initial `current_dir` for Path resolution.
+/// - `env`: active overlay name, threaded to each `load_command_with_env`
+///   call so descended configs pick up env-layered fields.
+pub fn walk_commands(
+    cmd_name: &str,
+    tail: &[String],
+    top_commands: &BTreeMap<String, CommandSpec>,
+    project_root: &Path,
+    env: Option<&str>,
+) -> WalkOutcome {
+    let mut commands: BTreeMap<String, CommandSpec> = top_commands.clone();
+    let mut enclosing: Option<CommandConfig> = None;
+    let mut current_dir: PathBuf = project_root.to_path_buf();
+    let mut name: String = cmd_name.to_string();
+    let mut current_tail: Vec<String> = tail.to_vec();
+
+    loop {
+        let spec = match commands.get(&name) {
+            Some(s) => s.clone(),
+            None => return WalkOutcome::UnknownCommand { name },
+        };
+
+        let kind = match spec.kind() {
+            Ok(k) => k,
+            Err(e) => return WalkOutcome::Error(format!("command `{name}`: {e}")),
+        };
+
+        match kind {
+            CommandKind::Run => {
+                let command = spec
+                    .run
+                    .expect("Run kind guarantees `run` is set")
+                    .clone();
+                return WalkOutcome::RunScript {
+                    command,
+                    docker: spec.docker,
+                    cwd: current_dir,
+                };
+            }
+            CommandKind::Path => {
+                match classify_path_step(&spec, &name, &current_dir, &current_tail, env) {
+                    PathOutcome::LoadFailed(msg) => return WalkOutcome::Error(msg),
+                    PathOutcome::Descend {
+                        child,
+                        new_dir,
+                        new_name,
+                    } => {
+                        commands = child.commands.clone();
+                        enclosing = Some(*child);
+                        current_dir = new_dir;
+                        name = new_name;
+                        // classify_path_step returned Descend because
+                        // current_tail[0] named a nested command; consume
+                        // that token before the next iteration.
+                        if !current_tail.is_empty() {
+                            current_tail.remove(0);
+                        }
+                    }
+                    PathOutcome::ShowHelp { child } => {
+                        return WalkOutcome::PrintCommandHelp {
+                            config: child,
+                            name,
+                        };
+                    }
+                    PathOutcome::RefreshSchema { child, child_dir } => {
+                        return WalkOutcome::RefreshSchema {
+                            config: child,
+                            cmd_dir: child_dir,
+                            cmd_name: name,
+                        };
+                    }
+                    PathOutcome::Exec { child, child_dir } => {
+                        return WalkOutcome::ExecCommand {
+                            config: child,
+                            preset: None,
+                            tail: current_tail,
+                            cmd_dir: child_dir,
+                        };
+                    }
+                }
+            }
+            CommandKind::Preset => {
+                let Some(encl) = enclosing.take() else {
+                    return WalkOutcome::PresetAtTopLevel { name };
+                };
+
+                if current_tail.iter().any(|a| a == "--help" || a == "-h") {
+                    let parent_label = current_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    return WalkOutcome::PrintPresetHelp {
+                        config: Box::new(encl),
+                        parent_label,
+                        preset_name: name,
+                    };
+                }
+
+                return WalkOutcome::ExecCommand {
+                    config: Box::new(encl),
+                    preset: Some(name),
+                    tail: current_tail,
+                    cmd_dir: current_dir,
+                };
+            }
+        }
     }
 }
 
@@ -246,5 +422,290 @@ mod tests {
         // `actual/` is the real dir courtesy of `path:`.
         let out = classify_path_step(&spec, "label", tmp.path(), &tail, None);
         assert!(matches!(out, PathOutcome::Exec { .. }));
+    }
+
+    // ── walk_commands: outer walker ──────────────────────────────────────
+    //
+    // These drive the full walk from top-level down, asserting on the
+    // terminal WalkOutcome variant. No processes are spawned — the walker
+    // is pure, so tests stay fast and hermetic.
+
+    /// Build a top-level `commands:` map by parsing a short YAML snippet.
+    fn top_commands(yaml: &str) -> BTreeMap<String, CommandSpec> {
+        #[derive(serde::Deserialize)]
+        struct Root {
+            #[serde(default)]
+            commands: BTreeMap<String, CommandSpec>,
+        }
+        serde_yaml::from_str::<Root>(yaml)
+            .expect("parse top-level commands")
+            .commands
+    }
+
+    fn args(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn walk_top_level_run_returns_run_script() {
+        let tmp = TempDir::new();
+        let commands = top_commands("commands:\n  greet:\n    run: echo hello\n");
+        let out = walk_commands("greet", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::RunScript { command, docker, cwd } => {
+                assert_eq!(command, "echo hello");
+                assert!(docker.is_none());
+                assert_eq!(cwd, tmp.path());
+            }
+            _ => panic!("expected RunScript"),
+        }
+    }
+
+    #[test]
+    fn walk_top_level_run_with_docker_preserves_service() {
+        let tmp = TempDir::new();
+        let commands = top_commands(
+            "commands:\n  dev:\n    run: cargo test\n    docker: dev\n",
+        );
+        let out = walk_commands("dev", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::RunScript { docker, .. } => {
+                assert_eq!(docker.as_deref(), Some("dev"));
+            }
+            _ => panic!("expected RunScript with docker"),
+        }
+    }
+
+    #[test]
+    fn walk_unknown_top_level_returns_unknown() {
+        let tmp = TempDir::new();
+        let commands = top_commands("commands:\n  greet:\n    run: echo hello\n");
+        let out = walk_commands("nope", &args(&["arg"]), &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::UnknownCommand { name } => assert_eq!(name, "nope"),
+            _ => panic!("expected UnknownCommand"),
+        }
+    }
+
+    #[test]
+    fn walk_top_level_preset_errors_without_enclosing() {
+        // A top-level command with preset-shaped fields (`options:`) but
+        // neither `run:` nor `path:` has no enclosing CommandConfig to
+        // borrow an `entry:` from — must error loudly.
+        let tmp = TempDir::new();
+        let commands = top_commands(
+            "commands:\n  orphan:\n    options: { model: linear }\n",
+        );
+        let out = walk_commands("orphan", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::PresetAtTopLevel { name } => assert_eq!(name, "orphan"),
+            _ => panic!("expected PresetAtTopLevel"),
+        }
+    }
+
+    #[test]
+    fn walk_run_and_path_both_set_is_error() {
+        let tmp = TempDir::new();
+        let commands = top_commands(
+            "commands:\n  bad:\n    run: echo hi\n    path: ./sub\n",
+        );
+        let out = walk_commands("bad", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::Error(msg) => {
+                assert!(msg.contains("bad"), "got: {msg}");
+                assert!(msg.contains("both `run:` and `path:`"), "got: {msg}");
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn walk_path_exec_at_one_level() {
+        // Top-level `ddp-bench` path-kind → no further descent → Exec.
+        let tmp = TempDir::new();
+        mkcmd(tmp.path(), "ddp-bench", "entry: cargo run -p ddp-bench\n");
+        let commands = top_commands("commands:\n  ddp-bench: {}\n");
+        let tail = args(&["--seed", "42"]);
+        let out = walk_commands("ddp-bench", &tail, &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::ExecCommand {
+                preset,
+                tail: returned_tail,
+                cmd_dir,
+                ..
+            } => {
+                assert!(preset.is_none());
+                assert_eq!(returned_tail, args(&["--seed", "42"]));
+                assert_eq!(cmd_dir, tmp.path().join("ddp-bench"));
+            }
+            _ => panic!("expected ExecCommand"),
+        }
+    }
+
+    #[test]
+    fn walk_path_then_preset_at_two_levels() {
+        // fdl.yml: commands: { ddp-bench: {} }  → path kind, convention
+        // ddp-bench/fdl.yml: commands: { quick: { options: { model: linear } } }
+        // Invocation: `fdl ddp-bench quick --epochs 5`
+        // Expected: descend into ddp-bench, resolve `quick` as preset,
+        // emit ExecCommand with preset=Some("quick"), tail=["--epochs","5"].
+        let tmp = TempDir::new();
+        mkcmd(
+            tmp.path(),
+            "ddp-bench",
+            "entry: cargo run -p ddp-bench\n\
+             commands:\n  quick:\n    options: { model: linear }\n",
+        );
+        let commands = top_commands("commands:\n  ddp-bench: {}\n");
+        let tail = args(&["quick", "--epochs", "5"]);
+        let out = walk_commands("ddp-bench", &tail, &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::ExecCommand {
+                preset,
+                tail: returned_tail,
+                cmd_dir,
+                ..
+            } => {
+                assert_eq!(preset.as_deref(), Some("quick"));
+                assert_eq!(returned_tail, args(&["--epochs", "5"]));
+                assert_eq!(cmd_dir, tmp.path().join("ddp-bench"));
+            }
+            _ => panic!("expected ExecCommand with preset"),
+        }
+    }
+
+    #[test]
+    fn walk_path_then_path_then_preset_at_three_levels() {
+        // Three-level walk: `fdl a b quick`.
+        // tmp/fdl.yml             → commands: { a: {} }
+        // tmp/a/fdl.yml           → commands: { b: {} }   + entry (required for preset parent)
+        // tmp/a/b/fdl.yml         → commands: { quick: { options: { x: 1 } } } + entry
+        let tmp = TempDir::new();
+        mkcmd(
+            tmp.path(),
+            "a",
+            "entry: echo a\ncommands:\n  b: {}\n",
+        );
+        // b is a sibling directory under a/
+        let b_dir = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&b_dir).unwrap();
+        std::fs::write(
+            b_dir.join("fdl.yml"),
+            "entry: echo b\ncommands:\n  quick:\n    options: { x: 1 }\n",
+        )
+        .unwrap();
+        let commands = top_commands("commands:\n  a: {}\n");
+        let tail = args(&["b", "quick"]);
+        let out = walk_commands("a", &tail, &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::ExecCommand {
+                preset, cmd_dir, ..
+            } => {
+                assert_eq!(preset.as_deref(), Some("quick"));
+                assert_eq!(cmd_dir, b_dir);
+            }
+            _ => panic!("expected ExecCommand with preset at depth 3"),
+        }
+    }
+
+    #[test]
+    fn walk_path_child_missing_returns_error() {
+        // Convention-default Path for `ghost`, but tmp/ghost/fdl.yml doesn't exist.
+        let tmp = TempDir::new();
+        let commands = top_commands("commands:\n  ghost: {}\n");
+        let out = walk_commands("ghost", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::Error(msg) => assert!(msg.contains("no fdl.yml"), "got: {msg}"),
+            _ => panic!("expected Error(LoadFailed)"),
+        }
+    }
+
+    #[test]
+    fn walk_path_help_prints_command_help() {
+        let tmp = TempDir::new();
+        mkcmd(tmp.path(), "ddp-bench", "entry: echo\n");
+        let commands = top_commands("commands:\n  ddp-bench: {}\n");
+        let tail = args(&["--help"]);
+        let out = walk_commands("ddp-bench", &tail, &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::PrintCommandHelp { name, .. } => assert_eq!(name, "ddp-bench"),
+            _ => panic!("expected PrintCommandHelp"),
+        }
+    }
+
+    #[test]
+    fn walk_preset_help_prints_preset_help() {
+        // `fdl ddp-bench quick --help` — help applies to the preset, not
+        // the enclosing command (descent wins at the classify level, then
+        // Preset-kind with `--help` in the tail emits PrintPresetHelp).
+        let tmp = TempDir::new();
+        mkcmd(
+            tmp.path(),
+            "ddp-bench",
+            "entry: echo\ncommands:\n  quick:\n    options: { x: 1 }\n",
+        );
+        let commands = top_commands("commands:\n  ddp-bench: {}\n");
+        let tail = args(&["quick", "--help"]);
+        let out = walk_commands("ddp-bench", &tail, &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::PrintPresetHelp {
+                parent_label,
+                preset_name,
+                ..
+            } => {
+                assert_eq!(preset_name, "quick");
+                assert_eq!(parent_label, "ddp-bench");
+            }
+            _ => panic!("expected PrintPresetHelp"),
+        }
+    }
+
+    #[test]
+    fn walk_path_refresh_schema() {
+        let tmp = TempDir::new();
+        mkcmd(tmp.path(), "ddp-bench", "entry: echo\n");
+        let commands = top_commands("commands:\n  ddp-bench: {}\n");
+        let tail = args(&["--refresh-schema"]);
+        let out = walk_commands("ddp-bench", &tail, &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::RefreshSchema { cmd_name, .. } => {
+                assert_eq!(cmd_name, "ddp-bench");
+            }
+            _ => panic!("expected RefreshSchema"),
+        }
+    }
+
+    #[test]
+    fn walk_env_propagates_to_child_overlay() {
+        // Base child says entry=echo-base; env overlay fdl.ci.yml
+        // overrides entry=echo-ci. After descent with env=Some("ci"),
+        // the ExecCommand carries the overlaid config.
+        let tmp = TempDir::new();
+        let child = mkcmd(tmp.path(), "ddp-bench", "entry: echo-base\n");
+        std::fs::write(child.join("fdl.ci.yml"), "entry: echo-ci\n").unwrap();
+        let commands = top_commands("commands:\n  ddp-bench: {}\n");
+        let out = walk_commands("ddp-bench", &[], &commands, tmp.path(), Some("ci"));
+        match out {
+            WalkOutcome::ExecCommand { config, .. } => {
+                assert_eq!(config.entry.as_deref(), Some("echo-ci"));
+            }
+            _ => panic!("expected ExecCommand with env-overlaid entry"),
+        }
+    }
+
+    #[test]
+    fn walk_env_none_ignores_overlay() {
+        // Same fixtures as above, but env=None — base must win.
+        let tmp = TempDir::new();
+        let child = mkcmd(tmp.path(), "ddp-bench", "entry: echo-base\n");
+        std::fs::write(child.join("fdl.ci.yml"), "entry: echo-ci\n").unwrap();
+        let commands = top_commands("commands:\n  ddp-bench: {}\n");
+        let out = walk_commands("ddp-bench", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::ExecCommand { config, .. } => {
+                assert_eq!(config.entry.as_deref(), Some("echo-base"));
+            }
+            _ => panic!("expected ExecCommand with base entry"),
+        }
     }
 }

@@ -11,7 +11,7 @@ use flodl_cli::{
     overlay, parse_or_schema_from, run, schema_cache, setup, skill, util, FdlArgs,
 };
 
-use dispatch::{classify_path_step, PathOutcome};
+use dispatch::{walk_commands, WalkOutcome};
 
 use std::env;
 use std::process::ExitCode;
@@ -1082,6 +1082,10 @@ fn load_project_config(
 /// recurses into a child fdl.yml (Path), executes a self-contained shell
 /// command (Run), or invokes the enclosing entry with merged preset
 /// fields (Preset).
+///
+/// The graph walk itself lives in [`dispatch::walk_commands`] and is
+/// pure — this wrapper performs the actual IO (process spawning, stdout
+/// writes, exit code mapping) based on the returned [`WalkOutcome`].
 fn dispatch_config(cmd: &str, args: &[String], env: Option<&str>) -> ExitCode {
     let cwd = env::current_dir().unwrap_or_default();
     let (project, project_root) = match load_project_config(&cwd, env) {
@@ -1094,98 +1098,54 @@ fn dispatch_config(cmd: &str, args: &[String], env: Option<&str>) -> ExitCode {
         }
     };
 
-    // Walk the command graph. Presets require an enclosing CommandConfig
-    // (they reuse its `entry:`), so we track the most recently loaded
-    // one as we descend.
-    let mut commands: std::collections::BTreeMap<String, config::CommandSpec> =
-        project.commands.clone();
-    let mut enclosing_cfg: Option<config::CommandConfig> = None;
-    let mut current_dir = project_root.clone();
-    let mut name = cmd.to_string();
-    let mut tail_idx = 2usize; // args[2..] is the tail after the first command
+    let tail: &[String] = args.get(2..).unwrap_or(&[]);
+    let outcome = walk_commands(cmd, tail, &project.commands, &project_root, env);
 
-    loop {
-        let spec = match commands.get(&name) {
-            Some(s) => s.clone(),
-            None => {
-                eprintln!("unknown command: {name}");
-                eprintln!();
-                run::print_project_help(&project, &project_root, BUILTINS, env);
-                return ExitCode::FAILURE;
-            }
-        };
-
-        let tail = &args[tail_idx..];
-
-        let kind = match spec.kind() {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("error in command `{name}`: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        match kind {
-            config::CommandKind::Run => {
-                let run_cmd = spec.run.as_deref().expect("Run kind guarantees run is set");
-                return run::exec_script(run_cmd, spec.docker.as_deref(), &current_dir);
-            }
-            config::CommandKind::Path => {
-                match classify_path_step(&spec, &name, &current_dir, tail, env) {
-                    PathOutcome::LoadFailed(msg) => {
-                        eprintln!("error: {msg}");
-                        return ExitCode::FAILURE;
-                    }
-                    PathOutcome::Descend {
-                        child,
-                        new_dir,
-                        new_name,
-                    } => {
-                        commands = child.commands.clone();
-                        enclosing_cfg = Some(*child);
-                        current_dir = new_dir;
-                        name = new_name;
-                        tail_idx += 1;
-                    }
-                    PathOutcome::ShowHelp { child } => {
-                        run::print_command_help(&child, &name);
-                        return ExitCode::SUCCESS;
-                    }
-                    PathOutcome::RefreshSchema { child, child_dir } => {
-                        return cmd_refresh_schema(&child, &child_dir, &name);
-                    }
-                    PathOutcome::Exec { child, child_dir } => {
-                        return run::exec_command(
-                            &child,
-                            None,
-                            tail,
-                            &child_dir,
-                            &project_root,
-                        );
-                    }
-                }
-            }
-            config::CommandKind::Preset => {
-                let Some(encl) = enclosing_cfg.as_ref() else {
-                    eprintln!(
-                        "error: preset command `{name}` has no enclosing \
-                         fdl.yml (top-level commands must be `run:` or `path:`)"
-                    );
-                    return ExitCode::FAILURE;
-                };
-
-                if tail.iter().any(|a| a == "--help" || a == "-h") {
-                    // Label the preset with the enclosing command path.
-                    let parent_label = current_dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
-                    run::print_preset_help(encl, parent_label, &name);
-                    return ExitCode::SUCCESS;
-                }
-
-                return run::exec_command(encl, Some(&name), tail, &current_dir, &project_root);
-            }
+    match outcome {
+        WalkOutcome::RunScript {
+            command,
+            docker,
+            cwd,
+        } => run::exec_script(&command, docker.as_deref(), &cwd),
+        WalkOutcome::ExecCommand {
+            config,
+            preset,
+            tail,
+            cmd_dir,
+        } => run::exec_command(&config, preset.as_deref(), &tail, &cmd_dir, &project_root),
+        WalkOutcome::RefreshSchema {
+            config,
+            cmd_dir,
+            cmd_name,
+        } => cmd_refresh_schema(&config, &cmd_dir, &cmd_name),
+        WalkOutcome::PrintCommandHelp { config, name } => {
+            run::print_command_help(&config, &name);
+            ExitCode::SUCCESS
+        }
+        WalkOutcome::PrintPresetHelp {
+            config,
+            parent_label,
+            preset_name,
+        } => {
+            run::print_preset_help(&config, &parent_label, &preset_name);
+            ExitCode::SUCCESS
+        }
+        WalkOutcome::UnknownCommand { name } => {
+            eprintln!("unknown command: {name}");
+            eprintln!();
+            run::print_project_help(&project, &project_root, BUILTINS, env);
+            ExitCode::FAILURE
+        }
+        WalkOutcome::PresetAtTopLevel { name } => {
+            eprintln!(
+                "error: preset command `{name}` has no enclosing \
+                 fdl.yml (top-level commands must be `run:` or `path:`)"
+            );
+            ExitCode::FAILURE
+        }
+        WalkOutcome::Error(msg) => {
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
         }
     }
 }
