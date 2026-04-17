@@ -56,7 +56,7 @@ struct CompletionData {
 
 struct CommandData {
     name: String,
-    jobs: Vec<String>,
+    sub_commands: Vec<String>,
     options: Vec<OptionCompletion>,
 }
 
@@ -88,20 +88,23 @@ impl CompletionData {
         let mut commands = Vec::new();
 
         if let Some((proj, root)) = project {
-            for name in proj.scripts.keys() {
+            for (name, spec) in &proj.commands {
                 top_level.push(name.clone());
-            }
-            for cmd_path in &proj.commands {
-                let short = config::command_name(cmd_path).to_string();
-                top_level.push(short.clone());
 
-                let cmd_dir = root.join(cmd_path);
-                if let Ok(cmd_config) = config::load_command(&cmd_dir) {
-                    commands.push(CommandData::from_config(short, &cmd_config));
+                // Only try to load a child fdl.yml for Path-kind commands.
+                // `run:` commands are leaf scripts; presets at the root are
+                // disallowed.
+                let is_path_kind = spec.run.is_none();
+                if !is_path_kind {
+                    continue;
+                }
+                let child_dir = spec.resolve_path(name, root);
+                if let Ok(cmd_config) = config::load_command(&child_dir) {
+                    commands.push(CommandData::from_config(name.clone(), &cmd_config));
                 } else {
                     commands.push(CommandData {
-                        name: short,
-                        jobs: Vec::new(),
+                        name: name.clone(),
+                        sub_commands: Vec::new(),
                         options: Vec::new(),
                     });
                 }
@@ -117,7 +120,7 @@ impl CompletionData {
 
 impl CommandData {
     fn from_config(name: String, cfg: &CommandConfig) -> Self {
-        let jobs: Vec<String> = cfg.jobs.keys().cloned().collect();
+        let sub_commands: Vec<String> = cfg.commands.keys().cloned().collect();
         let options = cfg
             .schema
             .as_ref()
@@ -130,7 +133,7 @@ impl CommandData {
             .unwrap_or_default();
         Self {
             name,
-            jobs,
+            sub_commands,
             options,
         }
     }
@@ -352,7 +355,7 @@ fn emit_bash(data: &CompletionData) -> String {
     s.push_str("        return\n");
     s.push_str("    fi\n");
 
-    // Sub-commands with schema / jobs.
+    // Sub-commands with schema / nested commands.
     for cmd in &data.commands {
         s.push_str(&format!("\n    if [[ \"$cmd\" == \"{name}\" ]]; then\n", name = cmd.name));
 
@@ -383,7 +386,7 @@ fn emit_bash(data: &CompletionData) -> String {
         }
         s.push_str("        esac\n");
 
-        // At position 2, offer jobs + option flags.
+        // At position 2, offer nested sub-commands + option flags.
         // Beyond position 2, offer option flags only (prev-value already handled).
         let option_flags: Vec<String> = cmd
             .options
@@ -396,16 +399,16 @@ fn emit_bash(data: &CompletionData) -> String {
             v.push("-h".into());
             v.join(" ")
         };
-        let jobs_str = cmd.jobs.join(" ");
+        let sub_cmds_str = cmd.sub_commands.join(" ");
 
         s.push_str("        if [[ $COMP_CWORD -eq 2 ]]; then\n");
-        if cmd.jobs.is_empty() {
+        if cmd.sub_commands.is_empty() {
             s.push_str(&format!(
                 "            COMPREPLY=($(compgen -W \"{cmd_flags_str}\" -- \"$cur\"))\n"
             ));
         } else {
             s.push_str(&format!(
-                "            COMPREPLY=($(compgen -W \"{jobs_str} {cmd_flags_str}\" -- \"$cur\"))\n"
+                "            COMPREPLY=($(compgen -W \"{sub_cmds_str} {cmd_flags_str}\" -- \"$cur\"))\n"
             ));
         }
         s.push_str("            return\n");
@@ -496,7 +499,7 @@ fn emit_zsh(data: &CompletionData) -> String {
             s.push_str("            esac\n");
         }
 
-        // Position 3 (after the command name): offer jobs + options.
+        // Position 3 (after the command name): offer nested sub-commands + options.
         let option_flags: Vec<String> = cmd
             .options
             .iter()
@@ -507,14 +510,14 @@ fn emit_zsh(data: &CompletionData) -> String {
         all_flags.push("-h".into());
         let flags_joined = all_flags.join(" ");
 
-        if !cmd.jobs.is_empty() {
+        if !cmd.sub_commands.is_empty() {
             s.push_str("            if (( CURRENT == 3 )); then\n");
-            s.push_str("                local -a jobs\n");
+            s.push_str("                local -a subcommands\n");
             s.push_str(&format!(
-                "                jobs=({})\n",
-                cmd.jobs.join(" ")
+                "                subcommands=({})\n",
+                cmd.sub_commands.join(" ")
             ));
-            s.push_str("                _describe 'job' jobs\n");
+            s.push_str("                _describe 'command' subcommands\n");
             s.push_str("            fi\n");
         }
         s.push_str(&format!(
@@ -574,9 +577,9 @@ fn emit_fish(data: &CompletionData) -> String {
         s.push_str(&format!("# {name}\n", name = cmd.name));
         let cond = format!("__fish_seen_subcommand_from {}", cmd.name);
 
-        for job in &cmd.jobs {
+        for sub in &cmd.sub_commands {
             s.push_str(&format!(
-                "complete -c fdl -n '{cond}' -a '{job}' -d 'job'\n"
+                "complete -c fdl -n '{cond}' -a '{sub}' -d 'command'\n"
             ));
         }
 

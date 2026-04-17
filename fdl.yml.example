@@ -1,6 +1,9 @@
 description: flodl - Rust deep learning framework
 
-scripts:
+commands:
+  # --- Sub-command (child fdl.yml) ---
+  ddp-bench:                    # convention: ./ddp-bench/fdl.yml
+
   # --- CPU targets ---
   build:
     description: Build (debug)
@@ -79,6 +82,3 @@ scripts:
   self-build:
     description: Rebuild fdl CLI after changes
     run: cargo install --path flodl-cli
-
-commands:
-  - ddp-bench/

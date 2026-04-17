@@ -1,7 +1,8 @@
-//! Job resolution and command execution.
+//! Command resolution and execution.
 //!
-//! Merges structured config sections into CLI arguments,
-//! resolves jobs, and spawns the target process.
+//! Merges structured config sections into CLI arguments, resolves named
+//! command presets, and spawns the target process (directly or through
+//! Docker when a `docker:` service is declared).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -234,13 +235,13 @@ pub fn exec_script(command: &str, docker_service: Option<&str>, cwd: &Path) -> E
 
 // ── Command execution ───────────────────────────────────────────────────
 
-/// Execute a sub-command, optionally with a named job.
+/// Execute a sub-command, optionally with a named preset (inline command).
 ///
 /// `project_root` is needed to resolve Docker compose context and
 /// compute the relative workdir for containerized execution.
 pub fn exec_command(
     cmd_config: &CommandConfig,
-    job_name: Option<&str>,
+    preset_name: Option<&str>,
     extra_args: &[String],
     cmd_dir: &Path,
     project_root: &Path,
@@ -256,12 +257,12 @@ pub fn exec_command(
         }
     };
 
-    // Resolve config: job overrides merged with root defaults.
-    let resolved = match job_name {
-        Some(name) => match cmd_config.jobs.get(name) {
-            Some(job) => config::merge_job(cmd_config, job),
+    // Resolve config: preset overrides merged with root defaults.
+    let resolved = match preset_name {
+        Some(name) => match cmd_config.commands.get(name) {
+            Some(preset) => config::merge_preset(cmd_config, preset),
             None => {
-                eprintln!("error: unknown job '{name}'");
+                eprintln!("error: unknown command '{name}'");
                 eprintln!();
                 print_command_help(cmd_config, "");
                 return ExitCode::FAILURE;
@@ -294,7 +295,7 @@ pub fn exec_command(
             format!("cd {workdir} && {entry} {args_str}")
         };
 
-        if job_name.is_some() {
+        if preset_name.is_some() {
             eprintln!("fdl: [{service}] {inner}");
         }
 
@@ -311,7 +312,7 @@ pub fn exec_command(
         let program = parts[0];
         let entry_args = &parts[1..];
 
-        if job_name.is_some() {
+        if preset_name.is_some() {
             let preview: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             eprintln!("fdl: {entry} {}", preview.join(" "));
         }
@@ -360,23 +361,15 @@ pub fn print_command_help(cmd_config: &CommandConfig, name: &str) {
     }
 
     // Build a schema-aware usage line when args are declared.
-    let usage_tail = build_usage_tail(cmd_config.schema.as_ref(), !cmd_config.jobs.is_empty());
+    let has_sub_commands = !cmd_config.commands.is_empty();
+    let usage_tail = build_usage_tail(cmd_config.schema.as_ref(), has_sub_commands);
     eprintln!();
     eprintln!("{}:", style::yellow("Usage"));
     eprintln!("    fdl {name}{usage_tail}");
 
-    if !cmd_config.jobs.is_empty() {
-        eprintln!();
-        eprintln!("{}:", style::yellow("Jobs"));
-        for (job_name, job) in &cmd_config.jobs {
-            let desc = job.description.as_deref().unwrap_or("-");
-            eprintln!("    {}  {}", style::green(&format!("{:<20}", job_name)), desc);
-        }
-    }
-
-    // Schema-driven args + options. Renders only when a schema block is
-    // present in fdl.yaml; the pre-existing "Defaults" section below still
-    // covers the ddp/training/output structured config.
+    // Arguments: schema-declared positionals only (distinct concept from
+    // sub-commands). Sub-commands live under their own "Commands:" section
+    // below.
     if let Some(schema) = &cmd_config.schema {
         if !schema.args.is_empty() {
             eprintln!();
@@ -385,6 +378,28 @@ pub fn print_command_help(cmd_config: &CommandConfig, name: &str) {
                 eprintln!("    {}", format_arg(a));
             }
         }
+    }
+
+    // Commands: nested sub-commands declared in this fdl.yml (any kind —
+    // inline presets that reuse the entry, `run:` scripts, or `path:`
+    // pointers to child fdl.yml files).
+    if has_sub_commands {
+        eprintln!();
+        eprintln!("{}:", style::yellow("Commands"));
+        for (sub_name, sub_spec) in &cmd_config.commands {
+            let desc = sub_spec.description.as_deref().unwrap_or("-");
+            eprintln!(
+                "    {}  {}",
+                style::green(&format!("{:<20}", sub_name)),
+                desc
+            );
+        }
+    }
+
+    // Schema-driven options. Renders only when a schema block is present in
+    // fdl.yaml; the "Defaults" section below covers the ddp/training/output
+    // structured config.
+    if let Some(schema) = &cmd_config.schema {
         if !schema.options.is_empty() {
             eprintln!();
             eprintln!("{}:", style::yellow("Options"));
@@ -446,37 +461,34 @@ pub fn print_command_help(cmd_config: &CommandConfig, name: &str) {
     }
 }
 
-/// Print help for a specific job within a sub-command.
-pub fn print_job_help(cmd_config: &CommandConfig, cmd_name: &str, job_name: &str) {
-    let job = match cmd_config.jobs.get(job_name) {
-        Some(j) => j,
+/// Print help for a named preset command nested inside a sub-command.
+pub fn print_preset_help(cmd_config: &CommandConfig, cmd_name: &str, preset_name: &str) {
+    let preset = match cmd_config.commands.get(preset_name) {
+        Some(s) => s,
         None => {
-            eprintln!("unknown job: {job_name}");
+            eprintln!("unknown command: {preset_name}");
             return;
         }
     };
 
     // Title.
-    let desc = job
-        .description
-        .as_deref()
-        .unwrap_or("(no description)");
+    let desc = preset.description.as_deref().unwrap_or("(no description)");
     eprintln!(
         "{} {} {}",
         style::bold(cmd_name),
-        style::green(job_name),
+        style::green(preset_name),
         desc
     );
 
     eprintln!();
     eprintln!("{}:", style::yellow("Usage"));
     eprintln!(
-        "    fdl {cmd_name} {job_name} {}",
+        "    fdl {cmd_name} {preset_name} {}",
         style::dim("[extra options]")
     );
 
-    // Show the merged config that this job produces.
-    let resolved = config::merge_job(cmd_config, job);
+    // Show the merged config that this preset produces.
+    let resolved = config::merge_preset(cmd_config, preset);
 
     eprintln!();
     eprintln!("{}:", style::yellow("Effective config"));
@@ -546,7 +558,7 @@ pub fn print_job_help(cmd_config: &CommandConfig, cmd_name: &str, job_name: &str
 
     eprintln!();
     eprintln!(
-        "Extra {} after the job name are appended to the command.",
+        "Extra {} after the command name are appended to the entry.",
         style::dim("[options]")
     );
 }
@@ -620,31 +632,38 @@ pub fn print_project_help(
         eprintln!("    {}  {desc}", style::green(&format!("{:<18}", name)));
     }
 
-    // Scripts.
-    if !project.scripts.is_empty() {
-        eprintln!();
-        eprintln!("{}:", style::yellow("Scripts"));
-        for (name, script) in &project.scripts {
-            eprintln!(
-                "    {}  {}",
-                style::green(&format!("{:<18}", name)),
-                script.description()
-            );
-        }
-    }
-
-    // Commands (load each child's description).
+    // Commands: unified section. Each entry in `project.commands` is one
+    // of: an inline `run:` script, a `path:` (or convention-default)
+    // pointer to a child fdl.yml, or — at nested levels only — an inline
+    // preset. Descriptions come from the `CommandSpec`; for `path:`
+    // commands missing their own description, fall back to loading the
+    // child fdl.yml's description.
     if !project.commands.is_empty() {
         eprintln!();
         eprintln!("{}:", style::yellow("Commands"));
-        for cmd_path in &project.commands {
-            let short = config::command_name(cmd_path);
-            let cmd_dir = project_root.join(cmd_path);
-            let desc = config::load_command_with_env(&cmd_dir, active_env)
-                .ok()
-                .and_then(|c| c.description)
-                .unwrap_or_else(|| "(sub-command)".into());
-            eprintln!("    {}  {desc}", style::green(&format!("{:<18}", short)));
+        for (name, spec) in &project.commands {
+            let desc: String = match spec.description.clone() {
+                Some(d) => d,
+                None => {
+                    // For path-kind entries, fall back to the child config's
+                    // own description so `commands: { ddp-bench: }` still
+                    // shows a useful blurb.
+                    let is_path_kind = spec.run.is_none();
+                    if is_path_kind {
+                        let child_dir = spec.resolve_path(name, project_root);
+                        config::load_command_with_env(&child_dir, active_env)
+                            .ok()
+                            .and_then(|c| c.description)
+                            .unwrap_or_else(|| "(sub-command)".into())
+                    } else {
+                        spec.run
+                            .as_deref()
+                            .unwrap_or("(command)")
+                            .to_string()
+                    }
+                }
+            };
+            eprintln!("    {}  {desc}", style::green(&format!("{:<18}", name)));
         }
     }
 
@@ -692,13 +711,13 @@ pub fn _format_options(opts: &BTreeMap<String, serde_json::Value>) -> String {
 // ── Schema-driven help helpers ──────────────────────────────────────────
 
 /// Build the part of "fdl <cmd>..." after the command name: positionals
-/// rendered as `<name>` (required) or `[<name>]` (optional), plus `[job]`
-/// and `[options]` when applicable.
-fn build_usage_tail(schema: Option<&Schema>, has_jobs: bool) -> String {
+/// rendered as `<name>` (required) or `[<name>]` (optional), plus
+/// `[<command>]` (when nested commands exist) and `[options]`.
+fn build_usage_tail(schema: Option<&Schema>, has_sub_commands: bool) -> String {
     let mut parts = String::new();
-    if has_jobs {
+    if has_sub_commands {
         parts.push(' ');
-        parts.push_str(&style::dim("[job]"));
+        parts.push_str(&style::dim("[<command>]"));
     }
     if let Some(s) = schema {
         for a in &s.args {

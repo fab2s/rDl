@@ -316,19 +316,11 @@ fn is_builtin_name(name: &str) -> bool {
 
 fn is_project_command(base_config: &std::path::Path, name: &str) -> bool {
     // Must NOT merge env overlays here — that would be circular when the
-    // env name also matches a script key. Inspect the raw base only.
+    // env name also matches a command key. Inspect the raw base only.
     let Ok(project) = config::load_project_with_env(base_config, None) else {
         return false;
     };
-    if project.scripts.contains_key(name) {
-        return true;
-    }
-    for cmd_path in &project.commands {
-        if config::command_name(cmd_path) == name {
-            return true;
-        }
-    }
-    false
+    project.commands.contains_key(name)
 }
 
 /// Thin wrapper over `parse_or_schema_from` that sets the program name
@@ -685,22 +677,66 @@ fn cmd_install(check_only: bool, dev: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // --dev: symlink to current binary (always tracks latest build)
+    // --dev: symlink to the stable local-build location (~/.cargo/bin/fdl),
+    // which is where `cargo install --path flodl-cli` (== `fdl self-build`)
+    // drops the freshly-compiled binary. Every subsequent rebuild updates
+    // that same path, so the symlink is kept pointing at today's build for
+    // free. Falling back to `env::current_exe()` would footgun when the
+    // user happens to be running the binary *from* `~/.local/bin/fdl`
+    // itself — `canonicalize()` returns that same path and we'd create a
+    // symlink to itself (Too many levels of symbolic links).
     if dev {
         #[cfg(unix)]
         {
+            let cargo_bin = home.join(".cargo/bin/fdl");
             let self_canonical = self_path.canonicalize().unwrap_or(self_path.clone());
 
-            // Remove existing (file or symlink)
+            // Prefer the cargo-install target; fall back to the running
+            // binary only when cargo-install isn't present.
+            let target = if cargo_bin.is_file() {
+                cargo_bin.canonicalize().unwrap_or(cargo_bin)
+            } else {
+                self_canonical.clone()
+            };
+
+            // Self-loop guard: refuse to symlink dest to itself. The
+            // comparison is against the literal `dest` path (not its
+            // canonicalization) because a symlink stores the target
+            // string verbatim — if dest is already a symlink to target,
+            // `dest.canonicalize()` would resolve through it and match
+            // target, but that's a legitimate "refresh the symlink" case.
+            // A true self-loop happens when `target == dest` as strings.
+            if target == dest {
+                eprintln!(
+                    "error: --dev cannot symlink `{}` to itself.",
+                    dest.display()
+                );
+                eprintln!();
+                eprintln!(
+                    "The currently-running `fdl` is installed at the dest path \
+                     and no stable cargo build exists at `{}`.",
+                    home.join(".cargo/bin/fdl").display()
+                );
+                eprintln!();
+                eprintln!("Build one first:");
+                eprintln!("    cargo install --path flodl-cli");
+                eprintln!("    # or (from inside a flodl checkout):");
+                eprintln!("    fdl self-build");
+                eprintln!();
+                eprintln!("Then rerun `fdl install --dev`.");
+                return ExitCode::FAILURE;
+            }
+
+            // Remove existing (file or symlink) before linking.
             if dest.exists() || dest.is_symlink() {
                 let _ = std::fs::remove_file(&dest);
             }
 
-            match std::os::unix::fs::symlink(&self_canonical, &dest) {
+            match std::os::unix::fs::symlink(&target, &dest) {
                 Ok(()) => {
-                    println!("Linked fdl -> {}", self_canonical.display());
+                    println!("Linked fdl -> {}", target.display());
                     println!("Global fdl now tracks your local build.");
-                    println!("Rebuild with: cargo build --release -p flodl-cli");
+                    println!("Rebuild with: cargo install --path flodl-cli (or `fdl self-build`).");
                 }
                 Err(e) => {
                     eprintln!("error: symlink failed: {e}");
@@ -933,10 +969,14 @@ fn load_project_config(
     Some((project, root))
 }
 
-/// Try to dispatch an unknown command via fdl.yaml scripts and commands.
+/// Dispatch an unknown top-level token through the unified `commands:`
+/// graph declared in fdl.yml. Handles arbitrary nesting: each step either
+/// recurses into a child fdl.yml (Path), executes a self-contained shell
+/// command (Run), or invokes the enclosing entry with merged preset
+/// fields (Preset).
 fn dispatch_config(cmd: &str, args: &[String], env: Option<&str>) -> ExitCode {
     let cwd = env::current_dir().unwrap_or_default();
-    let (project, root) = match load_project_config(&cwd, env) {
+    let (project, project_root) = match load_project_config(&cwd, env) {
         Some(pair) => pair,
         None => {
             eprintln!("unknown command: {cmd}");
@@ -946,69 +986,104 @@ fn dispatch_config(cmd: &str, args: &[String], env: Option<&str>) -> ExitCode {
         }
     };
 
-    // Check scripts.
-    if let Some(script) = project.scripts.get(cmd) {
-        return run::exec_script(script.command(), script.docker_service(), &root);
-    }
+    // Walk the command graph. Presets require an enclosing CommandConfig
+    // (they reuse its `entry:`), so we track the most recently loaded
+    // one as we descend.
+    let mut commands: std::collections::BTreeMap<String, config::CommandSpec> =
+        project.commands.clone();
+    let mut enclosing_cfg: Option<config::CommandConfig> = None;
+    let mut current_dir = project_root.clone();
+    let mut name = cmd.to_string();
+    let mut tail_idx = 2usize; // args[2..] is the tail after the first command
 
-    // Check commands.
-    for cmd_path in &project.commands {
-        let short = config::command_name(cmd_path);
-        if short != cmd {
-            continue;
-        }
-
-        let cmd_dir = root.join(cmd_path);
-        let cmd_config = match config::load_command_with_env(&cmd_dir, env) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: {e}");
+    loop {
+        let spec = match commands.get(&name) {
+            Some(s) => s.clone(),
+            None => {
+                eprintln!("unknown command: {name}");
+                eprintln!();
+                run::print_project_help(&project, &project_root, BUILTINS, env);
                 return ExitCode::FAILURE;
             }
         };
 
-        // --help for the sub-command.
-        if args.get(2).map(String::as_str) == Some("--help")
-            || args.get(2).map(String::as_str) == Some("-h")
-        {
-            run::print_command_help(&cmd_config, short);
-            return ExitCode::SUCCESS;
-        }
+        let tail = &args[tail_idx..];
 
-        // --refresh-schema: probe `<entry> --fdl-schema` and update the cache.
-        // Accepted anywhere in the sub-command's arg tail so users don't need
-        // to remember a specific position.
-        if args[2..].iter().any(|a| a == "--refresh-schema") {
-            return cmd_refresh_schema(&cmd_config, &cmd_dir, short);
-        }
-
-        // Check if first sub-arg matches a job name.
-        let first_sub = args.get(2).map(String::as_str);
-        let (job_name, extra_start) = match first_sub {
-            Some(name) if cmd_config.jobs.contains_key(name) => (Some(name), 3),
-            _ => (None, 2),
+        let kind = match spec.kind() {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("error in command `{name}`: {e}");
+                return ExitCode::FAILURE;
+            }
         };
 
-        // Recursive help: fdl ddp-bench <job> --help
-        if let Some(jn) = &job_name {
-            let has_help = args[extra_start..]
-                .iter()
-                .any(|a| a == "--help" || a == "-h");
-            if has_help {
-                run::print_job_help(&cmd_config, short, jn);
-                return ExitCode::SUCCESS;
+        match kind {
+            config::CommandKind::Run => {
+                let run_cmd = spec.run.as_deref().expect("Run kind guarantees run is set");
+                return run::exec_script(run_cmd, spec.docker.as_deref(), &current_dir);
+            }
+            config::CommandKind::Path => {
+                let child_dir = spec.resolve_path(&name, &current_dir);
+                let child_cfg = match config::load_command_with_env(&child_dir, env) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+
+                // If the next token names a nested command, descend before
+                // handling --help / --refresh-schema — those apply to the
+                // level the user is actually asking about.
+                if let Some(next) = tail.first() {
+                    if child_cfg.commands.contains_key(next) {
+                        commands = child_cfg.commands.clone();
+                        enclosing_cfg = Some(child_cfg);
+                        current_dir = child_dir;
+                        name = next.clone();
+                        tail_idx += 1;
+                        continue;
+                    }
+                }
+
+                // --help at this sub-command level.
+                if tail.iter().any(|a| a == "--help" || a == "-h") {
+                    run::print_command_help(&child_cfg, &name);
+                    return ExitCode::SUCCESS;
+                }
+
+                // --refresh-schema: probe `<entry> --fdl-schema` and update cache.
+                if tail.iter().any(|a| a == "--refresh-schema") {
+                    return cmd_refresh_schema(&child_cfg, &child_dir, &name);
+                }
+
+                // No nested command match; pass the tail through to the
+                // child's entry.
+                return run::exec_command(&child_cfg, None, tail, &child_dir, &project_root);
+            }
+            config::CommandKind::Preset => {
+                let Some(encl) = enclosing_cfg.as_ref() else {
+                    eprintln!(
+                        "error: preset command `{name}` has no enclosing \
+                         fdl.yml (top-level commands must be `run:` or `path:`)"
+                    );
+                    return ExitCode::FAILURE;
+                };
+
+                if tail.iter().any(|a| a == "--help" || a == "-h") {
+                    // Label the preset with the enclosing command path.
+                    let parent_label = current_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    run::print_preset_help(encl, parent_label, &name);
+                    return ExitCode::SUCCESS;
+                }
+
+                return run::exec_command(encl, Some(&name), tail, &current_dir, &project_root);
             }
         }
-
-        let extra = args[extra_start..].to_vec();
-        return run::exec_command(&cmd_config, job_name, &extra, &cmd_dir, &root);
     }
-
-    // Not found.
-    eprintln!("unknown command: {cmd}");
-    eprintln!();
-    run::print_project_help(&project, &root, BUILTINS, env);
-    ExitCode::FAILURE
 }
 
 /// `fdl config show [<env>]` — print the resolved merged config.

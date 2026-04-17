@@ -1,80 +1,86 @@
 # fdl.yaml spec
 
-`fdl.yaml` is the project manifest for flodl projects. It defines scripts,
-sub-commands, and training configurations. `fdl` discovers it automatically
-at the project root, like `package.json` or `composer.json`.
+`fdl.yaml` is the project manifest for flodl projects. It declares a single
+`commands:` map at every level; each entry is either a path to a child
+`fdl.yml`, an inline `run:` script, or (inside a sub-command) a preset that
+reuses the enclosing `entry:` with merged config fields. `fdl` discovers
+the root manifest automatically, like `package.json` or `composer.json`.
 
 ## Quick start
 
 ```
-fdl --help                             # show scripts, commands, built-ins
-fdl build                              # run a script
-fdl ddp-bench --model mlp              # pass args to a sub-command
-fdl ddp-bench anchor-3                 # run a named job
-fdl ddp-bench anchor-3 --model mlp     # job + extra args
-fdl ddp-bench --list                   # show available jobs
+fdl --help                             # show commands + built-ins
+fdl build                              # run a `run:` command (shell script)
+fdl ddp-bench --model mlp              # pass args through to a sub-command's entry
+fdl ddp-bench quick                    # run a named preset inside ddp-bench
+fdl ddp-bench quick --epochs 3         # preset + extra pass-through args
+fdl ddp-bench --help                   # list nested commands + options
 ```
 
 ## Format
 
-YAML primary. JSON and TOML accepted, auto-detected by file extension.
-Same Rust struct, three serde deserializers.
+YAML primary. JSON accepted too (auto-detected by file extension).
+
+## One concept: `commands:`
+
+Every `fdl.yml` — root and sub — declares a single `commands:` map. The
+kind of each entry is inferred from its fields:
+
+- **Path** (child directory): the entry has `path:` set, or is empty/null
+  and the command name maps by convention to `./<name>/fdl.yml`.
+- **Run** (inline script): the entry has `run:` set. Optional `docker:`
+  routes the script through `docker compose run --rm <service>`.
+- **Preset** (inside a sub-command only): neither `path:` nor `run:` is set;
+  preset fields (`ddp:`, `training:`, `output:`, `options:`) are merged
+  onto the enclosing config's defaults and the enclosing `entry:` is
+  invoked with the merged values.
+
+`run:` and `path:` are mutually exclusive; declaring both is a load-time
+error.
 
 ## Project manifest
 
-### Root fdl.yaml
+### Root fdl.yml
 
 ```yaml
-# fdl.yaml (project root)
 description: flodl - Rust deep learning framework
 
-scripts:
-  build: make build
-  test: make test
-  clippy: make clippy
-  shell: make shell
-  cuda-test: make cuda-test
-  cuda-test-all:
-    description: Full CUDA suite including NCCL isolated tests
-    run: make cuda-test-all
-
 commands:
-  - ddp-bench/
-  - benchmarks/
+  # Convention: `commands: { <name>: }` resolves to ./<name>/fdl.yml
+  ddp-bench:
+
+  # Explicit path override
+  bench:
+    description: flodl vs PyTorch benchmarks
+    path: benchmarks/
+
+  # Inline run scripts replace the old `scripts:` block
+  build:
+    description: Build (debug)
+    run: cargo build
+    docker: dev
+  cuda-test:
+    description: Run CUDA tests (parallel, excludes NCCL/Graph)
+    run: cargo test --features cuda -- --nocapture
+    docker: cuda
+  self-build:
+    description: Rebuild fdl CLI after changes
+    run: cargo install --path flodl-cli
 ```
 
-### Scripts
-
-Named shell commands. Short form (string) or long form (with description):
-
-```yaml
-scripts:
-  build: make build                      # short form
-  cuda-test-all:                         # long form
-    description: Full CUDA suite
-    run: make cuda-test-all
-```
-
-### Commands
-
-Sub-directories with their own `fdl.yaml`. Listed by path, descriptions
-come from each child's own `fdl.yaml` (zero duplication). `fdl --help`
-assembles the full picture automatically.
-
-```yaml
-commands:
-  - ddp-bench/
-  - benchmarks/
-```
+Top-level commands must be `Run` or `Path` — `Preset` is disallowed because
+there is no enclosing `entry:` at the project root.
 
 ## Sub-command manifest
 
-Each sub-command has its own `fdl.yaml` with an `entry` point,
-optional structured config sections, and named jobs.
+Each sub-command has its own `fdl.yml` with an `entry` point, optional
+structured config sections, and nested `commands:` (which may be presets
+of this entry, deeper child paths, or further `run:` scripts).
 
 ```yaml
-# ddp-bench/fdl.yaml
+# ddp-bench/fdl.yml
 description: DDP validation and benchmark suite
+docker: cuda
 entry: cargo run --release --features cuda --
 
 ddp:
@@ -89,17 +95,7 @@ training:
 output:
   dir: runs/
 
-jobs:
-  anchor-3:
-    description: ElChe with tight sync
-    ddp: { anchor: 3 }
-
-  anchor-5:
-    ddp: { anchor: 5 }
-
-  anchor-10:
-    ddp: { anchor: 10 }
-
+commands:
   quick:
     description: Fast smoke test
     training: { epochs: 1, batches_per_epoch: 100 }
@@ -109,65 +105,83 @@ jobs:
     description: All models, all modes
     options: { model: all, mode: all }
 
-  solo-baseline:
-    description: Solo GPU reference
-    ddp: { mode: solo-0 }
-    training: { lr: 0.001 }
+  anchor-3:
+    description: ElChe with tight sync
+    ddp: { anchor: 3 }
+
+  # A `run:` command inside a sub-command is also fine — it replaces
+  # the parent entry invocation with a self-contained shell script.
+  report:
+    description: Regenerate the convergence report
+    run: python scripts/report.py
+
+  # A path can point at further nesting if you want a grandchild tree.
+  # demo:
+  #   path: examples/demo/
 ```
 
 ### Entry
 
-The default binary that bare arguments pass through to.
-`fdl ddp-bench --model mlp` becomes:
-`cargo run --release --features cuda -- --model mlp`
+The binary that bare arguments (and preset invocations) pass through to.
+`fdl ddp-bench --model mlp` becomes
+`cargo run --release --features cuda -- --model mlp`.
 
-### Jobs
+### Presets
 
-Named argument/option presets. A job merges its config with the
-root-level defaults and passes the result to the entry point.
-
-Jobs are resolved implicitly: `fdl ddp-bench anchor-3` checks
-if `anchor-3` matches a job name. If yes, apply it. If no,
-pass through as a bare argument to entry.
+A preset merges its `ddp:` / `training:` / `output:` / `options:` fields
+over the enclosing sub-command's defaults, then invokes the enclosing
+`entry:` with the merged values appended to any CLI pass-through args.
 
 ```
-fdl ddp-bench anchor-3                 # job match -> merge config
-fdl ddp-bench anchor-3 --model mlp     # job + extra CLI args
-fdl ddp-bench --model mlp --epochs 10  # no job, pure pass-through
-fdl ddp-bench --list                   # show available jobs
+fdl ddp-bench quick                    # preset match -> merge + exec entry
+fdl ddp-bench quick --model mlp        # preset + extra CLI args (CLI wins)
+fdl ddp-bench --model mlp --epochs 10  # no preset, pure pass-through
 ```
 
 ## CLI resolution
 
 ```
 fdl <name> [args...]
-  1. built-in?        (setup, init, diagnose)       -> execute
-  2. root script?     (scripts section)              -> execute
-  3. sub-command?      (commands section)             -> load child fdl.yaml
-     3a. first arg matches a job?                    -> merge config, exec entry
-     3b. otherwise                                   -> pass args to entry
-  4. not found                                       -> error + suggestions
+  1. built-in?                                     -> execute (setup, init, …)
+  2. first-arg env overlay? (fdl.<name>.yml)       -> activate overlay, shift args
+  3. commands[<name>] in root fdl.yml?             -> resolve by kind:
+       Run  -> execute `run:` (optionally in docker)
+       Path -> load child fdl.yml, recurse with args[1..]
+  4. not found                                     -> error + help listing
+
+Inside a recursion (child fdl.yml loaded):
+  a. commands[<next-arg>] present?                 -> recurse again
+       Preset -> merge fields, exec enclosing entry with tail args
+       Run    -> execute `run:`
+       Path   -> recurse into grandchild fdl.yml
+  b. else                                          -> pass args to child entry
 ```
+
+Recursion is unbounded: `fdl a b c d ...` walks the command tree as long
+as each token matches a nested `commands:` entry, and once a non-match
+token is reached (or there are no more tokens), the current level either
+runs the matched command or passes the remaining tail through to the
+entry.
 
 ## Help conventions
 
 One way to ask for help: `--help` / `-h`. No `fdl help` subcommand —
 keeps the top-level namespace clean and frees `help` from being a
-reserved name (important once scripts and jobs multiply).
+reserved name.
 
-- `fdl`                        -> same as `fdl --help` (bare invocation is a discovery affordance)
-- `fdl --help` / `fdl -h`      -> project overview: built-ins, scripts, commands, envs
-- `fdl <cmd> --help`           -> command overview: description, jobs, options (from schema)
-- `fdl <cmd> <job> --help`     -> resolved job: merged config + remaining options
+- `fdl`                         -> same as `fdl --help`
+- `fdl --help` / `fdl -h`       -> project overview: built-ins, commands, envs
+- `fdl <cmd> --help`            -> command overview: arguments, nested commands, options
+- `fdl <cmd> <sub> --help`      -> resolved preset or recursive command help
 
 `-h` is reserved at the fdl level and cannot be shadowed by a sub-command
 or entry option (see "Collision rules" below).
 
 ## Config sections
 
-Structured sections that `fdl` understands natively. They appear at
-the root level of a sub-command's `fdl.yaml` (defaults for all jobs)
-and can be overridden per job.
+Structured sections that `fdl` understands natively. They appear at the
+root level of a sub-command's `fdl.yml` (defaults for all nested preset
+commands) and can be overridden per preset.
 
 ### ddp
 
@@ -208,17 +222,18 @@ Pure scalars that map directly to CLI args or RunConfig fields.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| dir | string | runs/ | Base output directory. Job name appended. |
+| dir | string | runs/ | Base output directory. Preset name appended. |
 | timeline | bool | false | Save timeline JSON/CSV/HTML |
 | monitor | int/null | null | Dashboard port (null = disabled) |
 
 ### options
 
-Pass-through key-value pairs rendered as `--key value` on the command line.
-Used in jobs for arguments that don't have a structured section yet.
+Pass-through key-value pairs rendered as `--key value` on the command
+line. Used in preset commands for arguments that don't have a structured
+section yet.
 
 ```yaml
-jobs:
+commands:
   full-sweep:
     options: { model: all, mode: all }
 ```
@@ -236,20 +251,22 @@ model:
 
 ## Inheritance rules
 
-1. Root-level sections in a sub-command's fdl.yaml are defaults for all jobs
-2. Job-level sections deep-merge into root defaults
-3. Job-level scalar wins over root-level scalar
-4. Job-level map extends root-level map (matching keys overwritten)
-5. CLI args override everything (appended after config-derived args)
-6. `null` means "use default", not "clear the field"
+1. Structured sections at the root of a sub-command's fdl.yml are defaults
+   for all nested preset commands.
+2. Preset-level sections deep-merge into root defaults.
+3. Preset-level scalar wins over root-level scalar.
+4. Preset-level map extends root-level map (matching keys overwritten).
+5. CLI args override everything (appended after config-derived args).
+6. `null` means "use default", not "clear the field" (within a sub-command
+   config — the env-overlay layer above *does* use `null` to delete).
 
 ## Execution model
 
 ```
-fdl ddp-bench anchor-3 --model mlp
-  -> load ddp-bench/fdl.yaml
-  -> resolve job "anchor-3"
-  -> deep-merge: root ddp + root training + job overrides
+fdl ddp-bench quick --model mlp
+  -> load ddp-bench/fdl.yml
+  -> resolve commands["quick"]  (a Preset)
+  -> deep-merge: root ddp + root training + preset overrides
   -> translate structured sections to CLI args
   -> append explicit CLI args (--model mlp)
   -> exec: cargo run --release --features cuda -- [merged args] --model mlp
@@ -257,7 +274,7 @@ fdl ddp-bench anchor-3 --model mlp
 
 ## Help assembly
 
-`fdl --help` reads the root fdl.yaml and each child's description:
+`fdl --help` reads the root fdl.yml and each path-kind child's description:
 
 ```
 fdl - flodl project toolkit
@@ -266,48 +283,59 @@ Built-in:
   setup          Auto-detect hardware, download libtorch, build Docker
   init           Scaffold a new flodl project
   diagnose       Check GPU, libtorch, Docker health
-
-Scripts:
-  build          make build
-  test           make test
-  clippy         make clippy
-  shell          make shell
-  cuda-test      make cuda-test
-  cuda-test-all  Full CUDA suite including NCCL isolated tests
+  config         Inspect resolved project configuration
 
 Commands:
+  build          Build (debug)
+  clippy         Lint (including test code, workspace + ddp-bench)
+  cuda-test      Run CUDA tests (parallel, excludes NCCL/Graph)
   ddp-bench      DDP validation and benchmark suite
-  bench          flodl vs PyTorch comparison
+  shell          Interactive shell in dev container
+  test           Run all CPU tests
 ```
 
-`fdl ddp-bench --list`:
+`fdl ddp-bench --help`:
 
 ```
-ddp-bench - DDP validation and benchmark suite
+ddp-bench DDP validation and benchmark suite
 
-Jobs:
-  anchor-3       ElChe with tight sync
-  anchor-5       -
-  anchor-10      -
-  quick          Fast smoke test
-  full-sweep     All models, all modes
-  solo-baseline  Solo GPU reference
+Usage:
+    fdl ddp-bench [<command>] [options]
 
-Entry: cargo run --release --features cuda --
-  Use --help for entry point options
+Commands:
+    full-sweep     All models, all DDP modes
+    nccl-async     NCCL async for all models
+    nccl-cadence   NCCL cadence for all models
+    quick          Fast smoke test (linear, 1 epoch)
+    solo-0         Solo baseline on fast GPU (all models)
+    solo-1         Solo baseline on slow GPU (all models)
+
+Options:
+    --model <VALUE>   Run a specific model  [default: all]
+    --mode <VALUE>    Run a specific DDP mode  [default: solo-0]
+    ...
+
+Entry:
+    cargo run --release --features cuda --  [docker: cuda]
+    Any extra [options] are forwarded to the entry point.
 ```
 
 ## Design principles
 
-- **Convention over configuration.** fdl.yaml at root = project manifest.
-  Sub-directories with fdl.yaml = sub-commands. No registration needed.
-- **Progressive complexity.** Simple script -> named job -> full structured config.
-  Each level is useful on its own.
-- **No premature abstraction.** Structured sections (ddp, training) exist because
-  fdl understands them. Everything else is pass-through options.
-- **Self-documenting.** `--help` and `--list` assemble from descriptions in the
-  YAML. New contributors see everything immediately.
-- **Replaces Makefile.** Scripts + commands + Docker awareness = complete project CLI.
+- **One concept, `commands:`.** No separate `scripts:`, `jobs:`, or root
+  command list. `run:` replaces scripts, `path:` replaces the old command
+  pointer list, and preset fields replace jobs.
+- **Convention over configuration.** `commands: { ddp-bench: }` implies
+  `./ddp-bench/fdl.yml`; explicit `path:` overrides.
+- **Recursive uniformity.** Every level works the same way. `fdl a b c`
+  walks `commands` maps left-to-right until a leaf (`run:` or a terminal
+  preset) is reached.
+- **No premature abstraction.** Structured sections (ddp, training) exist
+  because fdl understands them. Everything else is pass-through options.
+- **Self-documenting.** `--help` assembles from descriptions at every
+  level. New contributors see everything immediately.
+- **Replaces Makefile.** Unified commands + Docker awareness = complete
+  project CLI.
 
 ---
 

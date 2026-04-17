@@ -15,56 +15,20 @@ use serde::{Deserialize, Serialize};
 pub struct ProjectConfig {
     #[serde(default)]
     pub description: Option<String>,
+    /// Commands defined at this level. Each value is a [`CommandSpec`] that
+    /// encodes the kind of command (inline `run` script, `path` pointer to
+    /// a child fdl.yml, or inline preset reusing the parent entry).
     #[serde(default)]
-    pub scripts: BTreeMap<String, Script>,
-    #[serde(default)]
-    pub commands: Vec<String>,
-}
-
-/// Script: either a bare string or {description, run, docker}.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum Script {
-    Short(String),
-    Long {
-        #[serde(default)]
-        description: Option<String>,
-        run: String,
-        #[serde(default)]
-        docker: Option<String>,
-    },
-}
-
-impl Script {
-    pub fn command(&self) -> &str {
-        match self {
-            Script::Short(s) => s,
-            Script::Long { run, .. } => run,
-        }
-    }
-
-    pub fn description(&self) -> &str {
-        match self {
-            Script::Short(s) => s.as_str(),
-            Script::Long {
-                description: Some(d),
-                ..
-            } => d.as_str(),
-            Script::Long { run, .. } => run.as_str(),
-        }
-    }
-
-    pub fn docker_service(&self) -> Option<&str> {
-        match self {
-            Script::Short(_) => None,
-            Script::Long { docker, .. } => docker.as_deref(),
-        }
-    }
+    pub commands: BTreeMap<String, CommandSpec>,
 }
 
 // ── Sub-command config ──────────────────────────────────────────────────
 
 /// Sub-command fdl.yaml (e.g., ddp-bench/fdl.yaml).
+///
+/// Identical shape to [`ProjectConfig`] but with an executable `entry:`
+/// and optional structured config sections (ddp/training/output) that
+/// inline preset commands can override.
 #[derive(Debug, Default, Deserialize)]
 pub struct CommandConfig {
     #[serde(default)]
@@ -81,12 +45,149 @@ pub struct CommandConfig {
     pub training: Option<TrainingConfig>,
     #[serde(default)]
     pub output: Option<OutputConfig>,
+    /// Nested commands — inline presets of this config's entry, standalone
+    /// `run` scripts, or `path` pointers to child fdl.yml files.
     #[serde(default)]
-    pub jobs: BTreeMap<String, Job>,
+    pub commands: BTreeMap<String, CommandSpec>,
     /// Inline interim schema (before `<entry> --fdl-schema` is implemented).
     /// Drives help rendering, validation, and completions.
     #[serde(default)]
     pub schema: Option<Schema>,
+}
+
+// ── Unified command specification ───────────────────────────────────────
+
+/// A command at any nesting level. Three mutually-exclusive kinds are
+/// recognised at resolve time:
+///
+/// - **Path** (`path` set, or by default when the map is empty/null): the
+///   command is a pointer to a child `fdl.yml`. By convention the path is
+///   `./<command-name>/` when omitted.
+/// - **Run** (`run` set): the command is a self-contained shell script
+///   that is executed as-is. Optional `docker:` service routes it through
+///   `docker compose`.
+/// - **Preset**: neither `path` nor `run` is set. The command merges its
+///   `ddp` / `training` / `output` / `options` fields over the enclosing
+///   `CommandConfig` defaults and invokes that config's `entry:`.
+#[derive(Debug, Default, Clone)]
+pub struct CommandSpec {
+    pub description: Option<String>,
+    /// Inline shell command. Mutex with `path`.
+    pub run: Option<String>,
+    /// Pointer to a child directory containing its own `fdl.yml`. Absolute
+    /// or relative to the declaring config's directory. Mutex with `run`.
+    /// `None` + no other fields = "use the convention path
+    /// `./<command-name>/`".
+    pub path: Option<String>,
+    /// Docker compose service for `run`-kind commands.
+    pub docker: Option<String>,
+    /// Preset overrides. Only consulted when neither `run` nor `path` is set.
+    pub ddp: Option<DdpConfig>,
+    pub training: Option<TrainingConfig>,
+    pub output: Option<OutputConfig>,
+    pub options: BTreeMap<String, serde_json::Value>,
+}
+
+/// What kind of command is this, resolved from a [`CommandSpec`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandKind {
+    /// `run: "…"` — execute the inline shell command (optionally in Docker).
+    Run,
+    /// `path: "…"` or convention default — load `<path>/fdl.yml` and
+    /// recurse.
+    Path,
+    /// Neither `run` nor `path`. Merges preset fields onto the enclosing
+    /// `CommandConfig` defaults and invokes that config's `entry:`.
+    Preset,
+}
+
+impl CommandSpec {
+    /// Classify this command. Returns an error when both `run` and `path`
+    /// are declared — always a mistake, caught loudly rather than silently
+    /// picking one.
+    pub fn kind(&self) -> Result<CommandKind, String> {
+        match (self.run.as_deref(), self.path.as_deref()) {
+            (Some(_), Some(_)) => Err(
+                "command declares both `run:` and `path:`; \
+                 only one is allowed"
+                    .to_string(),
+            ),
+            (Some(_), None) => Ok(CommandKind::Run),
+            (None, Some(_)) => Ok(CommandKind::Path),
+            (None, None) => {
+                // No kind-selecting field. If preset fields are present,
+                // treat as Preset; otherwise, fall through to Path (the
+                // convention-default: `./<name>/fdl.yml`).
+                if self.ddp.is_some()
+                    || self.training.is_some()
+                    || self.output.is_some()
+                    || !self.options.is_empty()
+                {
+                    Ok(CommandKind::Preset)
+                } else {
+                    Ok(CommandKind::Path)
+                }
+            }
+        }
+    }
+
+    /// Resolve the effective directory for a `Path`-kind command declared
+    /// in `parent_dir`. Applies the `./<name>/` convention when `path` is
+    /// unset.
+    pub fn resolve_path(&self, name: &str, parent_dir: &Path) -> PathBuf {
+        match &self.path {
+            Some(p) => parent_dir.join(p),
+            None => parent_dir.join(name),
+        }
+    }
+}
+
+// Custom Deserialize so that `commands: { name: ~ }` (YAML null) and
+// `commands: { name: }` (empty value) both deserialize to a default
+// `CommandSpec`. Without this, serde_yaml errors on null because a
+// struct expects a map.
+impl<'de> Deserialize<'de> for CommandSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Inner {
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            run: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            docker: Option<String>,
+            #[serde(default)]
+            ddp: Option<DdpConfig>,
+            #[serde(default)]
+            training: Option<TrainingConfig>,
+            #[serde(default)]
+            output: Option<OutputConfig>,
+            #[serde(default)]
+            options: BTreeMap<String, serde_json::Value>,
+        }
+
+        let raw = serde_yaml::Value::deserialize(deserializer)?;
+        if matches!(raw, serde_yaml::Value::Null) {
+            return Ok(Self::default());
+        }
+        let inner: Inner =
+            serde_yaml::from_value(raw).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            description: inner.description,
+            run: inner.run,
+            path: inner.path,
+            docker: inner.docker,
+            ddp: inner.ddp,
+            training: inner.training,
+            output: inner.output,
+            options: inner.options,
+        })
+    }
 }
 
 // ── Schema (interim hand-written, future `<entry> --fdl-schema`) ────────
@@ -305,20 +406,6 @@ pub struct OutputConfig {
     pub monitor: Option<u16>,
 }
 
-/// A named job (preset) within a sub-command.
-#[derive(Debug, Default, Deserialize)]
-pub struct Job {
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub ddp: Option<DdpConfig>,
-    #[serde(default)]
-    pub training: Option<TrainingConfig>,
-    #[serde(default)]
-    pub output: Option<OutputConfig>,
-    #[serde(default)]
-    pub options: BTreeMap<String, serde_json::Value>,
-}
 
 // ── Config discovery ────────────────────────────────────────────────────
 
@@ -536,25 +623,17 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
     Ok(cfg)
 }
 
-/// Resolve a command path string (e.g. "ddp-bench/") to its short name.
-pub fn command_name(path: &str) -> &str {
-    let trimmed = path.trim_end_matches('/');
-    Path::new(trimmed)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(trimmed)
-}
-
-
 // ── Merge ───────────────────────────────────────────────────────────────
 
-/// Merge root defaults with per-job overrides. Job values win.
-pub fn merge_job(root: &CommandConfig, job: &Job) -> ResolvedConfig {
+/// Merge the enclosing `CommandConfig` defaults with a named preset's
+/// overrides. Preset values win. Used when dispatching an inline preset
+/// command (neither `run` nor `path`).
+pub fn merge_preset(root: &CommandConfig, preset: &CommandSpec) -> ResolvedConfig {
     ResolvedConfig {
-        ddp: merge_ddp(&root.ddp, &job.ddp),
-        training: merge_training(&root.training, &job.training),
-        output: merge_output(&root.output, &job.output),
-        options: job.options.clone(),
+        ddp: merge_ddp(&root.ddp, &preset.ddp),
+        training: merge_training(&root.training, &preset.training),
+        output: merge_output(&root.output, &preset.output),
+        options: preset.options.clone(),
     }
 }
 
@@ -752,29 +831,77 @@ mod tests {
         assert!(err.contains("contradiction"), "err was: {err}");
     }
 
-    /// Regression guard: fdl.yml.example must keep a working `doc` script.
+    /// Regression guard: fdl.yml.example must keep a working `doc` command.
     /// The fdl.doc pipeline (api-ref for the port skill, rustdoc warning
     /// enforcement in CI) depends on this entry existing and producing output.
     #[test]
     fn fdl_yml_example_has_doc_script() {
         let cfg = load_example();
-        let doc = cfg.scripts.get("doc").unwrap_or_else(|| {
-            panic!("fdl.yml.example is missing a `doc` script; the rustdoc pipeline \
-                    depends on `fdl doc` being defined")
+        let doc = cfg.commands.get("doc").unwrap_or_else(|| {
+            panic!(
+                "fdl.yml.example is missing a `doc` command; the rustdoc pipeline \
+                 depends on `fdl doc` being defined"
+            )
         });
-        let cmd = doc.command();
-        assert!(!cmd.trim().is_empty(),
-            "fdl.yml.example `doc` script has an empty `run:` command");
-        assert!(cmd.contains("cargo doc"),
-            "fdl.yml.example `doc` script must invoke `cargo doc`, got: {cmd}");
+        let cmd = doc
+            .run
+            .as_deref()
+            .expect("fdl.yml.example `doc` command must be a `run:` entry");
+        assert!(
+            !cmd.trim().is_empty(),
+            "fdl.yml.example `doc` command has an empty `run:` command"
+        );
+        assert!(
+            cmd.contains("cargo doc"),
+            "fdl.yml.example `doc` command must invoke `cargo doc`, got: {cmd}"
+        );
         // Must assert some output was produced -- otherwise rustdoc can
         // silently succeed without writing anything useful (e.g. when the
         // target crate fails to resolve). Keeping the exact check liberal:
         // any mention of target/doc as a produced artifact counts.
         assert!(
             cmd.contains("target/doc"),
-            "fdl.yml.example `doc` script must verify output was produced \
+            "fdl.yml.example `doc` command must verify output was produced \
              (expected a `test -f target/doc/...` check), got: {cmd}"
         );
+    }
+
+    #[test]
+    fn command_spec_kind_mutex_run_and_path() {
+        let spec = CommandSpec {
+            run: Some("echo".into()),
+            path: Some("x/".into()),
+            ..Default::default()
+        };
+        let err = spec.kind().expect_err("run + path must fail");
+        assert!(err.contains("both"), "err was: {err}");
+    }
+
+    #[test]
+    fn command_spec_kind_path_convention() {
+        let spec = CommandSpec::default();
+        assert_eq!(spec.kind().unwrap(), CommandKind::Path);
+    }
+
+    #[test]
+    fn command_spec_kind_preset_when_preset_fields_set() {
+        let spec = CommandSpec {
+            training: Some(TrainingConfig {
+                epochs: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(spec.kind().unwrap(), CommandKind::Preset);
+    }
+
+    #[test]
+    fn command_spec_deserialize_from_null() {
+        let yaml = "cmd: ~";
+        let map: BTreeMap<String, CommandSpec> =
+            serde_yaml::from_str(yaml).expect("null must deserialize to default");
+        let spec = map.get("cmd").expect("cmd missing");
+        assert!(spec.run.is_none() && spec.path.is_none());
+        assert_eq!(spec.kind().unwrap(), CommandKind::Path);
     }
 }

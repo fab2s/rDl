@@ -80,7 +80,7 @@ training:
 output:
   dir: runs/
 
-jobs:
+commands:
   quick:
     description: Fast smoke test (linear, 1 epoch)
     training: { epochs: 1 }
