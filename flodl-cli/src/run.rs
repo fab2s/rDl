@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{ExitCode, Stdio};
 
+use crate::builtins;
 use crate::cli_error;
 use crate::config::{self, ArgSpec, CommandConfig, OptionSpec, ResolvedConfig, Schema};
 use crate::libtorch;
@@ -669,9 +670,9 @@ fn print_config_value(label: &str, val: &Option<serde_json::Value>) {
 pub fn print_project_help(
     project: &config::ProjectConfig,
     project_root: &Path,
-    builtins: &[(&str, &str)],
     active_env: Option<&str>,
 ) {
+    let visible_builtins = builtins::visible_top_level();
     if let Some(desc) = &project.description {
         eprintln!("{} {}", style::bold("fdl"), desc);
     } else {
@@ -728,7 +729,7 @@ pub fn print_project_help(
     // Built-in commands.
     eprintln!();
     eprintln!("{}:", style::yellow("Built-in"));
-    for (name, desc) in builtins {
+    for (name, desc) in &visible_builtins {
         eprintln!("    {}  {desc}", style::green(&format!("{:<18}", name)));
     }
 

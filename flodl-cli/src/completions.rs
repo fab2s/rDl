@@ -12,61 +12,10 @@
 
 use std::path::Path;
 
+use crate::builtins;
 use crate::cli_error;
 use crate::config::{self, CommandConfig, CommandKind, OptionSpec, ProjectConfig};
 use crate::style;
-
-/// Built-in commands that are always available.
-/// `help` is intentionally omitted: use `--help`/`-h` instead.
-const BUILTINS: &[&str] = &[
-    "setup",
-    "libtorch",
-    "diagnose",
-    "init",
-    "install",
-    "skill",
-    "api-ref",
-    "config",
-    "schema",
-    "completions",
-    "autocomplete",
-    "version",
-];
-
-/// Hard-coded libtorch sub-commands (not schema-driven yet).
-const LIBTORCH_SUBS: &[&str] = &[
-    "download", "build", "list", "activate", "remove", "info",
-];
-
-/// Hard-coded schema sub-commands.
-const SCHEMA_SUBS: &[&str] = &["list", "clear", "refresh"];
-
-/// Hard-coded skill sub-commands.
-const SKILL_SUBS: &[&str] = &["install", "list"];
-
-/// Hard-coded config sub-commands.
-const CONFIG_SUBS: &[&str] = &["show"];
-
-/// Flag lists for built-in commands, hand-mirrored from the `FdlArgs`
-/// structs in `main.rs`. Each entry maps a command path to its flag
-/// set. The completion generator emits one rule per path, offering
-/// these flags (plus `--help` / `-h`) once the user has typed the
-/// full path.
-///
-/// Today this covers only single-level built-ins; nested built-in
-/// sub-commands (`libtorch download`, `schema list`, ...) still fall
-/// back to just their sub-command names. Extend the table + emitters
-/// when the pattern needs to reach deeper.
-///
-/// TODO: once the `main.rs` builtin structs move to `lib.rs`, drive
-/// this from `<Struct>::schema()` directly to avoid drift.
-const BUILTIN_FLAGS: &[(&str, &[&str])] = &[
-    ("setup", &["-y", "--non-interactive", "--force"]),
-    ("diagnose", &["--json"]),
-    ("init", &["--docker"]),
-    ("install", &["--check", "--dev"]),
-    ("api-ref", &["--json", "--path"]),
-];
 
 /// Reserved top-level flags, always offered at every position.
 const TOP_FLAGS: &[&str] = &[
@@ -87,6 +36,27 @@ struct CompletionData {
     top_level: Vec<String>,
     /// Per-command info for sub-commands declared in the root fdl.yaml.
     commands: Vec<CommandData>,
+    /// Built-in commands and their nested sub-commands, derived from the
+    /// [`builtins::registry`]. Carries both single-level entries
+    /// (e.g. `install`) and nested leaves (e.g. `libtorch download`) so
+    /// every level gets value-aware completion from the same pipeline.
+    builtins: Vec<BuiltinCommandData>,
+}
+
+/// Completion data for one built-in path. `path.len() == 1` covers
+/// top-level built-ins; `path.len() == 2` covers nested leaves.
+/// Parents are represented as single-level entries whose `sub_commands`
+/// lists the children — the emitter uses that to offer the sub-command
+/// list at the next position.
+struct BuiltinCommandData {
+    path: Vec<String>,
+    /// Direct children one level below `path`. Empty for leaves and for
+    /// entries that have options but no sub-commands.
+    sub_commands: Vec<String>,
+    /// Flags declared by the `FdlArgs` struct, when the registry entry
+    /// carries a `schema_fn`. Empty for parents and for entries parsed
+    /// by hand (`config show`, `completions`, `autocomplete`, `version`).
+    options: Vec<OptionCompletion>,
 }
 
 struct CommandData {
@@ -135,8 +105,15 @@ enum ValueKind {
 
 impl CompletionData {
     fn from_project(project: Option<(&ProjectConfig, &Path)>) -> Self {
-        let mut top_level: Vec<String> =
-            BUILTINS.iter().map(|s| s.to_string()).collect();
+        let builtin_entries = Self::collect_builtins();
+
+        // Top-level word list: every single-level built-in (visible +
+        // hidden) in registry order, then project commands.
+        let mut top_level: Vec<String> = builtin_entries
+            .iter()
+            .filter(|b| b.path.len() == 1)
+            .map(|b| b.path[0].clone())
+            .collect();
         let mut commands = Vec::new();
 
         if let Some((proj, root)) = project {
@@ -167,9 +144,80 @@ impl CompletionData {
         Self {
             top_level,
             commands,
+            builtins: builtin_entries,
         }
     }
+
+    /// Translate the static registry into completion-ready entries.
+    /// Groups children under their top-level parent so single-level
+    /// entries carry the sub-command list in registry order; nested
+    /// entries with a `schema_fn` get their own entry for value-aware
+    /// flag rules.
+    fn collect_builtins() -> Vec<BuiltinCommandData> {
+        let reg = builtins::registry();
+        let mut out: Vec<BuiltinCommandData> = Vec::new();
+
+        // Single-level entries carry the sub-command list for their
+        // children, derived from registry order.
+        for spec in reg.iter().filter(|s| s.path.len() == 1) {
+            let name = spec.path[0];
+            let sub_commands: Vec<String> = reg
+                .iter()
+                .filter(|s| s.path.len() == 2 && s.path[0] == name)
+                .map(|s| s.path[1].to_string())
+                .collect();
+            let options = spec
+                .schema_fn
+                .map(|f| options_from_schema(&f()))
+                .unwrap_or_default();
+            out.push(BuiltinCommandData {
+                path: vec![name.to_string()],
+                sub_commands,
+                options,
+            });
+        }
+
+        // Nested entries that carry a schema get their own value-aware
+        // block. Parents without a `schema_fn` at level 2 (e.g.
+        // `libtorch info`) have no flags to offer beyond the sub-command
+        // name already listed on the parent — skip them here.
+        for spec in reg.iter().filter(|s| s.path.len() == 2) {
+            let Some(schema_fn) = spec.schema_fn else {
+                continue;
+            };
+            let options = options_from_schema(&schema_fn());
+            out.push(BuiltinCommandData {
+                path: spec.path.iter().map(|s| s.to_string()).collect(),
+                sub_commands: Vec::new(),
+                options,
+            });
+        }
+
+        out
+    }
 }
+
+fn options_from_schema(schema: &config::Schema) -> Vec<OptionCompletion> {
+    schema
+        .options
+        .iter()
+        .map(|(long, spec)| OptionCompletion::from_spec(long, spec))
+        .collect()
+}
+
+impl BuiltinCommandData {
+    fn joined_path(&self) -> String {
+        self.path.join(" ")
+    }
+
+    fn option_flags_with_help(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.options.iter().flat_map(|o| o.flag_tokens()).collect();
+        v.push("--help".into());
+        v.push("-h".into());
+        v
+    }
+}
+
 
 impl CommandData {
     fn from_config(name: String, cfg: &CommandConfig) -> Self {
@@ -496,43 +544,121 @@ fn emit_bash(data: &CompletionData) -> String {
         s.push_str("    fi\n");
     }
 
-    // Built-in second-level sub-commands. Same shape: when the user
-    // has typed `fdl <builtin>` and is on the next word, offer the
-    // sub-command list. Hard-coded today; would be nice to drive from
-    // a single registry once the built-ins migrate to derive-based
-    // schemas like the project commands do.
-    for (parent, subs) in [
-        ("libtorch", LIBTORCH_SUBS),
-        ("schema", SCHEMA_SUBS),
-        ("skill", SKILL_SUBS),
-        ("config", CONFIG_SUBS),
-    ] {
+    // Nested built-ins first. Each block keys on `$cmd == <parent>` and
+    // `COMP_WORDS[2] == <child>`, so value-aware rules (e.g. `--cuda`
+    // → `12.6 12.8`) fire before the single-level catch-all below.
+    for b in data.builtins.iter().filter(|b| b.path.len() == 2) {
+        let parent = &b.path[0];
+        let child = &b.path[1];
         s.push_str(&format!(
-            "\n    if [[ \"$cmd\" == \"{parent}\" && $COMP_CWORD -eq 2 ]]; then\n"
+            "\n    if [[ \"$cmd\" == \"{parent}\" && \"${{COMP_WORDS[2]}}\" == \"{child}\" && $COMP_CWORD -ge 3 ]]; then\n"
         ));
+        s.push_str("        case \"$prev\" in\n");
+        for opt in &b.options {
+            if !opt.takes_value {
+                continue;
+            }
+            let flags = opt.flag_tokens().join("|");
+            let line = match &opt.value {
+                ValueKind::Choices(cs) => format!(
+                    "            {flags}) COMPREPLY=($(compgen -W \"{}\" -- \"$cur\")); return ;;\n",
+                    cs.join(" ")
+                ),
+                ValueKind::Path => format!(
+                    "            {flags}) COMPREPLY=($(compgen -f -- \"$cur\")); return ;;\n",
+                ),
+                ValueKind::Completer(c) => format!(
+                    "            {flags}) COMPREPLY=($(compgen -W \"$({c})\" -- \"$cur\")); return ;;\n",
+                ),
+                ValueKind::Any => format!(
+                    "            {flags}) return ;;\n",
+                ),
+                ValueKind::None => continue,
+            };
+            s.push_str(&line);
+        }
+        s.push_str("        esac\n");
+        let flags_str = b.option_flags_with_help().join(" ");
         s.push_str(&format!(
-            "        COMPREPLY=($(compgen -W \"{}\" -- \"$cur\"))\n",
-            subs.join(" ")
+            "        COMPREPLY=($(compgen -W \"{flags_str}\" -- \"$cur\"))\n"
         ));
         s.push_str("        return\n");
         s.push_str("    fi\n");
     }
 
-    // Single-level builtin flag completion. Once the user is past
-    // position 1 for a flag-carrying builtin (install, setup, ...)
-    // offer that builtin's flags plus --help / -h.
-    for (name, flags) in BUILTIN_FLAGS {
-        let mut flag_list: Vec<&str> = flags.to_vec();
-        flag_list.extend_from_slice(&["--help", "-h"]);
-        let joined = flag_list.join(" ");
+    // Single-level built-ins. Parent entries (with sub_commands) offer
+    // the sub-command list at position 2. Flag-carrying leaves offer
+    // their options + `--help/-h` once past position 1.
+    for b in data.builtins.iter().filter(|b| b.path.len() == 1) {
+        let name = &b.path[0];
+        let has_subs = !b.sub_commands.is_empty();
+        let has_opts = !b.options.is_empty();
+        if !has_subs && !has_opts {
+            continue; // e.g. `version`, `completions`, `autocomplete`
+        }
+
+        // Value completion for option flags (applies at any position
+        // beyond the command name).
+        if b.options.iter().any(|o| o.takes_value) {
+            s.push_str(&format!(
+                "\n    if [[ \"$cmd\" == \"{name}\" && $COMP_CWORD -ge 2 ]]; then\n"
+            ));
+            s.push_str("        case \"$prev\" in\n");
+            for opt in &b.options {
+                if !opt.takes_value {
+                    continue;
+                }
+                let flags = opt.flag_tokens().join("|");
+                let line = match &opt.value {
+                    ValueKind::Choices(cs) => format!(
+                        "            {flags}) COMPREPLY=($(compgen -W \"{}\" -- \"$cur\")); return ;;\n",
+                        cs.join(" ")
+                    ),
+                    ValueKind::Path => format!(
+                        "            {flags}) COMPREPLY=($(compgen -f -- \"$cur\")); return ;;\n",
+                    ),
+                    ValueKind::Completer(c) => format!(
+                        "            {flags}) COMPREPLY=($(compgen -W \"$({c})\" -- \"$cur\")); return ;;\n",
+                    ),
+                    ValueKind::Any => format!(
+                        "            {flags}) return ;;\n",
+                    ),
+                    ValueKind::None => continue,
+                };
+                s.push_str(&line);
+            }
+            s.push_str("        esac\n    fi\n");
+        }
+
         s.push_str(&format!(
-            "\n    if [[ \"$cmd\" == \"{name}\" && $COMP_CWORD -ge 2 ]]; then\n"
+            "\n    if [[ \"$cmd\" == \"{name}\" && $COMP_CWORD -eq 2 ]]; then\n"
         ));
+        let mut position2_words: Vec<String> = b.sub_commands.clone();
+        if has_opts {
+            position2_words.extend(b.option_flags_with_help());
+        } else if has_subs {
+            // Parent-only — still offer --help/-h for `fdl <parent> --help`.
+            position2_words.push("--help".into());
+            position2_words.push("-h".into());
+        }
         s.push_str(&format!(
-            "        COMPREPLY=($(compgen -W \"{joined}\" -- \"$cur\"))\n"
+            "        COMPREPLY=($(compgen -W \"{}\" -- \"$cur\"))\n",
+            position2_words.join(" ")
         ));
         s.push_str("        return\n");
         s.push_str("    fi\n");
+
+        if has_opts {
+            s.push_str(&format!(
+                "\n    if [[ \"$cmd\" == \"{name}\" && $COMP_CWORD -ge 3 ]]; then\n"
+            ));
+            s.push_str(&format!(
+                "        COMPREPLY=($(compgen -W \"{}\" -- \"$cur\"))\n",
+                b.option_flags_with_help().join(" ")
+            ));
+            s.push_str("        return\n");
+            s.push_str("    fi\n");
+        }
     }
 
     s.push_str("}\n");
@@ -655,38 +781,122 @@ fn emit_zsh(data: &CompletionData) -> String {
         s.push_str("            ;;\n");
     }
 
-    // Built-in second-level sub-commands.
-    for (parent, subs) in [
-        ("libtorch", LIBTORCH_SUBS),
-        ("schema", SCHEMA_SUBS),
-        ("skill", SKILL_SUBS),
-        ("config", CONFIG_SUBS),
-    ] {
-        s.push_str(&format!("        {parent})\n"));
-        s.push_str("            if (( CURRENT == 3 )); then\n");
-        s.push_str("                local -a subcmds\n");
-        s.push_str(&format!(
-            "                subcmds=({})\n",
-            subs.join(" ")
-        ));
-        s.push_str("                _describe 'subcommand' subcmds\n");
-        s.push_str("            fi\n");
-        s.push_str("            ;;\n");
-    }
+    // Built-in top-level entries: one match arm per top-level path.
+    // Parents with sub-commands offer the sub-command list at CURRENT ==
+    // 3, then dispatch per-child value/flag rules via a nested `case`.
+    for b in data.builtins.iter().filter(|b| b.path.len() == 1) {
+        let name = &b.path[0];
+        let has_subs = !b.sub_commands.is_empty();
+        let has_opts = !b.options.is_empty();
+        if !has_subs && !has_opts {
+            continue;
+        }
 
-    // Single-level builtin flags.
-    for (name, flags) in BUILTIN_FLAGS {
-        let mut flag_list: Vec<&str> = flags.to_vec();
-        flag_list.extend_from_slice(&["--help", "-h"]);
         s.push_str(&format!("        {name})\n"));
-        s.push_str(&format!(
-            "            _values 'option' {}\n",
-            flag_list
+
+        // Flag value completion (single-level options).
+        if b.options.iter().any(|o| o.takes_value) {
+            s.push_str("            case $words[CURRENT-1] in\n");
+            for opt in &b.options {
+                if !opt.takes_value {
+                    continue;
+                }
+                let flags = opt.flag_tokens().join("|");
+                let body = match &opt.value {
+                    ValueKind::Choices(cs) => format!(
+                        "                {flags}) _values 'value' {}; return ;;\n",
+                        cs.join(" ")
+                    ),
+                    ValueKind::Path => format!(
+                        "                {flags}) _files; return ;;\n",
+                    ),
+                    ValueKind::Completer(c) => format!(
+                        "                {flags}) local -a vals; vals=(${{(f)\"$({c})\"}}); _describe 'value' vals; return ;;\n",
+                    ),
+                    ValueKind::Any => format!(
+                        "                {flags}) return ;;\n",
+                    ),
+                    ValueKind::None => continue,
+                };
+                s.push_str(&body);
+            }
+            s.push_str("            esac\n");
+        }
+
+        if has_subs {
+            s.push_str("            if (( CURRENT == 3 )); then\n");
+            s.push_str("                local -a subcmds\n");
+            s.push_str(&format!(
+                "                subcmds=({})\n",
+                b.sub_commands.join(" ")
+            ));
+            s.push_str("                _describe 'subcommand' subcmds\n");
+            s.push_str("            fi\n");
+
+            // Nested flag/value rules: dispatch on $words[3].
+            let nested: Vec<&BuiltinCommandData> = data
+                .builtins
+                .iter()
+                .filter(|n| n.path.len() == 2 && n.path[0] == *name)
+                .collect();
+            if !nested.is_empty() {
+                s.push_str("            case $words[3] in\n");
+                for nb in nested {
+                    let child = &nb.path[1];
+                    s.push_str(&format!("                {child})\n"));
+                    if nb.options.iter().any(|o| o.takes_value) {
+                        s.push_str("                    case $words[CURRENT-1] in\n");
+                        for opt in &nb.options {
+                            if !opt.takes_value {
+                                continue;
+                            }
+                            let flags = opt.flag_tokens().join("|");
+                            let body = match &opt.value {
+                                ValueKind::Choices(cs) => format!(
+                                    "                        {flags}) _values 'value' {}; return ;;\n",
+                                    cs.join(" ")
+                                ),
+                                ValueKind::Path => format!(
+                                    "                        {flags}) _files; return ;;\n",
+                                ),
+                                ValueKind::Completer(c) => format!(
+                                    "                        {flags}) local -a vals; vals=(${{(f)\"$({c})\"}}); _describe 'value' vals; return ;;\n",
+                                ),
+                                ValueKind::Any => format!(
+                                    "                        {flags}) return ;;\n",
+                                ),
+                                ValueKind::None => continue,
+                            };
+                            s.push_str(&body);
+                        }
+                        s.push_str("                    esac\n");
+                    }
+                    let flags_quoted: Vec<String> = nb
+                        .option_flags_with_help()
+                        .iter()
+                        .map(|f| format!("'{f}'"))
+                        .collect();
+                    s.push_str(&format!(
+                        "                    _values 'option' {}\n",
+                        flags_quoted.join(" ")
+                    ));
+                    s.push_str("                    ;;\n");
+                }
+                s.push_str("            esac\n");
+            }
+        }
+
+        if has_opts {
+            let flags_quoted: Vec<String> = b
+                .option_flags_with_help()
                 .iter()
                 .map(|f| format!("'{f}'"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
+                .collect();
+            s.push_str(&format!(
+                "            _values 'option' {}\n",
+                flags_quoted.join(" ")
+            ));
+        }
         s.push_str("            ;;\n");
     }
     s.push_str("    esac\n");
@@ -783,38 +993,82 @@ fn emit_fish(data: &CompletionData) -> String {
         s.push('\n');
     }
 
-    // Built-in second-level sub-commands.
-    for (parent, subs) in [
-        ("libtorch", LIBTORCH_SUBS),
-        ("schema", SCHEMA_SUBS),
-        ("skill", SKILL_SUBS),
-        ("config", CONFIG_SUBS),
-    ] {
-        s.push_str(&format!("# {parent}\n"));
-        for sub in subs {
-            s.push_str(&format!(
-                "complete -c fdl -n '__fish_seen_subcommand_from {parent}' -a '{sub}'\n"
-            ));
+    // Built-in sub-command listings (parent entries) and their nested
+    // flag rules. Fish's `__fish_seen_subcommand_from` matches any of
+    // the listed words anywhere on the line, which is loose but
+    // adequate here: the combined predicate "parent seen AND child
+    // seen" pins down each nested path.
+    for b in data.builtins.iter().filter(|b| b.path.len() == 1) {
+        let name = &b.path[0];
+        let has_subs = !b.sub_commands.is_empty();
+        let has_opts = !b.options.is_empty();
+        if !has_subs && !has_opts {
+            continue;
         }
-    }
+        s.push_str(&format!("# {}\n", b.joined_path()));
 
-    // Single-level builtin flags.
-    for (name, flags) in BUILTIN_FLAGS {
-        s.push_str(&format!("# {name}\n"));
-        for f in *flags {
-            if let Some(long) = f.strip_prefix("--") {
+        if has_subs {
+            for sub in &b.sub_commands {
                 s.push_str(&format!(
-                    "complete -c fdl -n '__fish_seen_subcommand_from {name}' -l {long}\n"
+                    "complete -c fdl -n '__fish_seen_subcommand_from {name}' -a '{sub}'\n"
                 ));
-            } else if let Some(short) = f.strip_prefix('-') {
-                s.push_str(&format!(
-                    "complete -c fdl -n '__fish_seen_subcommand_from {name}' -s {short}\n"
-                ));
+            }
+        }
+
+        if has_opts {
+            for opt in &b.options {
+                emit_fish_option_line(&mut s, &format!("__fish_seen_subcommand_from {name}"), opt);
             }
         }
     }
 
+    for b in data.builtins.iter().filter(|b| b.path.len() == 2) {
+        if b.options.is_empty() {
+            continue;
+        }
+        let parent = &b.path[0];
+        let child = &b.path[1];
+        s.push_str(&format!("# {} {}\n", parent, child));
+        let cond = format!(
+            "__fish_seen_subcommand_from {parent}; and __fish_seen_subcommand_from {child}"
+        );
+        for opt in &b.options {
+            emit_fish_option_line(&mut s, &cond, opt);
+        }
+    }
+
     s
+}
+
+fn emit_fish_option_line(s: &mut String, cond: &str, opt: &OptionCompletion) {
+    let long = &opt.long;
+    let mut line = format!("complete -c fdl -n '{cond}' -l '{long}'");
+    if let Some(short_flag) = &opt.short {
+        line.push_str(&format!(" -s '{short_flag}'"));
+    }
+    match &opt.value {
+        ValueKind::None => {}
+        ValueKind::Choices(cs) => {
+            line.push_str(" -r -f -a '");
+            line.push_str(&cs.join(" "));
+            line.push('\'');
+        }
+        ValueKind::Path => {
+            line.push_str(" -r -F");
+        }
+        ValueKind::Completer(c) => {
+            line.push_str(&format!(" -r -f -a '({c})'"));
+        }
+        ValueKind::Any => {
+            line.push_str(" -r");
+        }
+    }
+    if let Some(desc) = &opt.description {
+        let safe = desc.replace('\'', "\\'");
+        line.push_str(&format!(" -d '{safe}'"));
+    }
+    line.push('\n');
+    s.push_str(&line);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -884,6 +1138,7 @@ mod tests {
         CompletionData {
             top_level: vec!["ddp-bench".into(), "libtorch".into()],
             commands: vec![make_cmd_with_schema()],
+            builtins: CompletionData::collect_builtins(),
         }
     }
 
@@ -993,6 +1248,7 @@ mod tests {
         let data = CompletionData {
             top_level: vec!["parent".into()],
             commands: vec![make_cmd_with_mixed_kinds()],
+            builtins: CompletionData::collect_builtins(),
         };
         let out = emit_zsh(&data);
         assert!(
@@ -1010,6 +1266,7 @@ mod tests {
         let data = CompletionData {
             top_level: vec!["parent".into()],
             commands: vec![make_cmd_with_mixed_kinds()],
+            builtins: CompletionData::collect_builtins(),
         };
         let out = emit_fish(&data);
         assert!(
@@ -1025,6 +1282,7 @@ mod tests {
         let data = CompletionData {
             top_level: vec!["parent".into()],
             commands: vec![make_cmd_with_mixed_kinds()],
+            builtins: CompletionData::collect_builtins(),
         };
         let out = emit_bash(&data);
         assert!(
@@ -1051,5 +1309,77 @@ mod tests {
         assert!(fish.contains("-l 'help'"), "fish: help long flag missing");
         assert!(fish.contains("-l 'version'"), "fish: version long flag missing");
         assert!(fish.contains("-s 'h'"), "fish: -h short missing");
+    }
+
+    /// Nested built-ins must emit their flag set at position-3+. The
+    /// parent→child routing is the whole reason we unified the
+    /// registry — before this refactor, `fdl libtorch download
+    /// --<TAB>` offered nothing.
+    #[test]
+    fn nested_builtin_emits_flag_rule() {
+        let data = CompletionData::from_project(None);
+        let bash = emit_bash(&data);
+        assert!(
+            bash.contains(
+                r#"if [[ "$cmd" == "libtorch" && "${COMP_WORDS[2]}" == "download""#
+            ),
+            "bash must guard nested libtorch download block; got:\n{bash}"
+        );
+        assert!(
+            bash.contains("--cpu --cuda --path --no-activate --dry-run --help -h")
+                || bash.contains("--cpu")
+                    && bash.contains("--cuda")
+                    && bash.contains("--no-activate"),
+            "bash nested block must list the download flag set; got:\n{bash}"
+        );
+
+        let fish = emit_fish(&data);
+        assert!(
+            fish.contains(
+                "__fish_seen_subcommand_from libtorch; and __fish_seen_subcommand_from download"
+            ),
+            "fish must combine parent+child predicates for nested rules; got:\n{fish}"
+        );
+    }
+
+    /// A nested `--cuda` offers `12.6 12.8`, not just the flag name —
+    /// the derive's `choices = &["12.6", "12.8"]` must flow all the
+    /// way through to shell completion.
+    #[test]
+    fn nested_builtin_emits_value_rule_for_choices() {
+        let data = CompletionData::from_project(None);
+        let bash = emit_bash(&data);
+        assert!(
+            bash.contains("--cuda) COMPREPLY=($(compgen -W \"12.6 12.8\""),
+            "bash must expand --cuda choices under the nested download block; got:\n{bash}"
+        );
+
+        let zsh = emit_zsh(&data);
+        assert!(
+            zsh.contains("--cuda) _values 'value' 12.6 12.8"),
+            "zsh must expand --cuda choices under nested download arm; got:\n{zsh}"
+        );
+
+        let fish = emit_fish(&data);
+        assert!(
+            fish.contains("-l 'cuda'") && fish.contains("-a '12.6 12.8'"),
+            "fish must emit --cuda choices for nested download; got:\n{fish}"
+        );
+    }
+
+    /// Single-level built-ins with schemas still get their old
+    /// completion coverage — no regression on today's behavior.
+    #[test]
+    fn single_level_builtin_still_offers_flags() {
+        let data = CompletionData::from_project(None);
+        let bash = emit_bash(&data);
+        assert!(
+            bash.contains(r#"if [[ "$cmd" == "install""#),
+            "bash must still emit the install block; got:\n{bash}"
+        );
+        assert!(
+            bash.contains("--check") && bash.contains("--dev") && bash.contains("-h"),
+            "install flag set must survive the refactor"
+        );
     }
 }

@@ -7,175 +7,21 @@
 //! is managed under `~/.flodl/` (override with `$FLODL_HOME`).
 
 use flodl_cli::{
-    api_ref, cli_error, completions, config, context, diagnose, dispatch, init, libtorch,
-    overlay, parse_or_schema_from, run, schema, schema_cache, setup, skill, style, util, FdlArgs,
+    api_ref, builtins, cli_error, completions, config, context, diagnose, dispatch, init,
+    libtorch, overlay, parse_or_schema_from, run, schema, schema_cache, setup, skill, style, util,
 };
 
+use builtins::{
+    ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, LibtorchActivateArgs, LibtorchBuildArgs,
+    LibtorchDownloadArgs, LibtorchListArgs, LibtorchRemoveArgs, SchemaClearArgs, SchemaListArgs,
+    SchemaRefreshArgs, SetupArgs, SkillInstallArgs,
+};
 use dispatch::{walk_commands, WalkOutcome};
 
 use std::env;
 use std::process::ExitCode;
 
 use context::Context;
-
-// ---------------------------------------------------------------------------
-// FdlArgs structs (one per leaf sub-command)
-//
-// These dogfood the derive macro across flodl-cli itself. Each is parsed
-// with `parse_or_schema_from(&argv)` from a sliced argv tail; the derive
-// handles argv, `--help`, and `--fdl-schema` uniformly.
-// ---------------------------------------------------------------------------
-
-/// Interactive guided setup wizard.
-#[derive(FdlArgs, Debug)]
-struct SetupArgs {
-    /// Skip all prompts and use auto-detected defaults.
-    #[option(short = 'y')]
-    non_interactive: bool,
-    /// Re-download or rebuild even if libtorch exists.
-    #[option]
-    force: bool,
-}
-
-/// System and GPU diagnostics.
-#[derive(FdlArgs, Debug)]
-struct DiagnoseArgs {
-    /// Emit machine-readable JSON.
-    #[option]
-    json: bool,
-}
-
-/// Generate flodl API reference.
-#[derive(FdlArgs, Debug)]
-struct ApiRefArgs {
-    /// Emit machine-readable JSON.
-    #[option]
-    json: bool,
-    /// Explicit flodl source path (defaults to detected project root).
-    #[option]
-    path: Option<String>,
-}
-
-/// Scaffold a new floDl project.
-#[derive(FdlArgs, Debug)]
-struct InitArgs {
-    /// New project directory name.
-    #[arg]
-    name: Option<String>,
-    /// Generate a Docker-based scaffold (libtorch baked into the image).
-    #[option]
-    docker: bool,
-}
-
-/// Install or update fdl globally (~/.local/bin/fdl).
-#[derive(FdlArgs, Debug)]
-struct InstallArgs {
-    /// Check for updates without installing.
-    #[option]
-    check: bool,
-    /// Symlink to the current binary (tracks local builds).
-    #[option]
-    dev: bool,
-}
-
-/// List installed libtorch variants.
-#[derive(FdlArgs, Debug)]
-struct LibtorchListArgs {
-    /// Emit machine-readable JSON.
-    #[option]
-    json: bool,
-}
-
-/// Activate a libtorch variant.
-#[derive(FdlArgs, Debug)]
-struct LibtorchActivateArgs {
-    /// Variant to activate (as shown by `fdl libtorch list`).
-    #[arg]
-    variant: Option<String>,
-}
-
-/// Remove a libtorch variant.
-#[derive(FdlArgs, Debug)]
-struct LibtorchRemoveArgs {
-    /// Variant to remove (as shown by `fdl libtorch list`).
-    #[arg]
-    variant: Option<String>,
-}
-
-/// Download a pre-built libtorch variant.
-#[derive(FdlArgs, Debug)]
-struct LibtorchDownloadArgs {
-    /// Force the CPU variant.
-    #[option]
-    cpu: bool,
-    /// Pick a specific CUDA version (instead of auto-detect).
-    #[option(choices = &["12.6", "12.8"])]
-    cuda: Option<String>,
-    /// Install libtorch to this directory (default: project libtorch/).
-    #[option]
-    path: Option<String>,
-    /// Do not activate after download.
-    #[option]
-    no_activate: bool,
-    /// Show what would happen without downloading.
-    #[option]
-    dry_run: bool,
-}
-
-/// Build libtorch from source.
-#[derive(FdlArgs, Debug)]
-struct LibtorchBuildArgs {
-    /// Override CUDA architectures (semicolon-separated, e.g. "6.1;12.0").
-    #[option]
-    archs: Option<String>,
-    /// Parallel compilation jobs.
-    #[option(default = "6")]
-    jobs: usize,
-    /// Force Docker build (isolated, reproducible).
-    #[option]
-    docker: bool,
-    /// Force native build (faster, requires host toolchain).
-    #[option]
-    native: bool,
-    /// Show what would happen without building.
-    #[option]
-    dry_run: bool,
-}
-
-/// Install AI coding assistant skills.
-#[derive(FdlArgs, Debug)]
-struct SkillInstallArgs {
-    /// Target tool (defaults to auto-detect).
-    #[option]
-    tool: Option<String>,
-    /// Specific skill name (defaults to all detected skills).
-    #[option]
-    skill: Option<String>,
-}
-
-/// List cached `--fdl-schema` outputs.
-#[derive(FdlArgs, Debug)]
-struct SchemaListArgs {
-    /// Emit machine-readable JSON.
-    #[option]
-    json: bool,
-}
-
-/// Clear cached schemas. No command name clears all.
-#[derive(FdlArgs, Debug)]
-struct SchemaClearArgs {
-    /// Command name to clear (defaults to all).
-    #[arg]
-    cmd: Option<String>,
-}
-
-/// Re-probe each entry and rewrite the cache.
-#[derive(FdlArgs, Debug)]
-struct SchemaRefreshArgs {
-    /// Command name to refresh (defaults to all).
-    #[arg]
-    cmd: Option<String>,
-}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -311,7 +157,7 @@ fn main() -> ExitCode {
         "--help" | "-h" => {
             let cwd = env::current_dir().unwrap_or_default();
             if let Some((project, root)) = load_project_config(&cwd, active_env.as_deref()) {
-                run::print_project_help(&project, &root, BUILTINS, active_env.as_deref());
+                run::print_project_help(&project, &root, active_env.as_deref());
             } else {
                 print_usage();
             }
@@ -468,7 +314,7 @@ fn resolve_env_first_arg(
 }
 
 fn is_builtin_name(name: &str) -> bool {
-    BUILTINS.iter().any(|(n, _)| *n == name) || HIDDEN_BUILTINS.contains(&name)
+    builtins::is_builtin_name(name)
 }
 
 fn is_project_command(base_config: &std::path::Path, name: &str) -> bool {
@@ -1315,28 +1161,6 @@ fn download_release_binary(tag: &str, home: &std::path::Path) -> Result<std::pat
 // fdl.yaml dispatch
 // ---------------------------------------------------------------------------
 
-/// Built-in commands shown in `fdl --help`. Paired with their one-line
-/// descriptions. The `is_builtin_name` check uses this list + [`HIDDEN_BUILTINS`]
-/// as a single source of truth for "is this reserved?".
-const BUILTINS: &[(&str, &str)] = &[
-    ("setup", "Interactive guided setup"),
-    ("libtorch", "Manage libtorch installations"),
-    ("init", "Scaffold a new floDl project"),
-    ("diagnose", "System and GPU diagnostics"),
-    ("install", "Install or update fdl globally"),
-    ("skill", "Manage AI coding assistant skills"),
-    ("api-ref", "Generate flodl API reference"),
-    ("config", "Inspect resolved project configuration"),
-    ("schema", "Inspect, clear, or refresh cached --fdl-schema outputs"),
-    ("completions", "Emit shell completion script (bash|zsh|fish)"),
-    ("autocomplete", "Install completions into the detected shell"),
-];
-
-/// Reserved top-level names that don't appear in the help banner
-/// (already covered by `--version`/`-V`) but must still be treated as
-/// builtins for first-arg env-collision detection.
-const HIDDEN_BUILTINS: &[&str] = &["version"];
-
 fn load_project_config(
     cwd: &std::path::Path,
     env: Option<&str>,
@@ -1404,7 +1228,7 @@ fn dispatch_config(cmd: &str, args: &[String], env: Option<&str>) -> ExitCode {
         WalkOutcome::UnknownCommand { name } => {
             eprintln!("unknown command: {name}");
             eprintln!();
-            run::print_project_help(&project, &project_root, BUILTINS, env);
+            run::print_project_help(&project, &project_root, env);
             ExitCode::FAILURE
         }
         WalkOutcome::PresetAtTopLevel { name } => {

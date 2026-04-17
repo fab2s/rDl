@@ -32,9 +32,18 @@
 //! }
 //! ```
 
+// Self-alias: the `#[derive(FdlArgs)]` macro emits `::flodl_cli::...`
+// paths. That resolves automatically when the derive is used from a
+// downstream crate (or from `main.rs`, which sees the lib as an external
+// dep), but inside the library itself the compiler only knows the
+// crate by its `crate`-root name. The alias makes `::flodl_cli::...`
+// resolve to ourselves so `builtins.rs` can derive the same trait.
+extern crate self as flodl_cli;
+
 // Internal modules — shared by lib consumers and the fdl binary.
 pub mod api_ref;
 pub mod args;
+pub mod builtins;
 pub mod completions;
 pub mod config;
 pub mod context;
