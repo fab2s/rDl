@@ -502,6 +502,107 @@ pub fn load_value(path: &Path) -> Result<Value, String> {
     }
 }
 
+// ── `inherit-from:` chain resolution ────────────────────────────────────
+//
+// A config file can declare a top-level `inherit-from: <path>` that names
+// a parent to merge under. Chains are linear (single parent) so the
+// effective layer list becomes [deepest-ancestor, ..., direct-parent, this].
+// The `inherit-from` key is stripped from every returned value so it
+// doesn't leak into the deserialised config.
+
+/// YAML key used by [`resolve_chain`] to discover the parent layer.
+const INHERIT_KEY: &str = "inherit-from";
+
+/// Load `path` and every ancestor reachable via `inherit-from:`, returning
+/// them in merge order (deepest ancestor first, `path` itself last). The
+/// `inherit-from` key is removed from every returned [`Value`].
+///
+/// Relative ancestor paths are resolved against the directory of the file
+/// that declared the `inherit-from:`. Cycles (including self-inheritance)
+/// are detected via the recursion stack and surface as an error listing
+/// the full cycle for fast diagnosis.
+pub fn resolve_chain(path: &Path) -> Result<Vec<(PathBuf, Value)>, String> {
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let mut out: Vec<(PathBuf, Value)> = Vec::new();
+    resolve_chain_inner(path, &mut stack, &mut out)?;
+    Ok(out)
+}
+
+fn resolve_chain_inner(
+    path: &Path,
+    stack: &mut Vec<PathBuf>,
+    out: &mut Vec<(PathBuf, Value)>,
+) -> Result<(), String> {
+    let canonical = path.canonicalize().map_err(|e| {
+        format!(
+            "cannot resolve inherit-from target `{}`: {e}",
+            path.display()
+        )
+    })?;
+
+    if stack.contains(&canonical) {
+        let mut chain: Vec<String> = stack.iter().map(|p| p.display().to_string()).collect();
+        chain.push(canonical.display().to_string());
+        return Err(format!("inherit-from cycle detected: {}", chain.join(" -> ")));
+    }
+
+    stack.push(canonical.clone());
+
+    let mut value = load_value(path)?;
+    let parent = extract_inherit_from(&mut value, path)?;
+
+    if let Some(parent_rel) = parent {
+        let parent_abs = if Path::new(&parent_rel).is_absolute() {
+            PathBuf::from(&parent_rel)
+        } else {
+            canonical
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&parent_rel)
+        };
+        resolve_chain_inner(&parent_abs, stack, out)?;
+    }
+
+    stack.pop();
+    out.push((canonical, value));
+    Ok(())
+}
+
+/// Pop the top-level `inherit-from` key from a mapping and return its
+/// string value. A missing or explicitly-null key returns `Ok(None)`.
+/// A non-string value errors with the offending type named.
+fn extract_inherit_from(value: &mut Value, path: &Path) -> Result<Option<String>, String> {
+    let Value::Mapping(m) = value else {
+        return Ok(None);
+    };
+    let key = Value::String(INHERIT_KEY.to_string());
+    match m.remove(&key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Err(format!(
+            "{INHERIT_KEY} in {} must be a non-empty path",
+            path.display()
+        )),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(other) => Err(format!(
+            "{INHERIT_KEY} in {} must be a string path, got {}",
+            path.display(),
+            type_name(&other)
+        )),
+    }
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Sequence(_) => "sequence",
+        Value::Mapping(_) => "mapping",
+        Value::Tagged(_) => "tagged",
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -962,6 +1063,160 @@ mod tests {
         let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
         assert!(out.contains("items:  "), "expected header line with tag");
         assert!(out.contains("- item-number-0"));
+    }
+
+    // ── inherit-from chain resolution ────────────────────────────────────
+
+    /// Canonicalise a path so tests can compare against `resolve_chain`'s
+    /// returned paths (which are always canonical).
+    fn canon(p: &Path) -> PathBuf {
+        p.canonicalize().expect("canonicalize fixture path")
+    }
+
+    #[test]
+    fn resolve_chain_single_file_no_inherit() {
+        let tmp = tempdir();
+        let f = tmp.path().join("fdl.yml");
+        std::fs::write(&f, "description: test\nddp:\n  policy: cadence\n").unwrap();
+        let chain = resolve_chain(&f).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].0, canon(&f));
+    }
+
+    #[test]
+    fn resolve_chain_strips_inherit_from_key() {
+        let tmp = tempdir();
+        let parent = tmp.path().join("fdl.yml");
+        let child = tmp.path().join("fdl.ci.yml");
+        std::fs::write(&parent, "a: 1\n").unwrap();
+        std::fs::write(&child, "inherit-from: fdl.yml\nb: 2\n").unwrap();
+        let chain = resolve_chain(&child).unwrap();
+        assert_eq!(chain.len(), 2);
+        // First layer is the parent (deepest), second is the child.
+        assert_eq!(chain[0].0, canon(&parent));
+        assert_eq!(chain[1].0, canon(&child));
+        // inherit-from must not appear in the returned values.
+        for (_, v) in &chain {
+            if let Value::Mapping(m) = v {
+                assert!(!m.contains_key(Value::String("inherit-from".to_string())));
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_chain_three_level_ordering() {
+        // c inherits from b, b inherits from a. Merge order must be [a, b, c].
+        let tmp = tempdir();
+        let a = tmp.path().join("a.yml");
+        let b = tmp.path().join("b.yml");
+        let c = tmp.path().join("c.yml");
+        std::fs::write(&a, "x: from-a\n").unwrap();
+        std::fs::write(&b, "inherit-from: a.yml\ny: from-b\n").unwrap();
+        std::fs::write(&c, "inherit-from: b.yml\nz: from-c\n").unwrap();
+        let chain = resolve_chain(&c).unwrap();
+        let paths: Vec<PathBuf> = chain.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(paths, vec![canon(&a), canon(&b), canon(&c)]);
+    }
+
+    #[test]
+    fn resolve_chain_relative_paths_resolve_from_declaring_file() {
+        // Declaring file sits one dir down; inherit-from uses `../base.yml`.
+        let tmp = tempdir();
+        let base = tmp.path().join("base.yml");
+        let nested_dir = tmp.path().join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let child = nested_dir.join("child.yml");
+        std::fs::write(&base, "shared: true\n").unwrap();
+        std::fs::write(&child, "inherit-from: ../base.yml\nlocal: true\n").unwrap();
+        let chain = resolve_chain(&child).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].0, canon(&base));
+        assert_eq!(chain[1].0, canon(&child));
+    }
+
+    #[test]
+    fn resolve_chain_absolute_path_works() {
+        let tmp = tempdir();
+        let parent = tmp.path().join("parent.yml");
+        let child = tmp.path().join("child.yml");
+        std::fs::write(&parent, "a: 1\n").unwrap();
+        // Use absolute path in inherit-from.
+        let abs = canon(&parent);
+        std::fs::write(
+            &child,
+            format!("inherit-from: {}\nb: 2\n", abs.display()),
+        )
+        .unwrap();
+        let chain = resolve_chain(&child).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].0, canon(&parent));
+    }
+
+    #[test]
+    fn resolve_chain_self_inheritance_errors() {
+        let tmp = tempdir();
+        let f = tmp.path().join("fdl.yml");
+        std::fs::write(&f, "inherit-from: fdl.yml\nx: 1\n").unwrap();
+        let err = resolve_chain(&f).unwrap_err();
+        assert!(err.contains("cycle"), "got: {err}");
+        // Self-loop appears as the same path on both sides of the arrow.
+        assert!(err.matches("fdl.yml").count() >= 2, "got: {err}");
+    }
+
+    #[test]
+    fn resolve_chain_two_file_cycle_errors() {
+        // a inherits from b, b inherits from a — classic cycle.
+        let tmp = tempdir();
+        let a = tmp.path().join("a.yml");
+        let b = tmp.path().join("b.yml");
+        std::fs::write(&a, "inherit-from: b.yml\nx: 1\n").unwrap();
+        std::fs::write(&b, "inherit-from: a.yml\ny: 2\n").unwrap();
+        let err = resolve_chain(&a).unwrap_err();
+        assert!(err.contains("cycle"), "got: {err}");
+        assert!(err.contains("a.yml"));
+        assert!(err.contains("b.yml"));
+    }
+
+    #[test]
+    fn resolve_chain_missing_parent_errors() {
+        let tmp = tempdir();
+        let f = tmp.path().join("fdl.yml");
+        std::fs::write(&f, "inherit-from: missing.yml\nx: 1\n").unwrap();
+        let err = resolve_chain(&f).unwrap_err();
+        assert!(
+            err.contains("cannot resolve inherit-from target"),
+            "got: {err}"
+        );
+        assert!(err.contains("missing.yml"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_chain_non_string_inherit_errors() {
+        let tmp = tempdir();
+        let f = tmp.path().join("fdl.yml");
+        std::fs::write(&f, "inherit-from: 42\nx: 1\n").unwrap();
+        let err = resolve_chain(&f).unwrap_err();
+        assert!(err.contains("must be a string path"), "got: {err}");
+        assert!(err.contains("got number"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_chain_empty_string_inherit_errors() {
+        let tmp = tempdir();
+        let f = tmp.path().join("fdl.yml");
+        std::fs::write(&f, "inherit-from: \"\"\nx: 1\n").unwrap();
+        let err = resolve_chain(&f).unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_chain_null_inherit_ignored() {
+        // Explicit `inherit-from: null` == key absent. No error, no parent.
+        let tmp = tempdir();
+        let f = tmp.path().join("fdl.yml");
+        std::fs::write(&f, "inherit-from: ~\nx: 1\n").unwrap();
+        let chain = resolve_chain(&f).unwrap();
+        assert_eq!(chain.len(), 1);
     }
 
     // Tiny tempdir helper — standalone so we don't pull in the tempfile crate.

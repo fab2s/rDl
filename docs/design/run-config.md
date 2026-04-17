@@ -461,6 +461,20 @@ ddp:
   hosts: { regions: [eu-west, us-east, ap-south] }
 ```
 
+Resolution rules:
+
+- **Linear chain**: each file names one parent; the effective layer
+  order is `[deepest-ancestor, ..., direct-parent, this]`.
+- **Relative paths** resolve against the directory of the declaring
+  file (not the cwd). Absolute paths work as-is.
+- **Env overlays compose**: `fdl.ci.yml` with `inherit-from: fdl.cloud.yml`
+  produces `[fdl.yml, fdl.cloud.yml, fdl.ci.yml]`. Duplicate files
+  (reached via two routes) are deduplicated at first occurrence.
+- **Cycles error loudly**: `A → B → A` (or self-inheritance) surfaces
+  the full cycle in the error message.
+- **`fdl config show`** tags each leaf with the file that set it, so
+  a three-level chain's provenance is visible at a glance.
+
 ### Merge rules
 
 - **Maps: deep-merge.** Recurse into nested maps; overlay keys win.

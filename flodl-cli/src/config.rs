@@ -532,11 +532,31 @@ pub fn load_merged_value(
     base_path: &Path,
     env: Option<&str>,
 ) -> Result<serde_yaml::Value, String> {
-    let mut layers = Vec::with_capacity(2);
-    layers.push(crate::overlay::load_value(base_path)?);
+    let layers = resolve_config_layers(base_path, env)?;
+    Ok(crate::overlay::merge_layers(
+        layers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+    ))
+}
+
+/// Resolve every layer contributing to a config, in merge order, with
+/// `inherit-from:` chains expanded. Paired with the base file + optional
+/// env overlay, the result is `[chain(base)..., chain(env_overlay)...]`
+/// de-duplicated by canonical path (kept-first).
+///
+/// Used by `fdl config show` for per-leaf source annotation, and
+/// internally by [`load_merged_value`] / [`load_command_with_env`] so
+/// every consumer picks up `inherit-from:` uniformly.
+pub fn resolve_config_layers(
+    base_path: &Path,
+    env: Option<&str>,
+) -> Result<Vec<(PathBuf, serde_yaml::Value)>, String> {
+    let mut layers = crate::overlay::resolve_chain(base_path)?;
     if let Some(name) = env {
         match crate::overlay::find_env_file(base_path, name) {
-            Some(p) => layers.push(crate::overlay::load_value(&p)?),
+            Some(p) => {
+                let env_chain = crate::overlay::resolve_chain(&p)?;
+                layers.extend(env_chain);
+            }
             None => {
                 return Err(format!(
                     "environment `{name}` not found (expected fdl.{name}.yml next to {})",
@@ -545,19 +565,20 @@ pub fn load_merged_value(
             }
         }
     }
-    Ok(crate::overlay::merge_layers(layers))
+    // Dedup by canonical path, keeping first occurrence. An env overlay
+    // whose chain loops back to a file already in the base chain (same
+    // file via a different inheritance route) collapses cleanly.
+    let mut seen = std::collections::HashSet::new();
+    layers.retain(|(path, _)| seen.insert(path.clone()));
+    Ok(layers)
 }
 
 /// Source path list for a base config + env overlay, in merge order. Used
 /// by `fdl config show` to annotate which layer a value came from.
 pub fn config_layer_sources(base_path: &Path, env: Option<&str>) -> Vec<PathBuf> {
-    let mut out = vec![base_path.to_path_buf()];
-    if let Some(name) = env {
-        if let Some(p) = crate::overlay::find_env_file(base_path, name) {
-            out.push(p);
-        }
-    }
-    out
+    resolve_config_layers(base_path, env)
+        .map(|ls| ls.into_iter().map(|(p, _)| p).collect())
+        .unwrap_or_else(|_| vec![base_path.to_path_buf()])
 }
 
 /// Load a command config from a sub-directory.
@@ -608,14 +629,20 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
     let base_path = base_path
         .ok_or_else(|| format!("no fdl.yml found in {}", dir.display()))?;
 
-    // Layered load: base + optional sibling env overlay.
-    let mut layers = vec![crate::overlay::load_value(&base_path)?];
+    // Layered load: base chain + optional env overlay chain. Both sides
+    // run through `resolve_chain` so `inherit-from:` composes the same
+    // way for nested commands as for the project root.
+    let mut layers = crate::overlay::resolve_chain(&base_path)?;
     if let Some(name) = env {
         if let Some(p) = crate::overlay::find_env_file(&base_path, name) {
-            layers.push(crate::overlay::load_value(&p)?);
+            layers.extend(crate::overlay::resolve_chain(&p)?);
         }
     }
-    let merged = crate::overlay::merge_layers(layers);
+    let mut seen = std::collections::HashSet::new();
+    layers.retain(|(path, _)| seen.insert(path.clone()));
+    let merged = crate::overlay::merge_layers(
+        layers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+    );
     let mut cfg: CommandConfig = serde_yaml::from_value(merged)
         .map_err(|e| format!("{}: {}", base_path.display(), e))?;
 
@@ -1295,5 +1322,148 @@ mod tests {
         let cfg: CommandConfig =
             serde_yaml::from_str("entry: echo\n").expect("minimal cfg must parse");
         assert!(cfg.arg_name.is_none());
+    }
+
+    // ── resolve_config_layers: inherit-from + env composition ────────────
+    //
+    // Integration coverage for how `inherit-from:` chains compose with env
+    // overlays at the config-module boundary. The overlay module already
+    // tests `resolve_chain` in isolation; here we verify the concat+dedup
+    // behaviour that config.rs layers on top.
+
+    /// Minimal tempdir helper — matches the pattern used across the crate.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "fdl-cfg-test-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn filenames(layers: &[(PathBuf, serde_yaml::Value)]) -> Vec<String> {
+        layers
+            .iter()
+            .map(|(p, _)| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolve_config_layers_base_only() {
+        let tmp = TempDir::new();
+        let base = tmp.0.join("fdl.yml");
+        std::fs::write(&base, "a: 1\n").unwrap();
+        let layers = resolve_config_layers(&base, None).unwrap();
+        assert_eq!(filenames(&layers), vec!["fdl.yml"]);
+    }
+
+    #[test]
+    fn resolve_config_layers_base_with_env_overlay() {
+        let tmp = TempDir::new();
+        let base = tmp.0.join("fdl.yml");
+        let env = tmp.0.join("fdl.ci.yml");
+        std::fs::write(&base, "a: 1\n").unwrap();
+        std::fs::write(&env, "b: 2\n").unwrap();
+        let layers = resolve_config_layers(&base, Some("ci")).unwrap();
+        assert_eq!(filenames(&layers), vec!["fdl.yml", "fdl.ci.yml"]);
+    }
+
+    #[test]
+    fn resolve_config_layers_env_inherits_from_mixin() {
+        // fdl.ci.yml inherits from fdl.cloud.yml (standalone mix-in, not
+        // derived from base). Combined chain: [base, cloud, ci].
+        let tmp = TempDir::new();
+        let base = tmp.0.join("fdl.yml");
+        let cloud = tmp.0.join("fdl.cloud.yml");
+        let ci = tmp.0.join("fdl.ci.yml");
+        std::fs::write(&base, "a: 1\n").unwrap();
+        std::fs::write(&cloud, "b: 2\n").unwrap();
+        std::fs::write(&ci, "inherit-from: fdl.cloud.yml\nc: 3\n").unwrap();
+        let layers = resolve_config_layers(&base, Some("ci")).unwrap();
+        assert_eq!(
+            filenames(&layers),
+            vec!["fdl.yml", "fdl.cloud.yml", "fdl.ci.yml"]
+        );
+    }
+
+    #[test]
+    fn resolve_config_layers_dedups_when_env_inherits_from_base() {
+        // fdl.ci.yml inherits from fdl.yml directly. Base is already in
+        // the layer list, so env's chain collapses into it — the final
+        // list must not have fdl.yml twice.
+        let tmp = TempDir::new();
+        let base = tmp.0.join("fdl.yml");
+        let ci = tmp.0.join("fdl.ci.yml");
+        std::fs::write(&base, "a: 1\n").unwrap();
+        std::fs::write(&ci, "inherit-from: fdl.yml\nb: 2\n").unwrap();
+        let layers = resolve_config_layers(&base, Some("ci")).unwrap();
+        assert_eq!(filenames(&layers), vec!["fdl.yml", "fdl.ci.yml"]);
+    }
+
+    #[test]
+    fn resolve_config_layers_merged_value_matches_chain() {
+        // End-to-end: the merge result should reflect the chain order
+        // (base < cloud < ci), with each subsequent layer overriding.
+        let tmp = TempDir::new();
+        let base = tmp.0.join("fdl.yml");
+        let cloud = tmp.0.join("fdl.cloud.yml");
+        let ci = tmp.0.join("fdl.ci.yml");
+        std::fs::write(&base, "value: base\nkeep_base: yes\n").unwrap();
+        std::fs::write(&cloud, "value: cloud\nkeep_cloud: yes\n").unwrap();
+        std::fs::write(
+            &ci,
+            "inherit-from: fdl.cloud.yml\nvalue: ci\nkeep_ci: yes\n",
+        )
+        .unwrap();
+        let merged = load_merged_value(&base, Some("ci")).unwrap();
+        let m = merged.as_mapping().unwrap();
+        // Last writer wins on `value`.
+        assert_eq!(
+            m.get(serde_yaml::Value::String("value".into())).unwrap(),
+            &serde_yaml::Value::String("ci".into())
+        );
+        // Each layer's unique key survives.
+        assert!(m.contains_key(serde_yaml::Value::String("keep_base".into())));
+        assert!(m.contains_key(serde_yaml::Value::String("keep_cloud".into())));
+        assert!(m.contains_key(serde_yaml::Value::String("keep_ci".into())));
+    }
+
+    #[test]
+    fn resolve_config_layers_missing_env_errors() {
+        let tmp = TempDir::new();
+        let base = tmp.0.join("fdl.yml");
+        std::fs::write(&base, "a: 1\n").unwrap();
+        let err = resolve_config_layers(&base, Some("nope")).unwrap_err();
+        assert!(err.contains("nope"));
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn resolve_config_layers_base_inherit_from_chain() {
+        // Base itself uses inherit-from: shared-defaults.yml. The
+        // defaults live in a sibling file and are merged UNDER the base.
+        let tmp = TempDir::new();
+        let defaults = tmp.0.join("shared.yml");
+        let base = tmp.0.join("fdl.yml");
+        std::fs::write(&defaults, "policy: default\n").unwrap();
+        std::fs::write(&base, "inherit-from: shared.yml\npolicy: override\n").unwrap();
+        let layers = resolve_config_layers(&base, None).unwrap();
+        assert_eq!(filenames(&layers), vec!["shared.yml", "fdl.yml"]);
     }
 }

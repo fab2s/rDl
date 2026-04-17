@@ -855,8 +855,15 @@ fn build_help_expr(fields: &[FieldSpec], description: Option<&str>, struct_name:
         None => format!("{struct_name}\n\n"),
     };
 
-    let mut opt_lines: Vec<String> = Vec::new();
-    let mut arg_lines: Vec<String> = Vec::new();
+    // The help is assembled at runtime so `::flodl_cli::style::*` can check
+    // whether stderr is a terminal — piped output stays plain, interactive
+    // output gets ANSI color to match the hand-rolled helps in run.rs.
+    // Padding is computed at macro-expand time from the raw label widths;
+    // ANSI escapes are zero-width on terminal and don't affect alignment
+    // because they're injected between the label and its trailing spaces.
+
+    let mut arg_tokens: Vec<TokenStream2> = Vec::new();
+    let mut opt_tokens: Vec<TokenStream2> = Vec::new();
 
     for f in fields {
         match f.kind {
@@ -871,20 +878,25 @@ fn build_help_expr(fields: &[FieldSpec], description: Option<&str>, struct_name:
                     TypeShape::List => String::from(" <VALUE>..."),
                     _ => format!(" <{}>", value_token(f)),
                 };
-                let mut line = format!("    {short_prefix}--{long}{value_part}");
-                while line.chars().count() < 36 {
-                    line.push(' ');
-                }
+                let label = format!("{short_prefix}--{long}{value_part}");
+                let pad = " ".repeat(36usize.saturating_sub(4 + label.chars().count()));
+                let mut tail = String::new();
                 if let Some(d) = &f.description {
-                    line.push_str(d);
+                    tail.push_str(d);
                 }
                 if let Some(d) = &f.default {
-                    line.push_str(&format!("  [default: {d}]"));
+                    tail.push_str(&format!("  [default: {d}]"));
                 }
                 if let Some(choices) = &f.choices {
-                    line.push_str(&format!("  [possible: {}]", choices.join(", ")));
+                    tail.push_str(&format!("  [possible: {}]", choices.join(", ")));
                 }
-                opt_lines.push(line);
+                opt_tokens.push(quote! {
+                    out.push_str("    ");
+                    out.push_str(&::flodl_cli::style::green(#label));
+                    out.push_str(#pad);
+                    out.push_str(#tail);
+                    out.push('\n');
+                });
             }
             FieldKind::Arg => {
                 let name = kebab(&f.ident.to_string());
@@ -896,33 +908,54 @@ fn build_help_expr(fields: &[FieldSpec], description: Option<&str>, struct_name:
                 } else {
                     format!("[<{name}>]")
                 };
-                let mut line = format!("    {label}");
-                while line.chars().count() < 36 {
-                    line.push(' ');
-                }
+                let pad = " ".repeat(36usize.saturating_sub(4 + label.chars().count()));
+                let mut tail = String::new();
                 if let Some(d) = &f.description {
-                    line.push_str(d);
+                    tail.push_str(d);
                 }
                 if let Some(d) = &f.default {
-                    line.push_str(&format!("  [default: {d}]"));
+                    tail.push_str(&format!("  [default: {d}]"));
                 }
-                arg_lines.push(line);
+                arg_tokens.push(quote! {
+                    out.push_str("    ");
+                    out.push_str(&::flodl_cli::style::green(#label));
+                    out.push_str(#pad);
+                    out.push_str(#tail);
+                    out.push('\n');
+                });
             }
         }
     }
 
-    let arg_section = if arg_lines.is_empty() {
-        String::new()
+    let arg_section = if arg_tokens.is_empty() {
+        quote! {}
     } else {
-        format!("Arguments:\n{}\n\n", arg_lines.join("\n"))
+        quote! {
+            out.push_str(&::flodl_cli::style::yellow("Arguments"));
+            out.push_str(":\n");
+            #(#arg_tokens)*
+            out.push('\n');
+        }
     };
-    let opt_section = if opt_lines.is_empty() {
-        String::new()
+    let opt_section = if opt_tokens.is_empty() {
+        quote! {}
     } else {
-        format!("Options:\n{}\n\n", opt_lines.join("\n"))
+        quote! {
+            out.push_str(&::flodl_cli::style::yellow("Options"));
+            out.push_str(":\n");
+            #(#opt_tokens)*
+            out.push('\n');
+        }
     };
-    let help = format!("{header}{arg_section}{opt_section}");
-    quote! { ::std::string::String::from(#help) }
+
+    quote! {
+        {
+            let mut out = ::std::string::String::from(#header);
+            #arg_section
+            #opt_section
+            out
+        }
+    }
 }
 
 fn value_token(f: &FieldSpec) -> &'static str {

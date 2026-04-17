@@ -683,6 +683,10 @@ pub fn print_project_help(
         style::green(&format!("{:<18}", "-V, --version"))
     );
     eprintln!(
+        "    {}  Use fdl.<name>.yml overlay (also: FDL_ENV=<name>)",
+        style::green(&format!("{:<18}", "--env <name>"))
+    );
+    eprintln!(
         "    {}  Verbose output",
         style::green(&format!("{:<18}", "-v"))
     );
@@ -697,6 +701,14 @@ pub fn print_project_help(
     eprintln!(
         "    {}  Suppress non-error output",
         style::green(&format!("{:<18}", "-q, --quiet"))
+    );
+    eprintln!(
+        "    {}  Force ANSI color (bypass TTY / NO_COLOR detection)",
+        style::green(&format!("{:<18}", "--ansi"))
+    );
+    eprintln!(
+        "    {}  Disable ANSI color output",
+        style::green(&format!("{:<18}", "--no-ansi"))
     );
 
     // Built-in commands.

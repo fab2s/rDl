@@ -8,7 +8,7 @@
 
 use flodl_cli::{
     api_ref, completions, config, context, diagnose, dispatch, init, libtorch,
-    overlay, parse_or_schema_from, run, schema_cache, setup, skill, util, FdlArgs,
+    overlay, parse_or_schema_from, run, schema_cache, setup, skill, style, util, FdlArgs,
 };
 
 use dispatch::{walk_commands, WalkOutcome};
@@ -160,9 +160,44 @@ struct SkillInstallArgs {
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().collect();
 
+    // Extract global color flags before anything else — subsequent help
+    // rendering and error messages must already honour the choice.
+    let args = match extract_ansi_flags(&raw_args) {
+        Ok((args, choice)) => {
+            if let Some(c) = choice {
+                style::set_color_choice(c);
+                // Propagate to child processes (Docker, subprocess) so
+                // nested `fdl` invocations inherit the choice.
+                // SAFETY: called before any threads are spawned.
+                unsafe {
+                    env::set_var(
+                        "FLODL_COLOR",
+                        match c {
+                            style::ColorChoice::Always => "always",
+                            style::ColorChoice::Never => "never",
+                            style::ColorChoice::Auto => "auto",
+                        },
+                    );
+                }
+            } else if let Ok(v) = env::var("FLODL_COLOR") {
+                // Inherited from a parent `fdl` invocation.
+                match v.as_str() {
+                    "always" => style::set_color_choice(style::ColorChoice::Always),
+                    "never" => style::set_color_choice(style::ColorChoice::Never),
+                    _ => {}
+                }
+            }
+            args
+        }
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Extract global verbosity flags before command dispatch.
     // Sets FLODL_VERBOSITY so child processes (including Docker) inherit it.
-    let (args, verbosity) = extract_verbosity(&raw_args);
+    let (args, verbosity) = extract_verbosity(&args);
     if let Some(v) = verbosity {
         // SAFETY: called before any threads are spawned.
         unsafe {
@@ -1184,38 +1219,31 @@ fn cmd_config_show(tail: &[String], active_env: Option<&str>) -> ExitCode {
         }
     };
 
-    // Load every contributing layer so we can tag each leaf with its
-    // source file, not just "base/overlay". Layer order matches
-    // `load_merged_value`: base first, env overlay (if present) after.
-    let sources = config::config_layer_sources(&base, target_env);
-    let layers: Vec<serde_yaml::Value> = match sources
-        .iter()
-        .map(|p| overlay::load_value(p))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(vs) => vs,
+    // Resolve every contributing layer (including `inherit-from:`
+    // ancestors) so we can tag each leaf with its source file, not just
+    // "base/overlay". Layer order matches `load_merged_value`: deepest
+    // ancestor first, env overlay chain last.
+    let layers = match config::resolve_config_layers(&base, target_env) {
+        Ok(ls) => ls,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    if target_env.is_some() && sources.len() == 1 {
-        println!("# (env overlay requested but not found next to base)");
-        println!("#");
-    }
-
-    let labels: Vec<String> = sources
+    let labels: Vec<String> = layers
         .iter()
-        .map(|p| {
+        .map(|(p, _)| {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("?")
                 .to_string()
         })
         .collect();
+    let values: Vec<serde_yaml::Value> =
+        layers.iter().map(|(_, v)| v.clone()).collect();
 
-    let annotated = overlay::merge_layers_annotated(&layers);
+    let annotated = overlay::merge_layers_annotated(&values);
     print!("{}", overlay::render_annotated_yaml(&annotated, &labels));
     ExitCode::SUCCESS
 }
@@ -1296,6 +1324,8 @@ fn print_usage() {
     println!();
     println!("GLOBAL OPTIONS:");
     println!("    --env <name>       Use fdl.<name>.yml overlay (also: FDL_ENV=<name>)");
+    println!("    --ansi             Force ANSI color output");
+    println!("    --no-ansi          Disable ANSI color output");
     println!("    -v                 Verbose output (DDP sync, data loading detail)");
     println!("    -vv                Debug output (per-batch timing, loop internals)");
     println!("    -vvv               Trace output (maximum detail)");
@@ -1360,6 +1390,36 @@ fn extract_verbosity(args: &[String]) -> (Vec<String>, Option<u8>) {
     }
 
     (filtered, level)
+}
+
+/// Strip `--ansi` / `--no-ansi` from `args`, returning a
+/// [`style::ColorChoice`] override when either was present. Errors if
+/// both are given (ambiguous). Scan-anywhere, consistent with `-v`
+/// and `--env` — global flags aren't position-locked.
+fn extract_ansi_flags(
+    args: &[String],
+) -> Result<(Vec<String>, Option<style::ColorChoice>), String> {
+    let mut ansi = false;
+    let mut no_ansi = false;
+    let mut filtered = Vec::with_capacity(args.len());
+
+    for arg in args {
+        match arg.as_str() {
+            "--ansi" => ansi = true,
+            "--no-ansi" => no_ansi = true,
+            _ => filtered.push(arg.clone()),
+        }
+    }
+
+    let choice = match (ansi, no_ansi) {
+        (true, true) => return Err(
+            "--ansi and --no-ansi are mutually exclusive".to_string()
+        ),
+        (true, false) => Some(style::ColorChoice::Always),
+        (false, true) => Some(style::ColorChoice::Never),
+        (false, false) => None,
+    };
+    Ok((filtered, choice))
 }
 
 fn print_libtorch_usage() {
@@ -1592,5 +1652,43 @@ mod tests {
             resolve_env(&args(&["fdl", "deploy", "--now"]), tmp.path(), None).unwrap();
         assert!(env.is_none());
         assert_eq!(rest, args(&["fdl", "deploy", "--now"]));
+    }
+
+    // ── --ansi / --no-ansi extraction ────────────────────────────────────
+
+    #[test]
+    fn extract_ansi_flags_absent_returns_none() {
+        let (rest, choice) = extract_ansi_flags(&args(&["fdl", "setup"])).unwrap();
+        assert_eq!(rest, args(&["fdl", "setup"]));
+        assert!(choice.is_none());
+    }
+
+    #[test]
+    fn extract_ansi_flags_ansi_forces_always() {
+        let (rest, choice) = extract_ansi_flags(&args(&["fdl", "--ansi", "setup"])).unwrap();
+        assert_eq!(rest, args(&["fdl", "setup"]));
+        assert_eq!(choice, Some(style::ColorChoice::Always));
+    }
+
+    #[test]
+    fn extract_ansi_flags_no_ansi_forces_never() {
+        let (rest, choice) = extract_ansi_flags(&args(&["fdl", "--no-ansi", "setup"])).unwrap();
+        assert_eq!(rest, args(&["fdl", "setup"]));
+        assert_eq!(choice, Some(style::ColorChoice::Never));
+    }
+
+    #[test]
+    fn extract_ansi_flags_scans_anywhere() {
+        // Position-independent, consistent with -v / --env.
+        let (rest, choice) =
+            extract_ansi_flags(&args(&["fdl", "setup", "--no-ansi"])).unwrap();
+        assert_eq!(rest, args(&["fdl", "setup"]));
+        assert_eq!(choice, Some(style::ColorChoice::Never));
+    }
+
+    #[test]
+    fn extract_ansi_flags_both_set_errors() {
+        let err = extract_ansi_flags(&args(&["fdl", "--ansi", "--no-ansi"])).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
     }
 }
