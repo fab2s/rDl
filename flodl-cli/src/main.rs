@@ -1184,35 +1184,40 @@ fn cmd_config_show(tail: &[String], active_env: Option<&str>) -> ExitCode {
         }
     };
 
-    let merged = match config::load_merged_value(&base, target_env) {
-        Ok(v) => v,
+    // Load every contributing layer so we can tag each leaf with its
+    // source file, not just "base/overlay". Layer order matches
+    // `load_merged_value`: base first, env overlay (if present) after.
+    let sources = config::config_layer_sources(&base, target_env);
+    let layers: Vec<serde_yaml::Value> = match sources
+        .iter()
+        .map(|p| overlay::load_value(p))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(vs) => vs,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    // Source annotations header — which files were layered, in order.
-    let sources = config::config_layer_sources(&base, target_env);
-    for (i, p) in sources.iter().enumerate() {
-        let tag = if i == 0 { "base" } else { "overlay" };
-        println!("# {tag}: {}", p.display());
-    }
     if target_env.is_some() && sources.len() == 1 {
         println!("# (env overlay requested but not found next to base)");
+        println!("#");
     }
-    println!("#");
 
-    match serde_yaml::to_string(&merged) {
-        Ok(s) => {
-            print!("{s}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("error: cannot serialize merged config: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    let labels: Vec<String> = sources
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect();
+
+    let annotated = overlay::merge_layers_annotated(&layers);
+    print!("{}", overlay::render_annotated_yaml(&annotated, &labels));
+    ExitCode::SUCCESS
 }
 
 fn print_config_usage() {

@@ -128,6 +128,366 @@ pub fn list_envs(base_config: &Path) -> Vec<String> {
     envs.into_iter().collect()
 }
 
+// ── Provenance-tracking merge ───────────────────────────────────────────
+//
+// [`deep_merge`] is lossy: once values collapse together we lose track of
+// which layer contributed each leaf. For `fdl config show`'s per-line
+// source annotation we need the merged *and* the origin, so we carry a
+// parallel tree that records a layer index at every leaf / sequence /
+// replaced-wholesale value. Maps are recursive: each entry carries its
+// own origin, the map itself has no single source. Sequences are
+// replaced wholesale, so they behave as leaves — the whole list is
+// attributed to whichever layer last wrote it.
+
+/// A merged value plus the layer that produced each leaf.
+///
+/// Layer indices are 0-based and refer to the slice passed to
+/// [`merge_layers_annotated`]: `0` is the base, `1` is the first overlay,
+/// and so on. Callers map indices to display labels (filenames, usually)
+/// at render time.
+#[derive(Debug, Clone)]
+pub enum AnnotatedNode {
+    /// Terminal value: scalar, null, or sequence. `source` is the layer
+    /// that last wrote this value.
+    Leaf { value: Value, source: usize },
+    /// Mapping node. `entries` preserves insertion order matching
+    /// [`deep_merge`]'s re-key-to-end behaviour (overridden keys move to
+    /// the tail of the map, matching the final `serde_yaml` serialisation).
+    Map { entries: Vec<(Value, AnnotatedNode)> },
+}
+
+impl AnnotatedNode {
+    /// Materialise the merged [`Value`] — useful for equality tests
+    /// against [`deep_merge`] output.
+    pub fn to_value(&self) -> Value {
+        match self {
+            AnnotatedNode::Leaf { value, .. } => value.clone(),
+            AnnotatedNode::Map { entries } => {
+                let mut m = Mapping::new();
+                for (k, v) in entries {
+                    m.insert(k.clone(), v.to_value());
+                }
+                Value::Mapping(m)
+            }
+        }
+    }
+}
+
+/// Merge a chain of layers left-to-right with provenance tracking. Mirrors
+/// [`merge_layers`] but returns an [`AnnotatedNode`] instead of a flat
+/// [`Value`]. Layer indices in the result are positions into `layers`.
+pub fn merge_layers_annotated(layers: &[Value]) -> AnnotatedNode {
+    if layers.is_empty() {
+        return AnnotatedNode::Leaf {
+            value: Value::Null,
+            source: 0,
+        };
+    }
+
+    let mut result = to_annotated(&layers[0], 0);
+    for (i, layer) in layers.iter().enumerate().skip(1) {
+        result = deep_merge_annotated(result, layer, i);
+    }
+    result
+}
+
+/// Lift a raw [`Value`] into an [`AnnotatedNode`] tagged with one source.
+fn to_annotated(v: &Value, source: usize) -> AnnotatedNode {
+    match v {
+        Value::Mapping(m) => {
+            let entries = m
+                .iter()
+                .map(|(k, v)| (k.clone(), to_annotated(v, source)))
+                .collect();
+            AnnotatedNode::Map { entries }
+        }
+        other => AnnotatedNode::Leaf {
+            value: other.clone(),
+            source,
+        },
+    }
+}
+
+/// Merge `over` onto `base` with provenance. Mirrors [`deep_merge`] but
+/// carries source indices; `over_source` is the layer index for any
+/// leaves the overlay introduces or replaces.
+fn deep_merge_annotated(
+    base: AnnotatedNode,
+    over: &Value,
+    over_source: usize,
+) -> AnnotatedNode {
+    match (base, over) {
+        (AnnotatedNode::Map { mut entries }, Value::Mapping(over_map)) => {
+            for (k, v) in over_map {
+                if matches!(v, Value::Null) {
+                    entries.retain(|(ek, _)| ek != k);
+                    continue;
+                }
+                let pos = entries.iter().position(|(ek, _)| ek == k);
+                match pos {
+                    Some(p) => {
+                        // Match deep_merge's re-key-to-end behaviour: drop
+                        // the existing entry and re-append under merge.
+                        let (_, existing) = entries.remove(p);
+                        let merged = deep_merge_annotated(existing, v, over_source);
+                        entries.push((k.clone(), merged));
+                    }
+                    None => {
+                        entries.push((k.clone(), to_annotated(v, over_source)));
+                    }
+                }
+            }
+            AnnotatedNode::Map { entries }
+        }
+        // Type change or scalar-over-anything: overlay replaces wholesale.
+        (_, over) => to_annotated(over, over_source),
+    }
+}
+
+// ── Rendering with inline source comments ───────────────────────────────
+
+/// Emit an [`AnnotatedNode`] as YAML with a trailing `# <label>` on each
+/// leaf line, column-aligned for legibility.
+///
+/// `source_labels[i]` is the label shown for layer index `i` (typically a
+/// filename). Sequences are rendered inline when all items are scalars
+/// and the resulting line fits [`INLINE_SEQ_LIMIT`]; otherwise they drop
+/// to block style with the source tag on the key line.
+pub fn render_annotated_yaml(node: &AnnotatedNode, source_labels: &[String]) -> String {
+    // Two-pass render so we can align comment columns. First pass emits
+    // lines with `\0` between body and source tag; second pass computes
+    // the target column and pads.
+    let mut raw = String::new();
+    render_node(node, 0, source_labels, &mut raw);
+    align_comments(&raw)
+}
+
+/// Inline-sequence threshold: combined line length beyond which a
+/// scalar-only sequence drops from `[a, b, c]` to block form.
+const INLINE_SEQ_LIMIT: usize = 80;
+
+fn render_node(node: &AnnotatedNode, indent: usize, labels: &[String], out: &mut String) {
+    match node {
+        AnnotatedNode::Leaf { value, source } => {
+            // Top-level leaf (root is a bare scalar). Rare but support it.
+            let tag = label(labels, *source);
+            emit_line(out, indent, &format_scalar(value), Some(&tag));
+        }
+        AnnotatedNode::Map { entries } => {
+            for (k, child) in entries {
+                let key = format_key(k);
+                match child {
+                    AnnotatedNode::Leaf { value, source } => {
+                        let tag = label(labels, *source);
+                        render_leaf_entry(&key, value, &tag, indent, out);
+                    }
+                    AnnotatedNode::Map { .. } => {
+                        // Header line for a nested map: no tag (the map
+                        // itself has no single source).
+                        emit_header(out, indent, &format!("{key}:"));
+                        render_node(child, indent + 2, labels, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_leaf_entry(key: &str, value: &Value, tag: &str, indent: usize, out: &mut String) {
+    match value {
+        Value::Sequence(items) if items.iter().all(is_inline_scalar) => {
+            let inline = format!(
+                "{key}: [{}]",
+                items
+                    .iter()
+                    .map(format_scalar)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if indent + inline.len() <= INLINE_SEQ_LIMIT {
+                emit_line(out, indent, &inline, Some(tag));
+            } else {
+                emit_line(out, indent, &format!("{key}:"), Some(tag));
+                for item in items {
+                    emit_header(out, indent + 2, &format!("- {}", format_scalar(item)));
+                }
+            }
+        }
+        Value::Sequence(items) => {
+            emit_line(out, indent, &format!("{key}:"), Some(tag));
+            for item in items {
+                match item {
+                    Value::Mapping(m) => {
+                        // Rare in fdl configs but render sensibly: first
+                        // key on the `-` line, rest indented.
+                        let mut it = m.iter();
+                        if let Some((first_k, first_v)) = it.next() {
+                            let first_key = format_key(first_k);
+                            emit_header(
+                                out,
+                                indent + 2,
+                                &format!("- {first_key}: {}", format_scalar(first_v)),
+                            );
+                            for (k, v) in it {
+                                emit_header(
+                                    out,
+                                    indent + 4,
+                                    &format!("{}: {}", format_key(k), format_scalar(v)),
+                                );
+                            }
+                        }
+                    }
+                    other => {
+                        emit_header(out, indent + 2, &format!("- {}", format_scalar(other)));
+                    }
+                }
+            }
+        }
+        other => {
+            emit_line(out, indent, &format!("{key}: {}", format_scalar(other)), Some(tag));
+        }
+    }
+}
+
+/// Write a line that will participate in column alignment. `body` is the
+/// YAML body (key: value); `tag` is the source label. Body and tag are
+/// separated by a `\0` sentinel so [`align_comments`] can pad precisely.
+fn emit_line(out: &mut String, indent: usize, body: &str, tag: Option<&str>) {
+    for _ in 0..indent {
+        out.push(' ');
+    }
+    out.push_str(body);
+    if let Some(t) = tag {
+        out.push('\0');
+        out.push_str(t);
+    }
+    out.push('\n');
+}
+
+/// Write a header/structural line (no source tag). No `\0` sentinel so
+/// alignment leaves it untouched.
+fn emit_header(out: &mut String, indent: usize, body: &str) {
+    for _ in 0..indent {
+        out.push(' ');
+    }
+    out.push_str(body);
+    out.push('\n');
+}
+
+/// Align `# <tag>` comments across lines that carry the `\0` sentinel.
+/// Lines without the sentinel pass through unchanged. Comment column is
+/// `max(body_width) + 2`, clamped to a minimum for single-line configs.
+fn align_comments(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut max_body = 0;
+    for line in &lines {
+        if let Some(idx) = line.find('\0') {
+            max_body = max_body.max(idx);
+        }
+    }
+    // 2-space gutter before the `#`. Minimum column so single-key files
+    // still look deliberate rather than cramped.
+    let col = max_body.max(12) + 2;
+
+    let mut out = String::with_capacity(raw.len() + lines.len() * 4);
+    for line in &lines {
+        match line.find('\0') {
+            Some(idx) => {
+                let (body, rest) = line.split_at(idx);
+                let tag = &rest[1..]; // skip the '\0'
+                out.push_str(body);
+                for _ in body.chars().count()..col {
+                    out.push(' ');
+                }
+                out.push_str("# ");
+                out.push_str(tag);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn label(labels: &[String], source: usize) -> String {
+    labels
+        .get(source)
+        .cloned()
+        .unwrap_or_else(|| format!("layer[{source}]"))
+}
+
+fn is_inline_scalar(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+    )
+}
+
+/// Format a scalar for display in a YAML line. Strings are quoted only
+/// when they would otherwise parse ambiguously (start with a special
+/// char, contain a `:` followed by space, etc.). Goal: look like the
+/// user's source file when unambiguous, quote only when required.
+fn format_scalar(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format_string(s),
+        Value::Sequence(_) | Value::Mapping(_) => {
+            // Shouldn't be called with a container — defensive fallback.
+            serde_yaml::to_string(v).unwrap_or_default().trim().to_string()
+        }
+        Value::Tagged(t) => serde_yaml::to_string(&**t)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
+fn format_key(k: &Value) -> String {
+    match k {
+        Value::String(s) => {
+            // Most config keys are plain identifiers; keep them unquoted.
+            if is_plain_key(s) {
+                s.clone()
+            } else {
+                format_string(s)
+            }
+        }
+        other => format_scalar(other),
+    }
+}
+
+fn is_plain_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn format_string(s: &str) -> String {
+    // Quote if the raw string would mis-parse as something else, or if
+    // it contains characters that make unquoted YAML ambiguous.
+    let needs_quote = s.is_empty()
+        || s.contains(':')
+        || s.contains('#')
+        || s.contains('\n')
+        || s.contains('"')
+        || s.starts_with(|c: char| c.is_whitespace() || "!&*>|%@`[]{},-?".contains(c))
+        || matches!(s, "true" | "false" | "null" | "yes" | "no" | "~")
+        || s.parse::<f64>().is_ok();
+    if needs_quote {
+        // Double-quoted with JSON-style escapes.
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Load a YAML/JSON file as a [`Value`]. Extension-based dispatch matches
 /// [`crate::config::parse`].
 pub fn load_value(path: &Path) -> Result<Value, String> {
@@ -147,9 +507,16 @@ pub fn load_value(path: &Path) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn yaml(s: &str) -> Value {
         serde_yaml::from_str(s).expect("test fixture must parse")
+    }
+
+    /// Build `Vec<String>` from string literals — shorter than repeating
+    /// `.to_string()` in every path assertion.
+    fn p(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -371,6 +738,230 @@ mod tests {
         let tmp = tempdir();
         std::fs::write(tmp.path().join("fdl.yml"), "").unwrap();
         assert!(find_env_file(&tmp.path().join("fdl.yml"), "nope").is_none());
+    }
+
+    // ── Annotated merge ──────────────────────────────────────────────────
+
+    /// Collect every leaf's (key-path, source-index) from an AnnotatedNode.
+    /// Key path elements are YAML `Value`s (almost always strings in our
+    /// configs) for parity with [`AnnotatedNode::Map`]'s key type.
+    fn leaves(node: &AnnotatedNode) -> Vec<(Vec<String>, usize)> {
+        fn walk(node: &AnnotatedNode, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, usize)>) {
+            match node {
+                AnnotatedNode::Leaf { source, .. } => out.push((path.clone(), *source)),
+                AnnotatedNode::Map { entries } => {
+                    for (k, v) in entries {
+                        let key = match k {
+                            Value::String(s) => s.clone(),
+                            other => format!("{other:?}"),
+                        };
+                        path.push(key);
+                        walk(v, path, out);
+                        path.pop();
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(node, &mut Vec::new(), &mut out);
+        out
+    }
+
+    #[test]
+    fn annotated_single_layer_tags_every_leaf_with_zero() {
+        let layers = vec![yaml("ddp:\n  policy: cadence\n  anchor: 3\ntraining:\n  epochs: 10\n")];
+        let node = merge_layers_annotated(&layers);
+        for (path, src) in leaves(&node) {
+            assert_eq!(src, 0, "{path:?} should be tagged with layer 0");
+        }
+    }
+
+    #[test]
+    fn annotated_overlay_replaces_key_source() {
+        let layers = vec![
+            yaml("ddp:\n  policy: cadence\n  anchor: 3\n"),
+            yaml("ddp:\n  anchor: 5\n"),
+        ];
+        let node = merge_layers_annotated(&layers);
+        let by_path: BTreeMap<Vec<String>, usize> = leaves(&node).into_iter().collect();
+        assert_eq!(by_path[&p(&["ddp", "policy"])], 0);
+        assert_eq!(by_path[&p(&["ddp", "anchor"])], 1);
+    }
+
+    #[test]
+    fn annotated_added_key_tagged_with_overlay() {
+        let layers = vec![
+            yaml("ddp:\n  policy: cadence\n"),
+            yaml("training:\n  epochs: 20\n"),
+        ];
+        let node = merge_layers_annotated(&layers);
+        let by_path: BTreeMap<Vec<String>, usize> = leaves(&node).into_iter().collect();
+        assert_eq!(by_path[&p(&["training", "epochs"])], 1);
+    }
+
+    #[test]
+    fn annotated_null_deletes_key_and_removes_leaf() {
+        let layers = vec![
+            yaml("ddp:\n  policy: cadence\n  anchor: 3\n"),
+            yaml("ddp:\n  anchor: ~\n"),
+        ];
+        let node = merge_layers_annotated(&layers);
+        let paths: Vec<Vec<String>> = leaves(&node).into_iter().map(|(path, _)| path).collect();
+        assert!(paths.contains(&p(&["ddp", "policy"])));
+        assert!(!paths.iter().any(|path| path == &p(&["ddp", "anchor"])));
+    }
+
+    #[test]
+    fn annotated_type_change_resets_source_to_overlay() {
+        // Mapping in base → scalar in overlay: the whole subtree collapses
+        // to a Leaf tagged with the overlay's index.
+        let layers = vec![
+            yaml("ddp:\n  policy: cadence\n"),
+            yaml("ddp: solo-0\n"),
+        ];
+        let node = merge_layers_annotated(&layers);
+        let by_path: BTreeMap<Vec<String>, usize> = leaves(&node).into_iter().collect();
+        assert_eq!(by_path[&p(&["ddp"])], 1);
+        assert!(!by_path.contains_key(&p(&["ddp", "policy"])));
+    }
+
+    #[test]
+    fn annotated_list_replaced_wholesale_tagged_with_setter() {
+        // Lists are replace-not-append, so the whole sequence is attributed
+        // to the layer that last wrote it.
+        let layers = vec![
+            yaml("regions: [eu-west]\n"),
+            yaml("regions: [us-east, ap-south]\n"),
+        ];
+        let node = merge_layers_annotated(&layers);
+        let by_path: BTreeMap<Vec<String>, usize> = leaves(&node).into_iter().collect();
+        assert_eq!(by_path[&p(&["regions"])], 1);
+    }
+
+    #[test]
+    fn annotated_three_layer_chain() {
+        let layers = vec![
+            yaml("a: 1\nb: 1\nc: 1\n"),
+            yaml("b: 2\nc: 2\n"),
+            yaml("c: 3\n"),
+        ];
+        let node = merge_layers_annotated(&layers);
+        let by_path: BTreeMap<Vec<String>, usize> = leaves(&node).into_iter().collect();
+        assert_eq!(by_path[&p(&["a"])], 0);
+        assert_eq!(by_path[&p(&["b"])], 1);
+        assert_eq!(by_path[&p(&["c"])], 2);
+    }
+
+    #[test]
+    fn annotated_to_value_matches_deep_merge() {
+        let l1 = yaml("ddp:\n  policy: cadence\n  anchor: 3\ntraining:\n  epochs: 10\n");
+        let l2 = yaml("ddp:\n  anchor: 5\ntraining:\n  seed: 42\n");
+        let annotated = merge_layers_annotated(&[l1.clone(), l2.clone()]);
+        let plain = deep_merge(l1, l2);
+        assert_eq!(annotated.to_value(), plain);
+    }
+
+    // ── Rendering ────────────────────────────────────────────────────────
+
+    fn labels(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn render_tags_every_leaf_with_filename() {
+        let layers = vec![yaml("ddp:\n  policy: cadence\n  anchor: 3\n")];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        for line in out.lines() {
+            if line.contains(':') && !line.trim_end().ends_with(':') {
+                assert!(line.contains("# fdl.yml"), "missing tag on: `{line}`");
+            }
+        }
+    }
+
+    #[test]
+    fn render_tags_overlay_keys_with_overlay_filename() {
+        let layers = vec![
+            yaml("ddp:\n  policy: cadence\n  anchor: 3\n"),
+            yaml("ddp:\n  anchor: 5\n"),
+        ];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml", "fdl.ci.yml"]));
+        // policy unchanged → tagged with base.
+        let policy_line = out.lines().find(|l| l.contains("policy:")).unwrap();
+        assert!(policy_line.contains("# fdl.yml") && !policy_line.contains("# fdl.ci.yml"));
+        // anchor overridden → tagged with overlay.
+        let anchor_line = out.lines().find(|l| l.contains("anchor:")).unwrap();
+        assert!(anchor_line.contains("# fdl.ci.yml"));
+    }
+
+    #[test]
+    fn render_aligns_comment_column() {
+        let layers = vec![yaml("a: 1\nbb: 22\nccc: 333\n")];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        // All `#` symbols must land in the same column.
+        let cols: Vec<usize> = out
+            .lines()
+            .filter_map(|l| l.find('#'))
+            .collect();
+        assert!(cols.len() >= 3);
+        let first = cols[0];
+        assert!(cols.iter().all(|c| *c == first), "mismatched columns: {cols:?}");
+    }
+
+    #[test]
+    fn render_inline_short_scalar_list() {
+        // `serde_yaml::Number::to_string` preserves `1.0` as `1.0`.
+        let layers = vec![yaml("ratios: [1.5, 1.0]\n")];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        assert!(out.contains("ratios: [1.5, 1.0]"), "got:\n{out}");
+        assert!(out.lines().next().unwrap().contains("# fdl.yml"));
+    }
+
+    #[test]
+    fn render_deleted_key_absent_from_output() {
+        let layers = vec![
+            yaml("ddp:\n  policy: cadence\n  anchor: 3\n"),
+            yaml("ddp:\n  anchor: ~\n"),
+        ];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml", "fdl.ci.yml"]));
+        assert!(!out.contains("anchor"), "deleted key leaked: {out}");
+        assert!(out.contains("policy"));
+    }
+
+    #[test]
+    fn render_header_lines_have_no_comment() {
+        // The `ddp:` header line is a nested-map opener — it has no single
+        // source, so it gets no trailing `# <label>`.
+        let layers = vec![yaml("ddp:\n  policy: cadence\n")];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let header = out.lines().find(|l| l.trim() == "ddp:").unwrap();
+        assert!(!header.contains('#'));
+    }
+
+    #[test]
+    fn render_quotes_ambiguous_strings() {
+        // `true` as a literal string must be quoted so it doesn't
+        // round-trip as a boolean.
+        let layers = vec![yaml("flag: \"true\"\n")];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        assert!(out.contains("flag: \"true\""), "got:\n{out}");
+    }
+
+    #[test]
+    fn render_long_scalar_list_drops_to_block_form() {
+        let long: Vec<String> = (0..30).map(|i| format!("item-number-{i}")).collect();
+        let yaml_src = format!("items: [{}]\n", long.join(", "));
+        let layers = vec![yaml(&yaml_src)];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        assert!(out.contains("items:  "), "expected header line with tag");
+        assert!(out.contains("- item-number-0"));
     }
 
     // Tiny tempdir helper — standalone so we don't pull in the tempfile crate.
