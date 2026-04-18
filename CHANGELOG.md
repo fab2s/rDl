@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-18
+
 ### Added
 
 #### New Crate: `flodl-cli-macros`
 - **`flodl-cli-macros/`** (new workspace member): proc-macro derive crate exposing `#[derive(FdlArgs)]`, re-exported as `flodl_cli::FdlArgs`. Turns a plain struct into an argv parser plus schema and help renderer. Implements `flodl_cli::FdlArgsTrait` with `try_parse_from(&[String]) -> Result<Self, String>`, `schema() -> flodl_cli::Schema`, and `render_help() -> String`.
 - **`#[option(...)]`** named-flag attribute: `short = 'c'`, `default = "..."`, `choices = &["a", "b"]`, `env = "VAR"`, `completer = "name"`. Supported field shapes: `bool` (absent = false, present = true), `T` (scalar, requires `default`), `Option<T>` (absent = None), `Vec<T>` (repeatable).
 - **`#[arg(...)]`** positional attribute: `default`, `choices`, `variadic` (requires `Vec<T>`, must be last), `completer`.
-- **Derive-time validation**: required positionals cannot follow optional ones; variadic must be last; reserved flags (`--help`, `--version`, `--quiet`, `--env`, `-h`, `-V`, `-q`, `-v`, `-e`) cannot be shadowed; duplicate long/short flags error at compile time.
+- **Derive-time validation**: required positionals cannot follow optional ones; variadic must be last; reserved flags cannot be shadowed (see Global Flags for the authoritative list); duplicate long/short flags error at compile time.
 - **Per-option env fallback**: `#[option(env = "WANDB_API_KEY")]` falls back to the environment variable when the flag is absent (argv > env > default). `bool` fields are exempt.
 - **Typed help via Rust docs**: doc-comments on the struct and fields flow into `render_help()` output with ANSI colouring.
 
@@ -59,8 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 #### Docs
-- **`docs/cli.md`** rewritten (+860 lines): restructured around three contexts: standalone (no project), inside an `fdl.yml` project, inside the flodl source checkout. Standalone libtorch-manager examples now lead with PyTorch C++ (CMake / `CMAKE_PREFIX_PATH`) alongside the existing tch-rs walkthrough.
-- **`docs/design/run-config.md`** expanded (+670 lines): formal schema for `fdl.yml`, sub-command resolution, overlay merge semantics, and the DDP / training / output to `DdpConfig` / `DdpRunConfig` mapping.
+- **`docs/cli.md`** rewritten: restructured around three contexts: standalone (no project), inside an `fdl.yml` project, inside the flodl source checkout. Standalone libtorch-manager examples now lead with PyTorch C++ (CMake / `CMAKE_PREFIX_PATH`) alongside the existing tch-rs walkthrough.
+- **`docs/design/run-config.md`** expanded: formal schema for `fdl.yml`, sub-command resolution, overlay merge semantics, and the DDP / training / output to `DdpConfig` / `DdpRunConfig` mapping.
 - **`docs/design/msf-cadence-control.md`** (new, 669 lines): design spec for the MSF cadence-control layer.
 - **`flodl-cli/README.md`** rewritten: leads with "this is the flodl CLI"; standalone libtorch manager framed as a secondary use case.
 - **`flodl-cli-macros/README.md`** (new): attribute reference for `#[derive(FdlArgs)]`.
@@ -69,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 #### Dogfooding
 - **`ddp-bench/src/main.rs`** ported to `#[derive(FdlArgs)]`: typed flags, shared schema with `fdl`, help / completion / validation all come from the derived parser. Replaces the hand-rolled argv handling.
 - **`fdl.yml.example`** and **`ddp-bench/fdl.yml.example`** updated to the unified `commands:` shape with the three-kind distinction.
+
+### Removed
+
+- **`scripts:` key in `fdl.yml`**: merged into the unified `commands:` map. Any 0.4.0 `fdl.yml` that used `scripts:` must move its entries into `commands:` with an explicit `run:` field. The three-kind `commands:` model (`run:` / `path:` / preset) is now the long-term stable manifest surface; no further breaking changes to its shape are scheduled.
+- **Shadowing of reserved CLI flags in `#[derive(FdlArgs)]` structs**: `--help`, `--version`, `--quiet`, `--env`, `-h`, `-V`, `-q`, `-v`, `-e` are now reserved and enforced at derive time. Structs in 0.4.0 that named fields with any of these flags silently overrode them; in 0.5.0 they fail to compile. Rename any affected fields.
 
 ## [0.4.0] - 2026-04-14
 

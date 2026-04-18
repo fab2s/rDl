@@ -452,7 +452,7 @@ use the cache.
 Example output (abbreviated):
 
 ```
-flodl API Reference v0.4.0
+flodl API Reference v0.5.0
 ========================================
 
 ## Modules (nn)
@@ -496,7 +496,7 @@ fdl skill install --skill port       # install a single skill only
 | Claude Code | `.claude/` directory            | `.claude/skills/<skill>/SKILL.md` |
 | Cursor      | `.cursor/` or `.cursorrules`    | `.cursorrules` (appended)       |
 
-**Available skills** (as of v0.4.0):
+**Available skills** (as of v0.5.0):
 
 | Skill  | Description                                                                                     |
 |--------|-------------------------------------------------------------------------------------------------|
