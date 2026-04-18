@@ -1,12 +1,12 @@
 //! Pure command-graph dispatch.
 //!
-//! [`walk_commands`] is the outer walker: it chases an arbitrarily nested
+//! `walk_commands` is the outer walker: it chases an arbitrarily nested
 //! `commands:` graph starting from a top-level name + tail, and returns a
-//! [`WalkOutcome`] describing what the caller should do (run a script,
+//! `WalkOutcome` describing what the caller should do (run a script,
 //! spawn an entry, print help, error out, ...). The walker performs no
 //! IO of its own: no process spawning, no stdout writes, no cwd reads.
 //!
-//! [`classify_path_step`] is the inner classifier used by `walk_commands`
+//! `classify_path_step` is the inner classifier used by `walk_commands`
 //! for the `Path` arm: loads the child fdl.yml and inspects the tail to
 //! decide whether to descend, render help, refresh the schema cache, or
 //! forward to the entry.

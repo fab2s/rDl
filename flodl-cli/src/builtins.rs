@@ -2,8 +2,8 @@
 //! help listing, collision detection, and shell completion.
 //!
 //! Each leaf sub-command owns a `#[derive(FdlArgs)]` struct that carries
-//! the canonical flag set — [`BuiltinSpec::schema_fn`] returns the
-//! [`Schema`] derived from that struct, so completion rules
+//! the canonical flag set. `BuiltinSpec::schema_fn` returns the
+//! `Schema` derived from that struct, so completion rules
 //! (`--cuda <TAB>` → `12.6 12.8`, etc.) flow through the same pipeline
 //! as project commands rather than a hand-mirrored flag table.
 

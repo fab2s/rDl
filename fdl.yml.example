@@ -29,6 +29,10 @@ commands:
     description: Generate API docs (strict, fails on warnings)
     run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
     docker: dev
+  ci:
+    description: Run the full CI CPU job locally (build + test + clippy + doc)
+    run: cargo build && cargo test -- --nocapture && cargo clippy -- -W clippy::all && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
+    docker: dev
   shell:
     description: Interactive shell in dev container
     run: bash

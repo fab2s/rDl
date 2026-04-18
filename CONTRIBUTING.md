@@ -111,10 +111,11 @@ Rust with `--cfg docsrs` and no libtorch — things that build fine in the dev
 container can fail there.
 
 ```bash
-make docs-rs    # simulates docs.rs build in a disposable container
+make docs-rs    # simulates docs.rs build for every publishable crate
 ```
 
-This catches:
+Since 0.5.0 this covers all three published crates (`flodl`, `flodl-cli`,
+`flodl-cli-macros`) in one disposable container. It catches:
 - Broken intra-doc links (`rustdoc::broken_intra_doc_links`)
 - Dependencies that don't compile on nightly with `--cfg docsrs`
 - Example scraping failures (examples need libtorch)
@@ -122,6 +123,20 @@ This catches:
 
 crates.io is immutable — a broken publish means bumping the version. Run this
 before every `cargo publish`.
+
+### Matching GitHub CI locally
+
+`make docs-rs` mirrors docs.rs. For GitHub CI parity (which runs stable Rust
+workspace-wide with `-D warnings` on rustdoc), use the `fdl` shortcuts:
+
+```bash
+fdl doc         # strict rustdoc pass (matches CI's "Doc" step)
+fdl ci          # full CI CPU job: build + test + clippy + doc
+```
+
+`fdl doc` is fast and catches rustdoc regressions. `fdl ci` is the complete
+CPU-job equivalent -- run it before pushing any PR that might fail CI.
+`fdl test` alone will not catch rustdoc warnings.
 
 The Makefile still exposes a few targets that pre-date `fdl` (useful
 when `fdl` itself is broken); treat it as a fallback, not the primary
