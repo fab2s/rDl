@@ -63,7 +63,7 @@ impl CacheEntry {
 }
 
 /// Scan `project_root` recursively for `.fdl/schema-cache/*.json` files.
-/// Skips common noise dirs ([`SKIP_DIRS`]). Results are sorted by cache
+/// Skips common noise dirs (`SKIP_DIRS`). Results are sorted by cache
 /// path for stable `fdl schema list` output.
 pub fn discover_caches(project_root: &Path) -> Vec<CacheEntry> {
     let mut out = Vec::new();
@@ -112,8 +112,8 @@ fn walk(dir: &Path, out: &mut Vec<CacheEntry>) {
 
 /// Pick the primary config file (`fdl.yml` > `fdl.yaml` > `fdl.json`)
 /// that sits next to a cache's command dir. Matches the preference
-/// order used by [`crate::overlay::EXTENSIONS`] via
-/// [`crate::config::CONFIG_NAMES`].
+/// order used by `crate::overlay::EXTENSIONS` via
+/// `crate::config::CONFIG_NAMES`.
 fn find_source_config(cmd_dir: &Path) -> Option<PathBuf> {
     for name in &["fdl.yml", "fdl.yaml", "fdl.json"] {
         let p = cmd_dir.join(name);

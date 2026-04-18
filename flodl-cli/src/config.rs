@@ -707,7 +707,7 @@ const STRICT_UNIVERSAL_LONGS: &[(&str, Option<char>, bool)] = &[
     ("refresh-schema", None, false),
 ];
 
-/// Convert a [`Schema`] into an [`ArgsSpec`] suitable for strict-mode
+/// Convert a [`Schema`] into an [`ArgsSpec`](crate::args::parser::ArgsSpec) suitable for strict-mode
 /// tail validation. Positional `required` flags are intentionally
 /// dropped: the binary itself will enforce them after parsing, and
 /// treating them as required here would turn "missing positional" into

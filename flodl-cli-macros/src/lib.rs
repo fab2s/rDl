@@ -111,7 +111,7 @@ struct FieldSpec {
     ident: Ident,
     kind: FieldKind,
     shape: TypeShape,
-    /// The "inner" type (for Option<T>/Vec<T>, the T; for T, T itself).
+    /// The "inner" type (for `Option<T>` / `Vec<T>`, the `T`; for `T`, `T` itself).
     inner_ty: Type,
     description: Option<String>,
     // Attribute contents

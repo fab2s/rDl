@@ -21,8 +21,7 @@ docs-rs:
 		cargo +nightly rustdoc --lib \
 			--no-default-features --features rng \
 			--config 'build.rustflags=[\"--cfg\", \"docsrs\"]' \
-			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]' \
-			-Zrustdoc-scrape-examples"
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]'"
 
 # --- Site (host python + docker compose up/down) ---
 

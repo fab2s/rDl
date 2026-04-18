@@ -803,7 +803,7 @@ pub fn print_project_help(
 
 // ── Schema-driven help helpers ──────────────────────────────────────────
 
-/// Build the part of "fdl <cmd>..." after the command name: positionals
+/// Build the part of `fdl <cmd>...` after the command name: positionals
 /// rendered as `<name>` (required) or `[<name>]` (optional), plus a slot
 /// for the first-positional picker — `[<preset>]` when only presets exist,
 /// `[<command>]` when only sub-commands exist, `[<preset>|<command>]` when

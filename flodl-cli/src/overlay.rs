@@ -251,8 +251,8 @@ fn deep_merge_annotated(
 ///
 /// `source_labels[i]` is the label shown for layer index `i` (typically a
 /// filename). Sequences are rendered inline when all items are scalars
-/// and the resulting line fits [`INLINE_SEQ_LIMIT`]; otherwise they drop
-/// to block style with the source tag on the key line.
+/// and the resulting line fits the `INLINE_SEQ_LIMIT` threshold; otherwise
+/// they drop to block style with the source tag on the key line.
 pub fn render_annotated_yaml(node: &AnnotatedNode, source_labels: &[String]) -> String {
     // Two-pass render so we can align comment columns. First pass emits
     // lines with `\0` between body and source tag; second pass computes
@@ -488,8 +488,8 @@ fn format_string(s: &str) -> String {
     }
 }
 
-/// Load a YAML/JSON file as a [`Value`]. Extension-based dispatch matches
-/// [`crate::config::parse`].
+/// Load a YAML/JSON file as a [`Value`]. Extension-based dispatch on the
+/// file suffix (`.yml`, `.yaml`, `.json`).
 pub fn load_value(path: &Path) -> Result<Value, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
