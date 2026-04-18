@@ -112,6 +112,12 @@ cargo add flodl && cargo build
 
 For CUDA: `cargo add flodl --features cuda` + [CUDA toolkit](https://developer.nvidia.com/cuda-downloads).
 
+> **Using tch-rs or PyTorch C++?** `fdl` also works as a standalone libtorch
+> manager outside of flodl: download any CPU/CUDA variant, switch between
+> installs, compile from source for mixed GPU architectures, and emit a
+> machine-readable diagnostics report. See
+> [flodl-cli](flodl-cli/README.md).
+
 Both paths generate an annotated training template. Edit `src/main.rs` to
 build your model:
 
