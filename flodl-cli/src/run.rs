@@ -380,6 +380,32 @@ fn shell_join(args: &[String]) -> String {
 
 // ── Help output ─────────────────────────────────────────────────────────
 
+/// Print help for a `run:`-kind command. Shows the inline script that
+/// will execute and the Docker service (if any). `run:` commands do not
+/// forward argv, so there are no flags or positionals to document.
+pub fn print_run_help(name: &str, description: Option<&str>, run: &str, docker: Option<&str>) {
+    if let Some(desc) = description {
+        eprintln!("{} {desc}", style::bold(name));
+    } else {
+        eprintln!("{}", style::bold(name));
+    }
+    eprintln!();
+    eprintln!("{}:", style::yellow("Usage"));
+    eprintln!("    fdl {name}");
+    eprintln!();
+    eprintln!("{}:", style::yellow("Runs"));
+    if let Some(svc) = docker {
+        eprintln!("    {} {svc} -c {run:?}", style::dim("docker compose run --rm"));
+    } else {
+        eprintln!("    {run}");
+    }
+    eprintln!();
+    eprintln!(
+        "{} run:-kind commands do not forward argv; the script runs as declared.",
+        style::dim("Note:"),
+    );
+}
+
 /// Print help for a sub-command (its arguments, nested commands, and
 /// entry). Orchestrates the per-section helpers below.
 pub fn print_command_help(cmd_config: &CommandConfig, name: &str) {

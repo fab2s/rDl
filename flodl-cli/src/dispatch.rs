@@ -132,6 +132,13 @@ pub enum WalkOutcome {
         parent_label: String,
         preset_name: String,
     },
+    /// Run terminal with `--help` / `-h` in the tail.
+    PrintRunHelp {
+        name: String,
+        description: Option<String>,
+        run: String,
+        docker: Option<String>,
+    },
     /// The top-level or descended-into name doesn't exist in the current
     /// `commands:` map. Caller prints the project-help banner.
     UnknownCommand { name: String },
@@ -184,8 +191,15 @@ pub fn walk_commands(
             CommandKind::Run => {
                 let command = spec
                     .run
-                    .expect("Run kind guarantees `run` is set")
-                    .clone();
+                    .expect("Run kind guarantees `run` is set");
+                if current_tail.iter().any(|a| a == "--help" || a == "-h") {
+                    return WalkOutcome::PrintRunHelp {
+                        name,
+                        description: spec.description,
+                        run: command,
+                        docker: spec.docker,
+                    };
+                }
                 return WalkOutcome::RunScript {
                     command,
                     docker: spec.docker,
@@ -474,6 +488,39 @@ mod tests {
             }
             _ => panic!("expected RunScript with docker"),
         }
+    }
+
+    #[test]
+    fn walk_run_with_help_prints_help_not_script() {
+        let tmp = TempDir::new();
+        let commands = top_commands(
+            "commands:\n  test:\n    description: Run all CPU tests\n    run: cargo test\n    docker: dev\n",
+        );
+        let tail = args(&["--help"]);
+        let out = walk_commands("test", &tail, &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::PrintRunHelp {
+                name,
+                description,
+                run,
+                docker,
+            } => {
+                assert_eq!(name, "test");
+                assert_eq!(description.as_deref(), Some("Run all CPU tests"));
+                assert_eq!(run, "cargo test");
+                assert_eq!(docker.as_deref(), Some("dev"));
+            }
+            _ => panic!("expected PrintRunHelp"),
+        }
+    }
+
+    #[test]
+    fn walk_run_with_short_help_prints_help() {
+        let tmp = TempDir::new();
+        let commands = top_commands("commands:\n  test:\n    run: cargo test\n");
+        let tail = args(&["-h"]);
+        let out = walk_commands("test", &tail, &commands, tmp.path(), None);
+        assert!(matches!(out, WalkOutcome::PrintRunHelp { .. }));
     }
 
     #[test]

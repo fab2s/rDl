@@ -1225,6 +1225,15 @@ fn dispatch_config(cmd: &str, args: &[String], env: Option<&str>) -> ExitCode {
             run::print_preset_help(&config, &parent_label, &preset_name);
             ExitCode::SUCCESS
         }
+        WalkOutcome::PrintRunHelp {
+            name,
+            description,
+            run,
+            docker,
+        } => {
+            run::print_run_help(&name, description.as_deref(), &run, docker.as_deref());
+            ExitCode::SUCCESS
+        }
         WalkOutcome::UnknownCommand { name } => {
             eprintln!("unknown command: {name}");
             eprintln!();
@@ -1247,8 +1256,8 @@ fn dispatch_config(cmd: &str, args: &[String], env: Option<&str>) -> ExitCode {
 
 /// `fdl config show [<env>]` — print the resolved merged config.
 ///
-/// `tail` is `args[1..]`: tail[0] is always "config", tail[1] is the
-/// sub-command ("show"), tail[2..] carry options (an optional explicit
+/// `tail` is `args[1..]`: `tail[0]` is always "config", `tail[1]` is the
+/// sub-command ("show"), `tail[2..]` carry options (an optional explicit
 /// `<env>` that overrides the first-arg env detection).
 fn cmd_config_show(tail: &[String], active_env: Option<&str>) -> ExitCode {
     let sub = tail.get(1).map(String::as_str).unwrap_or("--help");
