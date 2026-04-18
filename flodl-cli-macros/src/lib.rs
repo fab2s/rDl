@@ -1,8 +1,71 @@
-//! `#[derive(FdlArgs)]` — proc-macro derive for flodl-cli's argv parser.
+//! `#[derive(FdlArgs)]` -- proc-macro derive for flodl-cli's argv parser.
 //!
-//! See `flodl-cli` crate docs for the user-facing API. This crate emits
-//! code that calls into `flodl_cli::args::parser` and implements
-//! `flodl_cli::FdlArgsTrait`.
+//! This crate is re-exported by [`flodl-cli`](https://crates.io/crates/flodl-cli)
+//! as `flodl_cli::FdlArgs`, so downstream binaries depend on `flodl-cli`,
+//! not on this crate directly.
+//!
+//! The derive turns a plain struct with named fields into an argv parser
+//! plus JSON schema emitter plus ANSI-coloured help renderer. One struct
+//! is the single source of truth: doc-comments become help text,
+//! attribute metadata becomes schema, field types become typed values.
+//!
+//! # Field attributes
+//!
+//! Each field carries exactly one of `#[option(...)]` (named flag,
+//! kebab-cased from the field ident) or `#[arg(...)]` (positional).
+//! The field type determines cardinality:
+//!
+//! - `bool` -- absent = `false`, present = `true`. `#[option]` only.
+//! - `T` -- scalar, required. `#[option]` must supply `default = "..."`.
+//! - `Option<T>` -- scalar, optional. Absent = `None`.
+//! - `Vec<T>` -- `#[option]`: repeatable. `#[arg]`: variadic, last.
+//!
+//! Supported keys for `#[option]`: `short`, `default`, `choices`, `env`,
+//! `completer`. For `#[arg]`: `default`, `choices`, `variadic`,
+//! `completer`. Reserved flags (`--help`, `--version`, `--quiet`,
+//! `--env`, and their shorts) cannot be shadowed; collisions error at
+//! derive time.
+//!
+//! # Example
+//!
+//! The example below depends on the `flodl-cli` crate; it is marked
+//! `ignore` because this crate is a proc-macro and doesn't depend on
+//! `flodl-cli` itself. Copy the snippet into a `flodl-cli`-depending
+//! binary to try it.
+//!
+//! ```ignore
+//! use flodl_cli::{FdlArgs, parse_or_schema};
+//!
+//! /// Train a model.
+//! #[derive(FdlArgs, Debug)]
+//! struct TrainArgs {
+//!     /// Model architecture to use.
+//!     #[option(short = 'm', choices = &["mlp", "resnet"], default = "mlp")]
+//!     model: String,
+//!
+//!     /// Number of epochs.
+//!     #[option(short = 'e', default = "10")]
+//!     epochs: u32,
+//!
+//!     /// API key, read from env if flag is absent.
+//!     #[option(env = "WANDB_API_KEY")]
+//!     wandb_key: Option<String>,
+//!
+//!     /// Extra dataset paths.
+//!     #[arg(variadic)]
+//!     datasets: Vec<String>,
+//! }
+//!
+//! fn main() {
+//!     let args: TrainArgs = parse_or_schema();
+//!     // `--help` and `--fdl-schema` are intercepted by parse_or_schema.
+//!     let _ = args;
+//! }
+//! ```
+//!
+//! See the [`flodl-cli`](https://docs.rs/flodl-cli) crate for the
+//! user-facing API (`parse_or_schema`, `FdlArgsTrait`, `Schema`) and
+//! the full CLI reference.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -19,6 +82,10 @@ const RESERVED_SHORTS: &[char] = &['h', 'V', 'q', 'v', 'e'];
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
+/// Derive `FdlArgs` on a struct with named fields to generate an argv
+/// parser, `--fdl-schema` JSON emitter, and ANSI-coloured `--help`
+/// renderer. See the [crate-level docs](crate) for the attribute
+/// reference and a worked example.
 #[proc_macro_derive(FdlArgs, attributes(option, arg))]
 pub fn derive_fdl_args(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

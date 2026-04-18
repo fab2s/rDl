@@ -97,9 +97,9 @@ fdl --no-ansi config show # plain output for pipes and CI
 ```
 
 Some flag names are **reserved** by the CLI and cannot be shadowed by
-derived argument structs (see [Declaring flags in
-Rust](#declaring-flags-in-rust)): `--help`, `--version`, `--quiet`,
-`--env`, and the shorts `-h`, `-V`, `-q`, `-v`, `-e`.
+derived argument structs (see [Declaring flags in Rust](#declaring-flags-in-rust)):
+`--help`, `--version`, `--quiet`, `--env`, and the shorts `-h`, `-V`,
+`-q`, `-v`, `-e`.
 
 ---
 
@@ -699,10 +699,107 @@ uses it to drive:
 - Shell completion -- choices, short/long forms, value types.
 - Validation -- unknown flags error with a clear message.
 
+One struct is the single source of truth. The doc-comments become help
+text. The attribute metadata becomes schema. The struct fields become
+typed values in your `main()`.
+
+```rust
+use flodl_cli::{FdlArgs, parse_or_schema};
+
+/// Run the training benchmark suite.
+#[derive(FdlArgs, Debug)]
+pub struct BenchArgs {
+    /// Model to train (or `all` for the full suite).
+    #[option(short = 'm', choices = &["all", "linear", "mlp", "lenet",
+                                      "resnet", "char-rnn", "gpt-nano"],
+             default = "all")]
+    pub model: String,
+
+    /// DDP mode to exercise.
+    #[option(choices = &["solo-0", "nccl-cadence", "nccl-async",
+                         "cpu-cadence", "cpu-async"],
+             default = "nccl-cadence")]
+    pub mode: String,
+
+    /// Epochs to run (overrides the preset default).
+    #[option(short = 'e', default = "10")]
+    pub epochs: u32,
+
+    /// Write a Markdown convergence report to this path.
+    #[option]
+    pub report: Option<String>,
+
+    /// Weights & Biases API key (read from env if flag absent).
+    #[option(env = "WANDB_API_KEY")]
+    pub wandb_key: Option<String>,
+
+    /// Extra dataset paths to include.
+    #[arg(variadic)]
+    pub datasets: Vec<String>,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: BenchArgs = parse_or_schema();
+    // args.model, args.mode, args.epochs, ... are typed values.
+    Ok(())
+}
+```
+
+With this struct in place:
+
+- `cargo run --bin bench -- --help` renders an ANSI-coloured help page
+  with the doc-comments as descriptions.
+- `cargo run --bin bench -- --fdl-schema` emits JSON describing every
+  flag. `fdl` calls this on first use and caches the result.
+- `fdl bench --model <TAB>` in a completion-enabled shell offers
+  `all linear mlp lenet resnet char-rnn gpt-nano`.
+- `fdl bench --wandb-key <value>` works, and so does leaving the flag
+  off with `WANDB_API_KEY=...` in the environment.
+- Unknown flags and invalid choices fail with a clear error before your
+  binary starts.
+
+#### Attribute reference
+
+Each field must carry exactly one of `#[option(...)]` (named flag,
+kebab-cased from the field name) or `#[arg(...)]` (positional). The
+field's Rust type determines cardinality.
+
+| Shape       | Meaning                                               |
+|-------------|-------------------------------------------------------|
+| `bool`      | Flag is present or absent; no value. Absent = `false`. |
+| `T`         | Scalar, required. `#[option]` must supply `default`.  |
+| `Option<T>` | Scalar, optional. Absent = `None`.                    |
+| `Vec<T>`    | `#[option]`: repeatable. `#[arg]`: variadic (last).    |
+
+`#[option]` keys:
+
+| Key         | Example          | Notes                                                     |
+|-------------|------------------|-----------------------------------------------------------|
+| `short`     | `'c'`            | Single-char short flag.                                   |
+| `default`   | `"string"`       | Parsed via `FromStr` at run time; required on bare `T`.   |
+| `choices`   | `&["a", "b"]`    | Accepted values; enforced by the parser.                  |
+| `env`       | `"VAR_NAME"`     | Env fallback when the flag is absent; skipped on `bool`.  |
+| `completer` | `"name"`         | Named completer for shell completion scripts.             |
+
+`#[arg]` keys:
+
+| Key         | Example          | Notes                                                     |
+|-------------|------------------|-----------------------------------------------------------|
+| `default`   | `"string"`       | Makes the positional optional.                            |
+| `choices`   | `&["a", "b"]`    | Accepted values.                                          |
+| `variadic`  | bare or `= true` | Requires `Vec<T>`; must be the last positional.           |
+| `completer` | `"name"`         | Named completer for shell completion scripts.             |
+
+Validation runs at derive time: required positionals cannot follow
+optional ones, variadic must be last, reserved flags cannot be
+shadowed, and duplicate long/short flags error out. Errors point at
+the offending field, not at a run-time parser message.
+
 See the [`fdl schema`](#fdl-schema-and---fdl-schema) section for how to
 refresh the cache after rebuilding, and the
 [`flodl-cli-macros`](https://crates.io/crates/flodl-cli-macros) README
-for the full attribute surface.
+and [`flodl-cli` docs.rs page](https://docs.rs/flodl-cli) for the full
+attribute surface and internals.
 
 ### Environment overlays
 

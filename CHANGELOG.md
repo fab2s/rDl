@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.5.0] - 2026-04-18
 
+> Upgrading from 0.4.0? The only breaking changes live in `fdl.yml`
+> (`scripts:` merged into `commands:`) and in `#[derive(FdlArgs)]`
+> (a small set of reserved flag names). See
+> [UPGRADE.md](UPGRADE.md) for the step-by-step migration.
+
 ### Added
 
 #### New Crate: `flodl-cli-macros`

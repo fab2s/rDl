@@ -147,6 +147,96 @@ description: "A Rust deep learning framework on libtorch. Fluent graph API, hete
 
 <hr class="divider">
 
+<!-- fdl works without flodl too -->
+<section class="section">
+  <h2 class="section-title">Not writing Rust yet? <code>fdl</code> still helps.</h2>
+  <p class="section-sub">
+    The CLI is its own published crate. Outside a flodl checkout it's a
+    first-class <strong>libtorch manager</strong> for <a href="https://github.com/LaurentMazare/tch-rs">tch-rs</a>
+    and <strong>PyTorch C++</strong> users -- the installer PyTorch itself never shipped.
+    One binary, zero native dependencies, works before anything else is set up.
+  </p>
+
+  <div class="what-you-get" style="margin-top: 1.5rem;">
+    <div class="wyg-card">
+      <h3>GPU-aware downloads</h3>
+      <p>Reads <code>nvidia-smi</code>, picks cu126 / cu128 / CPU automatically, installs side-by-side, activates one with a single command.</p>
+      <pre style="margin-top: 0.5rem; font-size: 12px; background: var(--bg-alt); padding: 0.6rem 0.8rem; border-radius: 6px;">fdl libtorch download --cuda 12.8
+fdl libtorch list
+fdl libtorch activate precompiled/cu128</pre>
+    </div>
+    <div class="wyg-card">
+      <h3>Custom-arch source builds</h3>
+      <p>GTX 1060 + RTX 5060 Ti in one host? No single pre-built variant covers both. <code>fdl libtorch build</code> compiles PyTorch from source with the exact archs you need, Docker-isolated by default.</p>
+      <pre style="margin-top: 0.5rem; font-size: 12px; background: var(--bg-alt); padding: 0.6rem 0.8rem; border-radius: 6px;">fdl libtorch build --archs "6.1;12.0"
+fdl libtorch build --native --jobs 8</pre>
+    </div>
+    <div class="wyg-card">
+      <h3>Drop straight into tch-rs / C++</h3>
+      <p>Point <code>LIBTORCH</code> or <code>CMAKE_PREFIX_PATH</code> at the active variant and build. No more scraping URLs from the PyTorch get-started page.</p>
+      <pre style="margin-top: 0.5rem; font-size: 12px; background: var(--bg-alt); padding: 0.6rem 0.8rem; border-radius: 6px;">export LIBTORCH=$FLODL_HOME/libtorch/precompiled/cu128
+cargo add tch
+cargo build</pre>
+    </div>
+  </div>
+
+  <p style="margin-top: 1.2rem;">
+    <a href="{{ '/guide/cli' | relative_url }}#1-standalone-no-project-required" class="btn btn-outline" style="font-size: 14px;">
+      Standalone reference &rarr;
+    </a>
+    <a href="https://crates.io/crates/flodl-cli" target="_blank" class="btn btn-outline" style="font-size: 14px;">
+      flodl-cli on crates.io &rarr;
+    </a>
+  </p>
+</section>
+
+<hr class="divider">
+
+<!-- fdl config show: explainable config -->
+<section class="section">
+  <h2 class="section-title">Explainable config, per environment</h2>
+  <p class="section-sub">
+    Deep-merge <code>fdl.ci.yml</code> or <code>fdl.local.yml</code> on top of the base manifest with
+    <code>--env</code>. <code>fdl config show</code> prints the resolved result with per-layer origin
+    annotations -- you see exactly which file, which line, contributed each field before running
+    a long job.
+  </p>
+
+  <div class="terminal" style="max-width: 720px; margin: 1.5rem auto 0;">
+    <div class="terminal-bar">
+      <span class="terminal-dot"></span>
+      <span class="terminal-dot"></span>
+      <span class="terminal-dot"></span>
+      <span class="terminal-title">fdl --env ci config show</span>
+    </div>
+    <pre><span class="prompt">$ </span><span class="cm">fdl</span> <span class="flag">--env</span> ci config show
+<span class="comment"># resolved manifest, base + overlay</span>
+docker: dev                     <span class="comment"># fdl.yml:2</span>
+ddp:
+  policy: cadence               <span class="comment"># fdl.yml:8</span>
+  backend: <span class="url">cpu</span>                  <span class="comment"># fdl.ci.yml:3 (override)</span>
+  divergence_threshold: 0.05    <span class="comment"># fdl.yml:10</span>
+training:
+  epochs: <span class="url">1</span>                     <span class="comment"># fdl.ci.yml:6 (override)</span>
+  seed: 42                      <span class="comment"># fdl.yml:13</span>
+  batch_size: 32                <span class="comment"># fdl.yml:14</span>
+commands:
+  quick:                        <span class="comment"># fdl.yml:18 (preset)</span>
+    training: { epochs: 1 }
+    options: { model: linear, batches: 100 }</pre>
+  </div>
+
+  <p class="section-sub" style="margin-top: 1.5rem; font-size: 0.95rem;">
+    Three equivalent ways to apply an overlay: <code>fdl --env ci test</code>,
+    <code>FDL_ENV=ci fdl test</code>, or just <code>fdl ci test</code> when the name
+    doesn't collide with a command. Explicit selectors fail loudly on missing
+    files; the first-arg convention falls through so existing commands are never
+    shadowed.
+  </p>
+</section>
+
+<hr class="divider">
+
 <!-- Build your model -->
 <section class="section">
   <h2 class="section-title">Build your model</h2>

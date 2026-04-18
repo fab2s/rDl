@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! use flodl_cli::{FdlArgs, parse_or_schema};
 //!
 //! /// My training binary.
@@ -41,23 +41,75 @@
 extern crate self as flodl_cli;
 
 // Internal modules — shared by lib consumers and the fdl binary.
+
+/// Structured API reference for flodl itself (`fdl api-ref`), used by
+/// AI porting tools and as a machine-readable surface index.
 pub mod api_ref;
+
+/// Argv parsing primitives and the [`FdlArgsTrait`](args::FdlArgsTrait)
+/// contract that `#[derive(FdlArgs)]` implements.
 pub mod args;
+
+/// Built-in `fdl` sub-commands (setup, install, completions, schema,
+/// config, libtorch, diagnose, init, skill, ...).
 pub mod builtins;
+
+/// Shell completion script generation and per-project completion
+/// enrichment driven by cached schemas.
 pub mod completions;
+
+/// `fdl.yml` manifest loading, validation, and resolved-command types.
 pub mod config;
+
+/// Cross-cutting context passed to sub-command handlers (resolved config,
+/// verbosity, overlay selection, working directory, ...).
 pub mod context;
+
+/// Top-level command dispatch: routing argv to built-ins vs. manifest
+/// entries, resolving the three command kinds (run / path / preset).
 pub mod dispatch;
+
+/// Hardware and compatibility diagnostics (`fdl diagnose`).
 pub mod diagnose;
+
+/// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
+/// training template, `.gitignore`.
 pub mod init;
+
+/// libtorch variant management (download, build, list, activate, remove,
+/// info) used by both `fdl libtorch` and the standalone-manager flow.
 pub mod libtorch;
+
+/// Environment overlay loader (`--env`, `FDL_ENV`, first-arg convention)
+/// with per-field origin annotations for `fdl config show`.
 pub mod overlay;
+
+/// Runtime: invoking resolved commands, streaming their output, and
+/// mapping exit codes through `fdl`.
 pub mod run;
+
+/// `fdl schema` sub-command: discover every cache under the project,
+/// report fresh / stale / orphan states, and clear or refresh on
+/// demand. The [`Schema`] type itself lives in [`config`].
 pub mod schema;
+
+/// `--fdl-schema` binary contract and per-command cache mechanics.
+/// Caches live at `<cmd_dir>/.fdl/schema-cache/<cmd>.json` with
+/// mtime + binary hash metadata for staleness detection.
 pub mod schema_cache;
+
+/// First-run and reconfiguration wizard (`fdl setup`).
 pub mod setup;
+
+/// AI-skill bundles: packaging and installing the `/port` skill and
+/// similar assistant integrations.
 pub mod skill;
+
+/// ANSI styling primitives and the `--ansi` / `--no-ansi` / `NO_COLOR`
+/// resolution chain used by the help renderer and CLI output.
 pub mod style;
+
+/// Miscellaneous helpers shared by the other modules.
 pub mod util;
 
 /// Print a red-prefixed `error: <formatted>` line to stderr.

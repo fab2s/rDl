@@ -76,7 +76,12 @@ equally to the flodl source checkout and to anything you scaffolded with
 - **Schema introspection for your binaries.** Any binary built with
   `#[derive(flodl_cli::FdlArgs)]` responds to `--fdl-schema` with a JSON
   description of its flags; `fdl schema list/clear/refresh` manages the
-  cache that powers project-aware help and completion.
+  cache that powers project-aware help and completion. The derive lives
+  in the [`flodl-cli-macros`](https://crates.io/crates/flodl-cli-macros)
+  crate (re-exported here) -- see its
+  [README](https://github.com/fab2s/floDl/blob/main/flodl-cli-macros/README.md)
+  or the [CLI reference](https://github.com/fab2s/floDl/blob/main/docs/cli.md#declaring-flags-in-rust)
+  for the full attribute surface and a worked example.
 
 ### In the flodl source checkout specifically
 
